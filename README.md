@@ -21,7 +21,6 @@ This utility bridges the gap for customization enthusiasts who want to seamlessl
 
 ### GUI Interface (Clean View)
 ![macOSicons GUI Interface](screenshots/gui-interface-clean.png)
-
 ### In the Wild (KDE Desktop Integration)
 ![macOSicons KDE Integration](screenshots/gui-desktop-integration.png)
 
