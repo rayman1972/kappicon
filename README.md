@@ -19,7 +19,8 @@ This utility bridges the gap for customization enthusiasts who want to seamlessl
 
 ---
 
-🚀 Installation
+## 🚀 Installation
+
 Getting set up is incredibly simple. Just clone the repository and run the automated installer:
 
 ```bash
@@ -33,25 +34,28 @@ cd macosicons-linux
 
 ---
 
-🛠️ Usage
+## 🛠️ Usage
 
-🖥️ Desktop Launchers (Recommended)
+🖥️ Desktop Launchers (Recommended):
 Once installed, you can launch both versions directly from your application menu (under Settings/System):
 
 Terminal Version (macOSicons): Launch it to open a terminal tab running the interactive CLI tool to guide you through mapping.
 
 GUI Version (macOSicons (GUI)): Launch it to open a dedicated, custom-styled window to visually browse and apply your icons.
 
-🐚 Command Line (Bash)
+🐚 Command Line (Bash):
 If you prefer using the terminal directly, you can run the scripts from anywhere after installation:
 
 To run the interactive CLI tool:
 
-Bash
+```bash
 apply-mac-icon
+```
 To run the GUI tool:
 
-Bash
+```bash
 apply-mac-icon-gui
-📜 License
+```
+
+## 📜 License
 This project is licensed under the MIT License - see the LICENSE file for details.
