@@ -20,12 +20,10 @@ This utility bridges the gap for customization enthusiasts who want to seamlessl
 ## 📸 Screenshots
 
 ### GUI Interface (Clean View)
-Here is a detailed look at the utility's visual interface.
-![macOSicons GUI Interface](screenshots/gui-interface-clean.png")
+![macOSicons GUI Interface](screenshots/gui-interface-clean.png)
 
 ### In the Wild (KDE Desktop Integration)
-Here is how it looks fully integrated on a customized KDE Plasma desktop, showing the dynamic glass effect.
-![macOSicons KDE Integration](screenshots/gui-desktop-integration.jpg)
+![macOSicons KDE Integration](screenshots/gui-desktop-integration.png)
 
 ---
 
