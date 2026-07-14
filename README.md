@@ -22,13 +22,14 @@ This utility bridges the gap for customization enthusiasts who want to seamlessl
 🚀 Installation
 Getting set up is incredibly simple. Just clone the repository and run the automated installer:
 
-Bash
+```bash
 # Clone the repository
-git clone [https://github.com/system-rw/macosicons-linux.git](https://github.com/system-rw/macosicons-linux.git)
+git clone https://github.com/system-rw/macosicons-linux.git
 cd macosicons-linux
 
 # Run the installer
 ./install.sh
+```
 
 ---
 
