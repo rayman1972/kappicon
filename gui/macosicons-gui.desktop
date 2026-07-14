@@ -1,10 +1,10 @@
 [Desktop Entry]
 Comment[en_US]=Apply macOS icons to Linux applications
 Comment=Apply macOS icons to Linux applications
-Exec=/home/lenovo/.local/bin/apply-mac-icon-gui
+Exec=apply-mac-icon-gui
 GenericName[en_US]=
 GenericName=
-Icon=/home/lenovo/Pictures/MacIcons/macOSicons-gui.png
+Icon=macOSicons-gui.png
 MimeType=
 Name[en_US]=macOSicons (GUI)
 Name=macOSicons (GUI)
