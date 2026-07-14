@@ -1,8 +1,8 @@
 [Desktop Entry]
 Categories=Utility;
 Comment=Apply macOS icons to Linux applications
-Exec=/home/lenovo/.local/bin/apply-mac-icon
-Icon=/home/lenovo/Pictures/MacIcons/macOSicons.png
+Exec=apply-mac-icon
+Icon=macOSicons
 Name=macOSicons
 NoDisplay=false
 Path=
