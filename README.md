@@ -17,7 +17,7 @@ macOSicons Companion is a professional-grade utility designed to map custom icon
 ## 📸 Screenshots
 
 ### GUI Interface (Clean View)
-![macOSicons GUI Interface](screenshots/gui-dark/light.png)
+![macOSicons GUI Interface](screenshots/gui-dark-light.png)
 
 ## 🛠️ Installation
 
