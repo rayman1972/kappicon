@@ -14,6 +14,11 @@ macOSicons Companion is a professional-grade utility designed to map custom icon
 * **Glassmorphic Design**: A beautiful, adaptive interface with configurable transparency and theme options.
 * **Persistent Config**: All settings are saved automatically via QSettings (~/.config/macOSicons/macOSicons.conf), shared seamlessly between the CLI and GUI.
 
+## 📸 Screenshots
+
+### GUI Interface (Clean View)
+![macOSicons GUI Interface](screenshots/gui-dark/light.png)
+
 ## 🛠️ Installation
 
 Ensure you have the required dependencies installed, which is added to the install script. But in case it didn't work try to install: python3 python3-pyqt6 icnsutils imagemagick kdialog.  With your system's package manager
