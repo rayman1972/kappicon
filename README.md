@@ -1,4 +1,4 @@
-# macOSicons Companion v2.0
+# macOSicons Companion
 
 macOSicons Companion is a professional-grade utility designed to map custom icons to your Linux application launchers (.desktop files) with the look and feel of macOS.
 
