@@ -1,49 +1,80 @@
-# macOSicons Companion
+# KAppIcon
 
-macOSicons Companion is a professional-grade utility designed to map custom icons to your Linux application launchers (.desktop files) with the look and feel of macOS.
+**KAppIcon** is a Linux utility to change application icons, reuse icons from other apps, and design your own.
 
-## 🚀 Features
+It works by safely updating user-level `.desktop` files (no root required) and refreshing the desktop icon cache.
 
-* **Settings Dashboard**: A centralized UI to manage themes, glass effects, and backup preferences.
-* **Terminal & GUI Launchers**: Comes with dedicated .desktop files for both versions. One launches the interactive tool inside your terminal, and the other opens the standalone GUI.
-* **Smart Format Support**: Handles raw PNGs, ICOs, and ICNS files, mapping them cleanly to your applications.
-* **Desktop Integration**: Automatically updates your system's desktop entries (.desktop files) to ensure correct icon application.
-* **KDE Sync**: Forces a KDE system configuration cache rebuild (kbuildsycoca) so your new icons show up instantly without a system reboot.
-* **Automated Safety**: Timestamped backups of all .desktop files are created automatically before any changes are made.
-* **One-Click Restore**: Easily roll back to any previous backup state directly from the Settings tab.
-* **Glassmorphic Design**: A beautiful, adaptive interface with configurable transparency and theme options.
-* **Persistent Config**: All settings are saved automatically via QSettings (~/.config/macOSicons/macOSicons.conf), shared seamlessly between the CLI and GUI.
+## Features
 
-## 📸 Screenshots
+* **Map icons to apps** — pick any image (or another app’s icon) and apply it to a launcher
+* **From another app** — e.g. give Shelly the same icon Discover uses
+* **Create tab** — pixel editor + import PNG / JPG / WEBP (and more) to build icons
+* **Icon library** — saved creations live in `~/.local/share/kappicon/icons/`
+* **Backups & restore** — optional copies of `.desktop` files before changes
+* **CLI** — terminal workflow with `fzf` for power users
 
-### GUI Interface (Clean View)
-![macOSicons GUI Interface](screenshots/gui-dark-light.png)
+## Screenshots
 
-## 🛠️ Installation
+### GUI
+![KAppIcon GUI](screenshots/gui-dark-light.png)
 
-Ensure you have the required dependencies installed, which is added to the install script. But in case it didn't work try to install: python3 python3-pyqt6 icnsutils imagemagick kdialog.  With your system's package manager
-
-Then, run:
+## Installation
 
 ```bash
 ./install.sh
 ```
 
-## 💻 Usage
+Dependencies (installed automatically when possible):
 
-### Graphical Interface (GUI)
+| Distro | Packages |
+|--------|----------|
+| **Arch / CachyOS** | `python python-pyqt6 libicns imagemagick kdialog fzf` |
+| **Debian / Ubuntu** | `python3 python3-pyqt6 icnsutils imagemagick kdialog fzf` |
+| **Fedora** | `python3 python3-pyqt6 libicns-utils ImageMagick kdialog fzf` |
+
+## Usage
+
+### Graphical interface
 
 ```bash
-~/.local/bin/apply-mac-icon-gui
+kappicon-gui
 ```
 
-### Command Line Interface (CLI)
+Or search for **KAppIcon** in your app menu.
+
+**Tabs:**
+
+1. **Map** — choose an icon (file / another app) → choose the app to change → Apply  
+2. **Create** — draw pixels or import an image → Save / Save & use in Map  
+3. **Settings** — theme, backups, source folder, restore, cache refresh  
+
+### Command line
 
 ```bash
-apply-mac-icon --help
+kappicon --help
+kappicon              # interactive mapper
+kappicon --settings
+kappicon --restore
+kappicon --refresh
 ```
 
-## 🛡️ Safety & Configuration
+Legacy commands `apply-mac-icon` / `apply-mac-icon-gui` still work as shims after install.
 
-* **Backups**: Located at ~/.local/share/macosicons/backups/
-* **Persistence**: Config file located at ~/.config/macOSicons/macOSicons.conf
+## Paths
+
+| What | Where |
+|------|--------|
+| Config | `~/.config/KAppIcon/KAppIcon.conf` |
+| Created icons | `~/.local/share/kappicon/icons/` |
+| Applied icon PNGs | `~/Pictures/KAppIcon/` |
+| Desktop backups | `~/.local/share/kappicon/backups/` |
+
+## Notes
+
+* Changes write to `~/.local/share/applications/` so they override system launchers for your user only.
+* Theme icons (Map → “From another app”) set `Icon=` to a freedesktop icon name and follow your icon theme.
+* Custom files are normalized to a 512×512 PNG under `~/Pictures/KAppIcon/`.
+
+## License
+
+See [LICENSE](LICENSE).

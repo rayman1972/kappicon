@@ -1,0 +1,2335 @@
+#!/bin/bash
+DOWNLOADS_DIR="$HOME/Downloads"
+TARGET_DIR="$HOME/Pictures/KAppIcon"
+LIBRARY_DIR="$HOME/.local/share/kappicon/icons"
+mkdir -p "$TARGET_DIR" "$LIBRARY_DIR"
+
+get_desktop_dirs() {
+    local dirs=()
+    local xdg_dirs="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    IFS=':' read -r -a split_dirs <<< "$xdg_dirs"
+    for d in "${split_dirs[@]}" "$HOME/.local/share"; do
+        [ -d "$d/applications" ] && dirs+=("$d/applications")
+    done
+    # Flatpak exports
+    [ -d "/var/lib/flatpak/exports/share/applications" ] && dirs+=("/var/lib/flatpak/exports/share/applications")
+    [ -d "$HOME/.local/share/flatpak/exports/share/applications" ] && dirs+=("$HOME/.local/share/flatpak/exports/share/applications")
+    # Snap
+    [ -d "/var/lib/snapd/desktop/applications" ] && dirs+=("/var/lib/snapd/desktop/applications")
+    
+    printf "%s\n" "${dirs[@]}" | sort -u
+}
+
+find_desktop_files() {
+    for d in $(get_desktop_dirs); do
+        find "$d" -name "*.desktop" 2>/dev/null
+    done
+}
+
+show_error() {
+    local msg="$1"
+    if command -v kdialog &>/dev/null; then
+        kdialog --title "Error" --error "$msg"
+    elif command -v zenity &>/dev/null; then
+        zenity --error --title="Error" --text="$msg"
+    elif command -v notify-send &>/dev/null; then
+        notify-send -u critical "Error" "$msg"
+    else
+        echo "❌ Error: $msg" >&2
+    fi
+}
+
+show_info() {
+    local msg="$1"
+    if command -v kdialog &>/dev/null; then
+        kdialog --title "Success!" --passivepopup "$msg" 3
+    elif command -v notify-send &>/dev/null; then
+        notify-send "Success!" "$msg"
+    elif command -v zenity &>/dev/null; then
+        zenity --info --title="Success!" --text="$msg" --timeout=3
+    else
+        echo "✅ Success: $msg"
+    fi
+}
+
+MAGICK_CMD="magick"
+if ! command -v magick &>/dev/null; then
+    if command -v convert &>/dev/null; then
+        MAGICK_CMD="convert"
+    fi
+fi
+
+# 1. UNIFIED PyQt6 WINDOW — Map icons, edit/create icons, settings
+DESKTOP_LIST=$(find_desktop_files | sort -u)
+export DOWNLOADS_DIR
+export LIBRARY_DIR
+export DESKTOP_LIST
+
+RESULT=$(python3 - <<'PYEOF'
+import sys, os, subprocess, tempfile, shutil
+from datetime import datetime
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
+    QListWidget, QListWidgetItem, QPushButton, QLabel, QSplitter,
+    QFrame, QTabWidget, QCheckBox, QComboBox, QFileDialog,
+    QButtonGroup, QColorDialog, QMessageBox, QToolButton, QSizePolicy,
+    QMainWindow, QGroupBox, QFormLayout, QDialogButtonBox, QStatusBar,
+    QStyle, QStyleFactory, QRadioButton, QDialog,
+)
+from PyQt6.QtGui import (
+    QPixmap, QIcon, QColor, QPainter, QPainterPath, QPalette,
+    QCursor, QImage, QPen,
+)
+from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, pyqtSignal
+
+ICON_EXTENSIONS = {".icns", ".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_IMPORT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+LIBRARY_DIR = os.environ.get(
+    "LIBRARY_DIR", os.path.expanduser("~/.local/share/kappicon/icons")
+)
+os.makedirs(LIBRARY_DIR, exist_ok=True)
+# Sentinel stored on the empty-state list row so a click can open a file browser
+BROWSE_FOR_ICON = "__browse_for_icon__"
+# UserRole payload prefix for freedesktop/theme icon names (Icon=fooname)
+THEME_ICON_PREFIX = "theme:"
+DESKTOP_LIST_RAW = [d for d in os.environ.get("DESKTOP_LIST", "").strip().split("\n") if d]
+
+
+def collect_system_icons(app_data):
+    """Unique theme icon names already used by installed apps, with sources."""
+    by_icon = {}
+    for desktop_name, icon_name in app_data:
+        if not icon_name:
+            continue
+        # Skip absolute paths / URIs — those aren't theme names
+        if icon_name.startswith(("/", "http://", "https://", "data:", "file:")):
+            continue
+        if os.path.isabs(icon_name) or os.path.sep in icon_name:
+            continue
+        by_icon.setdefault(icon_name, []).append(desktop_name)
+    return sorted(by_icon.items(), key=lambda kv: kv[0].lower())
+
+
+def make_rounded_pixmap(pixmap, radius=18):
+    size = pixmap.size()
+    rounded = QPixmap(size)
+    rounded.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(rounded)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(0, 0, size.width(), size.height(), radius, radius)
+    painter.setClipPath(path)
+    painter.drawPixmap(0, 0, pixmap)
+    painter.end()
+    return rounded
+
+
+def extract_preview(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
+        # QPixmap can load these directly
+        return file_path
+    tmpdir = tempfile.mkdtemp()
+    try:
+        if ext == ".icns":
+            subprocess.run(["icns2png", "-x", file_path], cwd=tmpdir, capture_output=True, timeout=10)
+            candidates = sorted(
+                [f for f in os.listdir(tmpdir) if f.endswith(".png")],
+                key=lambda f: os.path.getsize(os.path.join(tmpdir, f)), reverse=True,
+            )
+            if candidates:
+                return os.path.join(tmpdir, candidates[0])
+    except Exception:
+        pass
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    return None
+
+
+def parse_desktop_fields(desktop_file):
+    """Return (Name, Icon) from a .desktop file. Name prefers unlocalized Name=."""
+    name = None
+    name_en = None
+    icon = None
+    in_desktop_entry = False
+    try:
+        with open(desktop_file, "r", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    if line == "[Desktop Entry]":
+                        in_desktop_entry = True
+                    else:
+                        in_desktop_entry = False
+                        if (name or name_en) and icon:
+                            break
+                    continue
+                if not in_desktop_entry:
+                    continue
+                if line.startswith("Name[en") and "=" in line and name_en is None:
+                    name_en = line.split("=", 1)[1].strip()
+                elif line.startswith("Name=") and name is None:
+                    name = line.split("=", 1)[1].strip()
+                elif line.startswith("Icon=") and icon is None:
+                    val = line.split("=", 1)[1].strip()
+                    if val and not val.startswith(("http://", "https://", "ftp://", "data:")):
+                        if "?" not in val and "#" not in val:
+                            icon = val
+    except Exception:
+        pass
+    display = name or name_en or os.path.splitext(os.path.basename(desktop_file))[0]
+    return display, icon
+
+
+def parse_icon_name(desktop_file):
+    _, icon = parse_desktop_fields(desktop_file)
+    return icon
+
+
+def friendly_desktop_label(desktop_basename, desktop_path_lookup):
+    """Human label for a .desktop basename using a path map if available."""
+    path = desktop_path_lookup.get(desktop_basename)
+    if path:
+        name, _ = parse_desktop_fields(path)
+        return name
+    return os.path.splitext(desktop_basename)[0]
+
+
+def pick_primary_provider(desktops):
+    """Choose the most representative .desktop that uses a shared theme icon."""
+    def score(d):
+        low = d.lower()
+        s = 0
+        if any(x in low for x in ("urlhandler", "handler", "autostart")):
+            s -= 8
+        if any(x in low for x in (".flatpak", ".snap", "solid_action")):
+            s -= 3
+        # Prefer shorter, “main” ids
+        s -= low.count(".")
+        s -= len(low) // 20
+        return s
+    return sorted(desktops, key=score, reverse=True)[0]
+
+
+def resolve_icon(icon_name):
+    if not icon_name:
+        return None
+    if os.path.isabs(icon_name):
+        if os.path.isfile(icon_name):
+            pix = QPixmap(icon_name)
+            if not pix.isNull():
+                return pix.scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio,
+                                  Qt.TransformationMode.SmoothTransformation)
+        return None
+    if any(c in icon_name for c in "/?#<>:\"|*"):
+        return None
+    from PyQt6.QtGui import QIcon
+    theme_icon = QIcon.fromTheme(icon_name)
+    if not theme_icon.isNull():
+        pix = theme_icon.pixmap(28, 28)
+        if not pix.isNull():
+            return pix
+    home_icons = os.path.expanduser("~/.local/share/icons")
+    for base in (home_icons, "/usr/share/icons", "/usr/share/pixmaps"):
+        for theme in ("hicolor", "breeze", "Papirus", "Numix", "Adwaita"):
+            for size in ("48x48", "64x64", "256x256", "scalable"):
+                for ext in (".png", ".svg", ".xpm"):
+                    candidate = os.path.join(base, theme, size, "apps", icon_name + ext)
+                    if os.path.isfile(candidate):
+                        pix = QPixmap(candidate)
+                        if not pix.isNull():
+                            return pix.scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio,
+                                              Qt.TransformationMode.SmoothTransformation)
+    return None
+
+
+# ── Icon editor (pixel canvas + image import) ────────────────────────────
+class PixelCanvas(QFrame):
+    """Simple pixel grid editor for designing icons."""
+    changed = pyqtSignal()
+
+    def __init__(self, grid_size=64, parent=None):
+        super().__init__(parent)
+        self.grid_size = grid_size
+        self.tool = "pen"  # pen | eraser | fill | picker
+        self.color = QColor(0, 120, 215, 255)
+        self.show_grid = True
+        self._drawing = False
+        self._dirty = False
+        self._image = QImage(grid_size, grid_size, QImage.Format.Format_ARGB32)
+        self._image.fill(Qt.GlobalColor.transparent)
+        self.setMinimumSize(280, 280)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setFrameShadow(QFrame.Shadow.Sunken)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def image(self):
+        return self._image
+
+    def is_dirty(self):
+        """True if the canvas changed since last save/mark_clean."""
+        return self._dirty
+
+    def mark_clean(self):
+        self._dirty = False
+
+    def is_blank(self):
+        """True if every pixel is fully transparent."""
+        blank = QImage(self._image.size(), self._image.format())
+        blank.fill(Qt.GlobalColor.transparent)
+        return self._image == blank
+
+
+    def _touch(self):
+        self._dirty = True
+        self.changed.emit()
+
+    def set_image(self, img: QImage):
+        if img.isNull():
+            return
+        self._image = img.convertToFormat(QImage.Format.Format_ARGB32)
+        self.grid_size = self._image.width()
+        self.update()
+        self._touch()
+
+    def clear(self, color=None):
+        if color is None:
+            self._image.fill(Qt.GlobalColor.transparent)
+        else:
+            self._image.fill(color)
+        self.update()
+        self._touch()
+
+    def resize_grid(self, size):
+        size = max(8, min(512, int(size)))
+        if size == self.grid_size:
+            return
+        scaled = self._image.scaled(
+            size, size,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self.grid_size = size
+        self._image = scaled.convertToFormat(QImage.Format.Format_ARGB32)
+        self.update()
+        self._touch()
+
+    def load_from_file(self, path, fit=True):
+        img = QImage(path)
+        if img.isNull():
+            return False
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+        if fit:
+            # Letterbox into square grid, preserving aspect, transparent pad
+            canvas = QImage(self.grid_size, self.grid_size, QImage.Format.Format_ARGB32)
+            canvas.fill(Qt.GlobalColor.transparent)
+            scaled = img.scaled(
+                self.grid_size, self.grid_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = (self.grid_size - scaled.width()) // 2
+            y = (self.grid_size - scaled.height()) // 2
+            p = QPainter(canvas)
+            p.drawImage(x, y, scaled)
+            p.end()
+            self._image = canvas
+        else:
+            self._image = img.scaled(
+                self.grid_size, self.grid_size,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ).convertToFormat(QImage.Format.Format_ARGB32)
+        self.update()
+        self._touch()
+        return True
+
+    def _cell_size(self):
+        side = min(self.width(), self.height())
+        return max(1, side / self.grid_size), side
+
+    def _pos_to_cell(self, pos):
+        cell, side = self._cell_size()
+        ox = (self.width() - side) / 2
+        oy = (self.height() - side) / 2
+        x = int((pos.x() - ox) / cell)
+        y = int((pos.y() - oy) / cell)
+        if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
+            return x, y
+        return None
+
+    def _apply_tool(self, x, y):
+        if self.tool == "pen":
+            self._image.setPixelColor(x, y, self.color)
+        elif self.tool == "eraser":
+            self._image.setPixelColor(x, y, QColor(0, 0, 0, 0))
+        elif self.tool == "picker":
+            self.color = self._image.pixelColor(x, y)
+            self.changed.emit()  # color swatch only — not a canvas edit
+            return
+        elif self.tool == "fill":
+            self._flood_fill(x, y, self.color)
+        self.update()
+        self._touch()
+
+    def _flood_fill(self, sx, sy, new_color):
+        target = self._image.pixelColor(sx, sy)
+        if target == new_color:
+            return
+        stack = [(sx, sy)]
+        seen = set()
+        w = self.grid_size
+        while stack:
+            x, y = stack.pop()
+            if (x, y) in seen:
+                continue
+            if not (0 <= x < w and 0 <= y < w):
+                continue
+            if self._image.pixelColor(x, y) != target:
+                continue
+            seen.add((x, y))
+            self._image.setPixelColor(x, y, new_color)
+            stack.extend(((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        cell, side = self._cell_size()
+        ox = (self.width() - side) / 2
+        oy = (self.height() - side) / 2
+
+        # Clip all drawing strictly within the canvas area
+        p.setClipRect(int(ox), int(oy), int(side), int(side))
+
+        # Checkerboard for transparency
+        p.fillRect(self.rect(), QColor(40, 40, 42) if self.palette().color(
+            self.palette().ColorRole.Window).lightness() < 128 else QColor(220, 220, 224))
+        check = max(4, int(cell))
+        c1, c2 = QColor(180, 180, 185), QColor(210, 210, 215)
+        if self.palette().color(self.palette().ColorRole.Window).lightness() < 128:
+            c1, c2 = QColor(50, 50, 54), QColor(62, 62, 68)
+        for row in range(int(side // check) + 1):
+            for col in range(int(side // check) + 1):
+                p.fillRect(
+                    int(ox + col * check), int(oy + row * check),
+                    check, check, c1 if (row + col) % 2 == 0 else c2,
+                )
+
+        # Pixel art (nearest neighbor)
+        scaled = QPixmap.fromImage(self._image).scaled(
+            int(side), int(side),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        p.drawPixmap(int(ox), int(oy), scaled)
+
+        if self.show_grid and cell >= 4:
+            p.setPen(QPen(QColor(0, 0, 0, 40), 1))
+            for i in range(self.grid_size + 1):
+                x = ox + i * cell
+                y = oy + i * cell
+                p.drawLine(int(x), int(oy), int(x), int(oy + side))
+                p.drawLine(int(ox), int(y), int(ox + side), int(y))
+
+        # Outer border
+        p.setPen(QPen(QColor(0, 0, 0, 80), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(int(ox), int(oy), int(side) - 1, int(side) - 1)
+        p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        cell = self._pos_to_cell(event.position())
+        if not cell:
+            return
+        self._drawing = self.tool in ("pen", "eraser")
+        self._apply_tool(*cell)
+
+    def mouseMoveEvent(self, event):
+        if not self._drawing:
+            return
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        cell = self._pos_to_cell(event.position())
+        if cell:
+            self._apply_tool(*cell)
+
+    def mouseReleaseEvent(self, event):
+        self._drawing = False
+
+
+# ── KDE / Breeze helpers ─────────────────────────────────────────────────
+def apply_breeze_style(app: QApplication):
+    """Prefer Breeze so Plasma users get native KDE look & feel."""
+    keys = {k.lower(): k for k in QStyleFactory.keys()}
+    for name in ("breeze", "oxygen", "fusion"):
+        if name in keys:
+            app.setStyle(QStyleFactory.create(keys[name]))
+            break
+    # Remember Plasma/system palette so Appearance → System can restore it
+    app._kappicon_system_palette = QPalette(app.palette())
+    # Desktop file / Wayland app id
+    app.setDesktopFileName("kappicon")
+    app.setApplicationName("KAppIcon")
+    app.setOrganizationName("KAppIcon")
+    app.setApplicationDisplayName("KAppIcon")
+
+
+def make_light_palette():
+    """Readable light scheme (Breeze-like) when user forces Light."""
+    p = QPalette()
+    window = QColor(239, 240, 241)
+    base = QColor(252, 252, 252)
+    text = QColor(35, 38, 41)
+    disabled = QColor(120, 120, 120)
+    highlight = QColor(61, 174, 233)
+    p.setColor(QPalette.ColorRole.Window, window)
+    p.setColor(QPalette.ColorRole.WindowText, text)
+    p.setColor(QPalette.ColorRole.Base, base)
+    p.setColor(QPalette.ColorRole.AlternateBase, QColor(245, 246, 247))
+    p.setColor(QPalette.ColorRole.Text, text)
+    p.setColor(QPalette.ColorRole.Button, window)
+    p.setColor(QPalette.ColorRole.ButtonText, text)
+    p.setColor(QPalette.ColorRole.BrightText, QColor(255, 255, 255))
+    p.setColor(QPalette.ColorRole.Highlight, highlight)
+    p.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+    p.setColor(QPalette.ColorRole.ToolTipBase, base)
+    p.setColor(QPalette.ColorRole.ToolTipText, text)
+    p.setColor(QPalette.ColorRole.PlaceholderText, QColor(100, 104, 109))
+    p.setColor(QPalette.ColorRole.Link, QColor(41, 128, 185))
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled)
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled)
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled)
+    return p
+
+
+def make_dark_palette():
+    """Readable dark scheme (Breeze Dark–like) when user forces Dark."""
+    p = QPalette()
+    window = QColor(35, 38, 41)
+    base = QColor(27, 30, 32)
+    text = QColor(239, 240, 241)
+    disabled = QColor(120, 120, 120)
+    highlight = QColor(61, 174, 233)
+    p.setColor(QPalette.ColorRole.Window, window)
+    p.setColor(QPalette.ColorRole.WindowText, text)
+    p.setColor(QPalette.ColorRole.Base, base)
+    p.setColor(QPalette.ColorRole.AlternateBase, QColor(42, 46, 50))
+    p.setColor(QPalette.ColorRole.Text, text)
+    p.setColor(QPalette.ColorRole.Button, window)
+    p.setColor(QPalette.ColorRole.ButtonText, text)
+    p.setColor(QPalette.ColorRole.BrightText, QColor(255, 255, 255))
+    p.setColor(QPalette.ColorRole.Highlight, highlight)
+    p.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+    p.setColor(QPalette.ColorRole.ToolTipBase, base)
+    p.setColor(QPalette.ColorRole.ToolTipText, text)
+    p.setColor(QPalette.ColorRole.PlaceholderText, QColor(150, 154, 158))
+    p.setColor(QPalette.ColorRole.Link, QColor(61, 174, 233))
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled)
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled)
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled)
+    return p
+
+
+def apply_appearance_mode(mode: str):
+    """Apply system / light / dark color scheme to the whole app."""
+    app = QApplication.instance()
+    if app is None:
+        return
+    mode = (mode or "system").lower()
+    if mode == "light":
+        app.setPalette(make_light_palette())
+    elif mode == "dark":
+        app.setPalette(make_dark_palette())
+    else:
+        sys_pal = getattr(app, "_kappicon_system_palette", None)
+        app.setPalette(QPalette(sys_pal) if sys_pal is not None else app.style().standardPalette())
+
+
+def layout_margins(widget=None):
+    """Standard layout margins from the active QStyle (KDE HIG–friendly)."""
+    style = QApplication.style()
+    m = style.pixelMetric(QStyle.PixelMetric.PM_LayoutLeftMargin)
+    # Breeze typically reports 6–9; keep a sensible floor for readability
+    m = max(9, m)
+    return m, m, m, m
+
+
+def layout_spacing():
+    style = QApplication.style()
+    s = style.pixelMetric(QStyle.PixelMetric.PM_LayoutVerticalSpacing)
+    return max(6, s)
+
+
+def theme_icon(*names, fallback=None):
+    for n in names:
+        ic = QIcon.fromTheme(n)
+        if not ic.isNull():
+            return ic
+    return fallback or QIcon()
+
+
+def make_hint_label(text):
+    """Secondary/helper text; color tracks the active palette (system/light/dark)."""
+    lab = QLabel(text)
+    lab.setWordWrap(True)
+    lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    # palette() resolves after Appearance changes without re-creating labels
+    lab.setStyleSheet("QLabel { color: palette(placeholder-text); }")
+    return lab
+
+
+def equalize_widths(widgets):
+    if not widgets:
+        return
+    max_w = max(w.sizeHint().width() for w in widgets)
+    for w in widgets:
+        w.setFixedWidth(max_w)
+
+
+
+# ── Main Window ──────────────────────────────────────────────────────────
+class CombinedWindow(QMainWindow):
+    def __init__(self, icon_files, app_data):
+        super().__init__()
+        self.settings = QSettings("KAppIcon", "KAppIcon")
+        self.icon_files = icon_files
+        # app_data: list of (desktop_basename, icon_name, display_name, desktop_path)
+        self.app_data = app_data
+        self.desktop_paths = {d[0]: d[3] for d in app_data}
+        self.desktop_labels = {d[0]: d[2] for d in app_data}
+        # theme icons already referenced by installed .desktop files
+        self.system_icons = collect_system_icons([(d[0], d[1]) for d in app_data])
+        self.icon_source = "files"  # "files" | "system"
+        self.selected_file = None   # path or "theme:<name>"
+        self.selected_app = None
+        self._preview_tmpdir = None
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle("KAppIcon")
+        self.resize(920, 640)
+        self.setMinimumSize(720, 520)
+
+        # Window icon (Breeze / hicolor / installed asset)
+        wicon = theme_icon("preferences-desktop-icons", "applications-graphics", "kappicon")
+        for path in (
+            os.path.expanduser("~/.local/share/icons/kappicon.png"),
+            os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps/kappicon.png"),
+        ):
+            if os.path.isfile(path):
+                wicon = QIcon(path)
+                break
+        self.setWindowIcon(wicon)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        m = layout_margins()
+        root.setContentsMargins(*m)
+        root.setSpacing(layout_spacing())
+
+        tabs = QTabWidget()
+        tabs.setDocumentMode(False)
+        tabs.setMovable(False)
+        self.main_tabs = tabs
+        tabs.currentChanged.connect(self._on_tab_changed)
+
+        map_w = QWidget()
+        self._build_map_tab(map_w)
+        tabs.addTab(map_w, theme_icon("preferences-desktop-icons", "folder-images"), "Map")
+
+        editor_w = QWidget()
+        self._build_editor_tab(editor_w)
+        tabs.addTab(editor_w, theme_icon("draw-brush", "document-edit", "applications-graphics"), "Create")
+
+        settings_w = QWidget()
+        self._build_settings_tab(settings_w)
+        tabs.addTab(settings_w, theme_icon("configure", "settings-configure", "preferences-system"), "Settings")
+
+        root.addWidget(tabs)
+
+        sb = QStatusBar()
+        self.setStatusBar(sb)
+        # No sticky Map-mode hints here — those are cleared on tab change.
+        sb.clearMessage()
+
+        # Apply saved light/dark/system preference
+        apply_appearance_mode(self.settings.value("appearance/theme", "system", type=str))
+
+        # ── Menu Bar ──────────────────────────────────────────────────────────
+        menubar = self.menuBar()
+
+        # File Menu
+        file_menu = menubar.addMenu("&File")
+        
+        open_action = file_menu.addAction("&Open Icon File...")
+        open_action.setIcon(theme_icon("document-open", "file-open"))
+        open_action.setShortcut("Ctrl+O")
+        open_action.setStatusTip("Open a file browser to select an icon file")
+        open_action.triggered.connect(self._browse_for_icon_file)
+
+        import_action = file_menu.addAction("&Import Image...")
+        import_action.setIcon(theme_icon("document-import", "image-x-generic"))
+        import_action.setShortcut("Ctrl+I")
+        import_action.setStatusTip("Import an image into the icon creator canvas")
+        import_action.triggered.connect(self._editor_import)
+
+        file_menu.addSeparator()
+
+        exit_action = file_menu.addAction("&Exit")
+        exit_action.setIcon(theme_icon("application-exit", "exit"))
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.setStatusTip("Exit KAppIcon")
+        exit_action.triggered.connect(self.close)
+
+        # Options Menu
+        options_menu = menubar.addMenu("&Options")
+
+        # Theme Sub-menu
+        theme_menu = options_menu.addMenu("&Theme")
+        theme_menu.setIcon(theme_icon("preferences-desktop-theme", "preferences-color"))
+        self.theme_actions = QButtonGroup(self)
+        theme_defs = (
+            ("System", "system", self.theme_system, theme_icon("preferences-desktop-theme-global", "system")),
+            ("Light", "light", self.theme_light, theme_icon("weather-clear", "clear")),
+            ("Dark", "dark", self.theme_dark, theme_icon("weather-clear-night", "night")),
+        )
+        for name, key, button, icon in theme_defs:
+            act = theme_menu.addAction(name)
+            act.setIcon(icon)
+            act.setCheckable(True)
+            cur = self.settings.value("appearance/theme", "system", type=str)
+            act.setChecked(cur == key)
+            act.triggered.connect(lambda checked, btn=button: btn.setChecked(True))
+            button.toggled.connect(lambda checked, a=act: a.setChecked(checked))
+
+        backup_action = options_menu.addAction("&Enable Auto Backups")
+        backup_action.setIcon(theme_icon("document-save", "save"))
+        backup_action.setCheckable(True)
+        backup_action.setChecked(self.backup_check.isChecked())
+        backup_action.triggered.connect(self.backup_check.setChecked)
+        self.backup_check.toggled.connect(backup_action.setChecked)
+
+        # Help Menu
+        help_menu = menubar.addMenu("&Help")
+        
+        help_action = help_menu.addAction("&Help / Documentation")
+        help_action.setIcon(theme_icon("help-contents", "dialog-question"))
+        help_action.setShortcut("F1")
+        help_action.triggered.connect(self._show_help_dialog)
+
+        help_menu.addSeparator()
+
+        about_action = help_menu.addAction("&About KAppIcon")
+        about_action.setIcon(theme_icon("help-about", "help-hint"))
+        about_action.triggered.connect(self._show_about_dialog)
+
+        about_qt_action = help_menu.addAction("About &Qt")
+        about_qt_action.setIcon(theme_icon("qtlogo", "qt-logo"))
+        about_qt_action.triggered.connect(QApplication.aboutQt)
+
+    def _on_tab_changed(self, index):
+        """Map-only status hints must not linger on Create/Settings."""
+        if self.statusBar():
+            self.statusBar().clearMessage()
+        # Ephemeral, tab-local tip only
+        if index == 0 and self.icon_source == "system":
+            # User is back on Map with "from another app" — brief reminder is OK
+            pass
+
+    def _show_about_dialog(self):
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.about(
+            self,
+            "About KAppIcon",
+            "<h3>KAppIcon</h3>"
+            "<p>Version 3.0.0</p>"
+            "<p>A Linux utility to change application icons, reuse theme icons from other apps, "
+            "and design your own custom icons.</p>"
+            "<p>Designed for Plasma / Breeze, following freedesktop.org desktop entry specifications.</p>"
+            "<p>License: MIT</p>"
+        )
+
+    # ── Map tab ──────────────────────────────────────────────────────────
+    def _build_map_tab(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(0, layout_spacing(), 0, 0)
+        layout.setSpacing(layout_spacing())
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        # ── Left: pick icon + pick app ───────────────────────────────────
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(layout_spacing())
+
+        icon_box = QGroupBox("1. Icon to use")
+        ib = QVBoxLayout(icon_box)
+        ib.addWidget(make_hint_label(
+            "Choose the icon that will be applied — not the application you are changing."
+        ))
+
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel("Source:"))
+        self.src_combo = QComboBox()
+        self.src_combo.addItem(theme_icon("folder-images", "document-open"), "From file", "files")
+        self.src_combo.addItem(
+            theme_icon("preferences-desktop-theme", "applications-other"),
+            "From another app",
+            "system",
+        )
+        self.src_combo.currentIndexChanged.connect(self._on_src_combo)
+        src_row.addWidget(self.src_combo, stretch=1)
+        ib.addLayout(src_row)
+
+        # Keep button aliases for older call sites
+        self.src_files_btn = self.src_combo  # duck-typed via _set_icon_source
+        self.src_system_btn = self.src_combo
+
+        self.file_search = QLineEdit()
+        self.file_search.setClearButtonEnabled(True)
+        self.file_search.setPlaceholderText("Filter icons…")
+        self.file_search.setProperty("setClearButtonEnabled", True)
+        self.file_search.textChanged.connect(self._filter_files)
+        ib.addWidget(self.file_search)
+
+        self.file_list = QListWidget()
+        self.file_list.setIconSize(QSize(32, 32))
+        self.file_list.setAlternatingRowColors(True)
+        self.file_list.setUniformItemSizes(True)
+        self.file_list.currentItemChanged.connect(self._on_file_select)
+        self.file_list.itemClicked.connect(self._on_file_item_clicked)
+        self._fill_file_list(self.icon_files)
+        ib.addWidget(self.file_list, stretch=1)
+        ll.addWidget(icon_box, stretch=1)
+
+        app_box = QGroupBox("2. Application to change")
+        ab = QVBoxLayout(app_box)
+        ab.addWidget(make_hint_label("This application’s launcher icon will be replaced."))
+
+        self.app_search = QLineEdit()
+        self.app_search.setClearButtonEnabled(True)
+        self.app_search.setPlaceholderText("Filter applications…")
+        self.app_search.textChanged.connect(self._filter_apps)
+        ab.addWidget(self.app_search)
+
+        self.app_list = QListWidget()
+        self.app_list.setIconSize(QSize(32, 32))
+        self.app_list.setAlternatingRowColors(True)
+        self.app_list.setUniformItemSizes(True)
+        self.app_list.currentItemChanged.connect(lambda *_: self._update_mapping_summary())
+        for desktop_name, icon_name, display_name, _path in self.app_data:
+            item = QListWidgetItem(display_name)
+            item.setData(Qt.ItemDataRole.UserRole, desktop_name)
+            item.setData(Qt.ItemDataRole.UserRole + 1, display_name)
+            item.setData(Qt.ItemDataRole.UserRole + 2, icon_name)
+            item.setToolTip(f"Will modify: {display_name}\nDesktop file: {desktop_name}")
+            pix = resolve_icon(icon_name)
+            if pix:
+                item.setIcon(QIcon(pix))
+            self.app_list.addItem(item)
+        ab.addWidget(self.app_list, stretch=1)
+        ll.addWidget(app_box, stretch=1)
+
+        splitter.addWidget(left)
+
+        # ── Right: summary (KDE-style group boxes + dialog buttons) ─────
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(layout_spacing())
+
+        src_card = QGroupBox("Icon to use")
+        sc = QVBoxLayout(src_card)
+        self.preview_label = QLabel("Select an icon")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumSize(128, 128)
+        self.preview_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.preview_label.setFrameShadow(QFrame.Shadow.Sunken)
+        self.preview_label.mousePressEvent = self._on_empty_icon_click
+        sc.addWidget(self.preview_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        self.info_label = QLabel()
+        self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.info_label.setWordWrap(True)
+        font = self.info_label.font()
+        font.setBold(True)
+        self.info_label.setFont(font)
+        self.info_label.mousePressEvent = self._on_empty_icon_click
+        sc.addWidget(self.info_label)
+
+        self.meta_label = make_hint_label("")
+        self.meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sc.addWidget(self.meta_label)
+        rl.addWidget(src_card)
+
+        arrow = QLabel("↓  applies to")
+        arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rl.addWidget(arrow)
+
+        tgt_card = QGroupBox("Application to change")
+        tc = QHBoxLayout(tgt_card)
+        self.target_icon_label = QLabel()
+        self.target_icon_label.setFixedSize(48, 48)
+        self.target_icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.target_icon_label.setFrameShape(QFrame.Shape.StyledPanel)
+        tc.addWidget(self.target_icon_label)
+        tgt_text = QVBoxLayout()
+        self.target_name_label = QLabel("Select an application")
+        font2 = self.target_name_label.font()
+        font2.setBold(True)
+        self.target_name_label.setFont(font2)
+        self.target_name_label.setWordWrap(True)
+        tgt_text.addWidget(self.target_name_label)
+        self.target_meta_label = make_hint_label("")
+        self.target_meta_label.setWordWrap(True)
+        tgt_text.addWidget(self.target_meta_label)
+        tgt_text.addStretch(1)
+        tc.addLayout(tgt_text, stretch=1)
+        rl.addWidget(tgt_card)
+
+        self.plan_label = make_hint_label("")
+        self.plan_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rl.addWidget(self.plan_label)
+
+        rl.addStretch(1)
+
+        # KDE-style dialog buttons (Apply is the primary action)
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Close
+        )
+        self.select_btn = self.button_box.button(QDialogButtonBox.StandardButton.Apply)
+        self.select_btn.setText("Apply icon")
+        self.select_btn.setEnabled(False)
+        self.select_btn.setIcon(theme_icon("dialog-ok-apply", "dialog-ok"))
+        
+        self.reset_btn = self.button_box.addButton("Reset to default", QDialogButtonBox.ButtonRole.ActionRole)
+        self.reset_btn.setIcon(theme_icon("edit-clear-all", "edit-undo", "document-revert"))
+        self.reset_btn.setEnabled(False)
+        self.reset_btn.clicked.connect(self._reset_app_icon)
+
+        close_btn = self.button_box.button(QDialogButtonBox.StandardButton.Close)
+        close_btn.setText("Close")
+        
+        equalize_widths([self.select_btn, self.reset_btn, close_btn])
+        self.button_box.rejected.connect(self.close)
+        self.button_box.clicked.connect(self._on_dialog_button)
+        rl.addWidget(self.button_box)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([520, 360])
+
+        layout.addWidget(splitter)
+
+        if self.file_list.count() > 0 and self.file_list.item(0).data(Qt.ItemDataRole.UserRole) != BROWSE_FOR_ICON:
+            self.file_list.setCurrentRow(0)
+        else:
+            self._show_empty_icon_state()
+        self._update_mapping_summary()
+        self.file_search.setFocus()
+
+    def _on_src_combo(self, _idx=None):
+        data = self.src_combo.currentData()
+        if data:
+            self._set_icon_source(data)
+
+    def _on_dialog_button(self, button):
+        if self.button_box.buttonRole(button) == QDialogButtonBox.ButtonRole.ApplyRole:
+            self._accept()
+
+    # ── Icon editor / creator tab ────────────────────────────────────────
+    def _build_editor_tab(self, parent):
+        layout = QHBoxLayout(parent)
+        layout.setContentsMargins(0, layout_spacing(), 0, 0)
+        layout.setSpacing(layout_spacing())
+
+        # Left: tools (QGroupBox + QToolButtons with theme icons)
+        tools = QGroupBox("Tools")
+        tools.setFixedWidth(180)
+        tl = QVBoxLayout(tools)
+
+        self.editor_tool_group = QButtonGroup(self)
+        self.editor_tool_group.setExclusive(True)
+        self._tool_btns = {}
+        tool_defs = (
+            ("pen", "Pen", ("draw-brush", "edit-draw")),
+            ("eraser", "Eraser", ("draw-eraser", "edit-delete")),
+            ("fill", "Fill", ("fill-color", "color-fill")),
+            ("picker", "Picker", ("color-picker", "gtk-color-picker")),
+        )
+        for key, label, icons in tool_defs:
+            b = QToolButton()
+            b.setText(label)
+            b.setIcon(theme_icon(*icons))
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            b.setCheckable(True)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            b.clicked.connect(lambda checked, k=key: self._editor_set_tool(k))
+            self.editor_tool_group.addButton(b)
+            self._tool_btns[key] = b
+            tl.addWidget(b)
+        self._tool_btns["pen"].setChecked(True)
+
+        tl.addWidget(QLabel("Color"))
+        self.color_btn = QPushButton("Choose…")
+        self.color_btn.setIcon(theme_icon("color-management", "fill-color"))
+        self.color_btn.clicked.connect(self._editor_pick_color)
+        tl.addWidget(self.color_btn)
+
+        tl.addWidget(QLabel("Canvas size"))
+        self.size_combo = QComboBox()
+        for s in (16, 32, 48, 64, 128, 256, 512):
+            self.size_combo.addItem(f"{s} × {s}", s)
+        self.size_combo.setCurrentIndex(3)  # 64
+        self.size_combo.currentIndexChanged.connect(self._editor_resize)
+        tl.addWidget(self.size_combo)
+
+        self.grid_check = QCheckBox("Show pixel grid")
+        self.grid_check.setChecked(True)
+        self.grid_check.toggled.connect(self._editor_toggle_grid)
+        tl.addWidget(self.grid_check)
+
+        tl.addStretch(1)
+
+        clear_btn = QPushButton("Clear canvas")
+        clear_btn.setIcon(theme_icon("edit-clear", "edit-delete"))
+        clear_btn.clicked.connect(lambda: self.pixel_canvas.clear())
+        tl.addWidget(clear_btn)
+
+        layout.addWidget(tools)
+
+        # Center: canvas
+        canvas_box = QGroupBox("Canvas")
+        center = QVBoxLayout(canvas_box)
+        center.addWidget(make_hint_label(
+            "Draw with the pen, or import a photo or logo. It is scaled into the canvas."
+        ))
+        self.pixel_canvas = PixelCanvas(64)
+        self.pixel_canvas.changed.connect(self._editor_on_change)
+        center.addWidget(self.pixel_canvas, stretch=1)
+        layout.addWidget(canvas_box, stretch=1)
+
+        # Right: actions + library
+        right = QGroupBox("Library")
+        right.setFixedWidth(260)
+        rl = QVBoxLayout(right)
+
+        import_btn = QPushButton("Import image…")
+        import_btn.setIcon(theme_icon("document-open", "document-import"))
+        import_btn.clicked.connect(self._editor_import)
+        rl.addWidget(import_btn)
+        rl.addWidget(make_hint_label("PNG, JPG, WEBP, BMP, GIF"))
+
+        rl.addWidget(QLabel("Name"))
+        self.editor_name = QLineEdit()
+        self.editor_name.setPlaceholderText("e.g. My custom icon")
+        self.editor_name.setClearButtonEnabled(True)
+        self.editor_name.setToolTip(
+            "File name used when saving. You can also set or change this in the save dialog."
+        )
+        rl.addWidget(self.editor_name)
+
+        save_btn = QPushButton("Save icon")
+        save_btn.setIcon(theme_icon("document-save", "document-save-as"))
+        save_btn.setDefault(True)
+        save_btn.setToolTip(
+            "Save the canvas as a PNG in your icon library.\n"
+            "Does not change any application."
+        )
+        save_btn.clicked.connect(self._editor_save)
+        rl.addWidget(save_btn)
+
+        use_row = QHBoxLayout()
+        use_row.setSpacing(4)
+        use_btn = QPushButton("Save and use in Map")
+        use_btn.setIcon(theme_icon("go-next", "dialog-ok-apply"))
+        use_btn.setToolTip(
+            "Save the icon, switch to Map, and select it so you can assign it to an app."
+        )
+        use_btn.clicked.connect(self._editor_save_and_use)
+        use_row.addWidget(use_btn, stretch=1)
+
+        use_help = QToolButton()
+        use_help.setText("?")
+        use_help.setToolTip("What does this do?")
+        use_help.setAutoRaise(True)
+        use_help.setFixedSize(28, 28)
+        help_icon = theme_icon("help-about", "help-hint", "dialog-question")
+        if not help_icon.isNull():
+            use_help.setIcon(help_icon)
+            use_help.setText("")
+        use_help.clicked.connect(self._show_help_dialog)
+        use_row.addWidget(use_help)
+        rl.addLayout(use_row)
+
+        self.editor_status = QLabel("")
+        self.editor_status.setWordWrap(True)
+        rl.addWidget(self.editor_status)
+
+        rl.addWidget(make_hint_label(f"Stored in {LIBRARY_DIR}"))
+
+        self.library_list = QListWidget()
+        self.library_list.setIconSize(QSize(32, 32))
+        self.library_list.setAlternatingRowColors(True)
+        self.library_list.itemDoubleClicked.connect(self._editor_open_library_item)
+        rl.addWidget(self.library_list, stretch=1)
+
+        lib_btn_row = QHBoxLayout()
+        lib_btn_row.setSpacing(6)
+
+        open_lib = QPushButton("Open in Map")
+        open_lib.setIcon(theme_icon("go-jump", "go-next"))
+        open_lib.setToolTip(
+            "Take the selected library icon to Map without re-saving the canvas."
+        )
+        open_lib.clicked.connect(self._editor_library_to_map)
+        lib_btn_row.addWidget(open_lib, stretch=1)
+
+        delete_lib = QPushButton("Delete")
+        delete_lib.setIcon(theme_icon("edit-delete", "edit-clear"))
+        delete_lib.setToolTip("Delete the selected custom icon permanently from your library.")
+        delete_lib.clicked.connect(self._editor_library_delete)
+        lib_btn_row.addWidget(delete_lib)
+
+        equalize_widths([open_lib, delete_lib])
+        rl.addLayout(lib_btn_row)
+
+        layout.addWidget(right)
+
+        self._editor_update_color_btn()
+        self._refresh_library_list()
+
+    def _editor_set_tool(self, tool):
+        self.pixel_canvas.tool = tool
+        for k, b in self._tool_btns.items():
+            b.setChecked(k == tool)
+
+    def _editor_pick_color(self):
+        col = QColorDialog.getColor(
+            self.pixel_canvas.color, self, "Pen color",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel,
+        )
+        if col.isValid():
+            self.pixel_canvas.color = col
+            self._editor_update_color_btn()
+            if self.pixel_canvas.tool == "picker":
+                self._editor_set_tool("pen")
+
+    def _editor_update_color_btn(self):
+        c = self.pixel_canvas.color
+        # Small color swatch icon so we stay on Breeze chrome, not custom button skins
+        pix = QPixmap(18, 18)
+        pix.fill(c)
+        self.color_btn.setIcon(QIcon(pix))
+        label = c.name(QColor.NameFormat.HexArgb) if c.alpha() < 255 else c.name()
+        self.color_btn.setText(label)
+
+    def _editor_resize(self):
+        size = self.size_combo.currentData()
+        if size:
+            self.pixel_canvas.resize_grid(size)
+
+    def _editor_toggle_grid(self, on):
+        self.pixel_canvas.show_grid = on
+        self.pixel_canvas.update()
+
+    def _editor_on_change(self):
+        # If picker grabbed a color, refresh swatch
+        if self.pixel_canvas.tool == "picker":
+            self._editor_update_color_btn()
+
+    def _editor_import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import image for icon",
+            os.path.expanduser("~/Downloads"),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.PNG *.JPG *.WEBP);;All files (*)",
+        )
+        if not path:
+            return
+        if not self.pixel_canvas.load_from_file(path, fit=True):
+            QMessageBox.warning(self, "Import failed", f"Could not load:\n{path}")
+            return
+        base = os.path.splitext(os.path.basename(path))[0]
+        if not self.editor_name.text().strip():
+            self.editor_name.setText(base)
+        self.editor_status.setText(f"Imported {os.path.basename(path)}")
+        QTimer.singleShot(2500, lambda: self.editor_status.setText(""))
+
+    def _editor_sanitize_name(self, name):
+        name = (name or "").strip()
+        if not name:
+            name = f"icon-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in name).strip("-") or "icon"
+        if not safe.lower().endswith(".png"):
+            safe += ".png"
+        return safe
+
+    def _editor_save_path(self, name=None):
+        if name is None:
+            name = self.editor_name.text()
+        return os.path.join(LIBRARY_DIR, self._editor_sanitize_name(name))
+
+    def _editor_canvas_has_content_to_save(self):
+        """False when the canvas is blank or has not been edited since last save."""
+        if not self.pixel_canvas.is_dirty():
+            return False
+        if self.pixel_canvas.is_blank():
+            return False
+        return True
+
+    def _editor_confirm_save_canvas(self):
+        """Ask before writing; let the user set the icon name.
+
+        Returns (True, name) on Yes, or (False, None) on No/cancel.
+        name may be '' → auto timestamped filename.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Save icon")
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(layout_spacing())
+
+        title = QLabel("Do you want the current canvas saved as an icon?")
+        font = title.font()
+        font.setBold(True)
+        title.setFont(font)
+        title.setWordWrap(True)
+        lay.addWidget(title)
+        lay.addWidget(make_hint_label(
+            "Choose a name for the file in your icon library. "
+            "Leave empty to use an automatic name."
+        ))
+
+        form = QFormLayout()
+        name_edit = QLineEdit(self.editor_name.text().strip())
+        name_edit.setPlaceholderText("e.g. My custom icon")
+        name_edit.setClearButtonEnabled(True)
+        form.addRow("Name:", name_edit)
+        lay.addLayout(form)
+
+        preview = make_hint_label("")
+        lay.addWidget(preview)
+
+        def update_preview(_text=None):
+            safe = self._editor_sanitize_name(name_edit.text())
+            preview.setText(f"Will save as: {safe}")
+
+        name_edit.textChanged.connect(update_preview)
+        update_preview()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Yes).setText("Yes")
+        buttons.button(QDialogButtonBox.StandardButton.No).setText("No")
+        buttons.button(QDialogButtonBox.StandardButton.Yes).clicked.connect(dlg.accept)
+        buttons.button(QDialogButtonBox.StandardButton.No).clicked.connect(dlg.reject)
+        lay.addWidget(buttons)
+
+        name_edit.setFocus()
+        name_edit.selectAll()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False, None
+        name = name_edit.text().strip()
+        self.editor_name.setText(name)
+        return True, name
+
+    def _editor_save(self, silent=False, ask_confirm=True):
+        if not self._editor_canvas_has_content_to_save():
+            if not silent:
+                if not self.pixel_canvas.is_dirty():
+                    msg = "Nothing to save — the canvas is unchanged."
+                else:
+                    msg = "Nothing to save — the canvas is empty."
+                self.editor_status.setText(msg)
+                QTimer.singleShot(3000, lambda: self.editor_status.setText(""))
+            return None
+
+        chosen_name = self.editor_name.text().strip()
+        if ask_confirm:
+            ok, name = self._editor_confirm_save_canvas()
+            if not ok:
+                return None
+            chosen_name = name  # may be ""
+
+        path = self._editor_save_path(chosen_name)
+        # Avoid silently overwriting without notice
+        if os.path.isfile(path):
+            overwrite = QMessageBox.question(
+                self,
+                "Replace file?",
+                f"“{os.path.basename(path)}” already exists.\nDo you want to replace it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if overwrite != QMessageBox.StandardButton.Yes:
+                return None
+
+        os.makedirs(LIBRARY_DIR, exist_ok=True)
+        # Export at least 512px for crisp desktop icons when source grid is smaller
+        img = self.pixel_canvas.image()
+        export = img
+        if img.width() < 512:
+            export = img.scaled(
+                512, 512,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+        if not export.save(path, "PNG"):
+            QMessageBox.warning(self, "Save failed", f"Could not write:\n{path}")
+            return None
+        self.pixel_canvas.mark_clean()
+        self._refresh_library_list()
+        # Also ensure Map source can see it
+        if path not in self.icon_files:
+            self.icon_files.append(path)
+        if not silent:
+            self.editor_status.setText(f"Saved {os.path.basename(path)}")
+            QTimer.singleShot(2500, lambda: self.editor_status.setText(""))
+        return path
+
+    def _show_help_dialog(self):
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.information(
+            self,
+            "KAppIcon Help & Workflow",
+            "<h2>KAppIcon Documentation</h2>"
+            "<p>KAppIcon is a Linux utility to customize launcher icons for your installed applications "
+            "following the freedesktop.org desktop entry specifications.</p>"
+            
+            "<h3>🔄 Workflow 1: Map an Icon to an Application</h3>"
+            "<ol>"
+            "<li><b>Select Icon Source</b> (Step 1): Choose <i>From file</i> (your custom/downloaded PNGs or ICNS) "
+            "or <i>From another app</i> (extracts theme icon names from existing launchers). Select the icon in the list.</li>"
+            "<li><b>Select Target Application</b> (Step 2): Select the application whose launcher you want to customize.</li>"
+            "<li><b>Apply</b>: Click <i>Apply icon</i> to copy the launcher into your local user directory and change the Icon field.</li>"
+            "</ol>"
+            
+            "<h3>🎨 Workflow 2: Create Custom Icons</h3>"
+            "<ol>"
+            "<li>Open the <b>Create</b> tab.</li>"
+            "<li>Set a canvas size (e.g., 16x16, 32x32, 64x64, etc.) or click <i>Import image...</i> to import an existing graphic.</li>"
+            "<li>Draw pixel art using the <b>Pen</b>, <b>Eraser</b>, <b>Fill</b>, and <b>Color Picker</b> tools.</li>"
+            "<li>Enter a name in the <i>Save Name</i> field and click <i>Save icon</i> or <i>Save and use in Map</i>.</li>"
+            "</ol>"
+            
+            "<h3>🛠️ Resetting & Library Maintenance</h3>"
+            "<ul>"
+            "<li><b>Reset launcher icon</b>: Select any application in the Map tab and click <b>Reset to default</b>. "
+            "This will restore its original system-defined icon while preserving any other custom configuration.</li>"
+            "<li><b>Delete custom designs</b>: In the Create tab under <i>Your Icons</i>, select any icon and click <b>Delete</b> "
+            "to permanently delete the file from your local icon library.</li>"
+            "<li><b>Backups</b>: In the Settings tab, you can enable auto-backups or revert overrides using the backup restorer.</li>"
+            "</ul>",
+        )
+
+    def _editor_save_and_use(self):
+        path = self._editor_save_path()
+        if not self.pixel_canvas.is_dirty() and os.path.isfile(path):
+            self._add_icon_file(path)
+            self._set_icon_source("files")
+            self.main_tabs.setCurrentIndex(0)  # Map tab
+            self.plan_label.setText(
+                f"Icon ready: {os.path.basename(path)}. Now choose the app to change."
+            )
+            return
+
+        if not self._editor_canvas_has_content_to_save():
+            if not self.pixel_canvas.is_dirty():
+                msg = "Nothing to save — the canvas is unchanged."
+            else:
+                msg = "Nothing to save — the canvas is empty."
+            self.editor_status.setText(msg)
+            QTimer.singleShot(3000, lambda: self.editor_status.setText(""))
+            QMessageBox.information(self, "Save and use in Map", msg)
+            return
+
+        # Confirm + name, then save (no second prompt)
+        path = self._editor_save(silent=True, ask_confirm=True)
+        if not path:
+            return
+        self._add_icon_file(path)
+        self._set_icon_source("files")
+        self.main_tabs.setCurrentIndex(0)  # Map tab
+        self.editor_status.setText("Saved — pick an app on Map, then Apply")
+        self.plan_label.setText(
+            f"Icon ready: {os.path.basename(path)}. Now choose the app to change."
+        )
+
+    def _refresh_library_list(self):
+        self.library_list.clear()
+        if not os.path.isdir(LIBRARY_DIR):
+            return
+        files = []
+        for f in os.listdir(LIBRARY_DIR):
+            path = os.path.join(LIBRARY_DIR, f)
+            if os.path.isfile(path) and os.path.splitext(f)[1].lower() in ICON_EXTENSIONS:
+                files.append(path)
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for path in files:
+            display_name = os.path.splitext(os.path.basename(path))[0]
+            item = QListWidgetItem(display_name)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            pix = QPixmap(path)
+            if not pix.isNull():
+                item.setIcon(QIcon(pix.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation)))
+            self.library_list.addItem(item)
+
+    def _editor_open_library_item(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and os.path.isfile(path):
+            # Load into canvas at current grid size
+            self.pixel_canvas.load_from_file(path, fit=True)
+            # Matches disk until the user draws again
+            self.pixel_canvas.mark_clean()
+            self.editor_name.setText(os.path.splitext(os.path.basename(path))[0])
+
+    def _editor_library_to_map(self):
+        item = self.library_list.currentItem()
+        if not item:
+            self.editor_status.setText("Select an icon in Your Icons first")
+            QTimer.singleShot(2000, lambda: self.editor_status.setText(""))
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and os.path.isfile(path):
+            self._add_icon_file(path)
+            self._set_icon_source("files")
+            self.main_tabs.setCurrentIndex(0)
+
+    def _editor_library_delete(self):
+        item = self.library_list.currentItem()
+        if not item:
+            self.editor_status.setText("Select an icon to delete first")
+            QTimer.singleShot(2000, lambda: self.editor_status.setText(""))
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and os.path.isfile(path):
+            filename = os.path.basename(path)
+            from PyQt6.QtWidgets import QMessageBox
+            confirm = QMessageBox.question(
+                self,
+                "Delete Icon?",
+                f"Are you sure you want to permanently delete “{filename}” from your icon library?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                try:
+                    os.remove(path)
+                    self._refresh_library_list()
+                    if path in self.icon_files:
+                        self.icon_files.remove(path)
+                        self._fill_file_list(self.icon_files)
+                    self.editor_status.setText(f"Deleted {filename}")
+                    QTimer.singleShot(2500, lambda: self.editor_status.setText(""))
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Could not delete file:\n{e}")
+
+    # ── Settings tab (KDE form / group box layout) ───────────────────────
+    def _build_settings_tab(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(0, layout_spacing(), 0, 0)
+        layout.setSpacing(layout_spacing())
+
+        look = QGroupBox("Appearance")
+        look_l = QVBoxLayout(look)
+        look_l.addWidget(make_hint_label(
+            "Widget style stays Breeze. Colors can follow the system or be forced light/dark."
+        ))
+        theme_row = QHBoxLayout()
+        self.theme_group = QButtonGroup(self)
+        self.theme_system = QRadioButton("System")
+        self.theme_light = QRadioButton("Light")
+        self.theme_dark = QRadioButton("Dark")
+        self.theme_group.addButton(self.theme_system)
+        self.theme_group.addButton(self.theme_light)
+        self.theme_group.addButton(self.theme_dark)
+        cur = self.settings.value("appearance/theme", "system", type=str)
+        {"light": self.theme_light, "dark": self.theme_dark}.get(cur, self.theme_system).setChecked(True)
+        self.theme_system.toggled.connect(lambda on: on and self._on_theme("system"))
+        self.theme_light.toggled.connect(lambda on: on and self._on_theme("light"))
+        self.theme_dark.toggled.connect(lambda on: on and self._on_theme("dark"))
+        theme_row.addWidget(self.theme_system)
+        theme_row.addWidget(self.theme_light)
+        theme_row.addWidget(self.theme_dark)
+        theme_row.addStretch(1)
+        look_l.addLayout(theme_row)
+        layout.addWidget(look)
+
+        backups = QGroupBox("Backups")
+        bl = QVBoxLayout(backups)
+        self.backup_check = QCheckBox("Create a backup of .desktop files before changing them")
+        self.backup_check.setChecked(self.settings.value("backups/enabled", False, type=bool))
+        self.backup_check.toggled.connect(lambda v: self.settings.setValue("backups/enabled", v))
+        bl.addWidget(self.backup_check)
+        bl.addWidget(make_hint_label(
+            "Backups are stored in ~/.local/share/kappicon/backups/"
+        ))
+        layout.addWidget(backups)
+
+        source = QGroupBox("Icon files")
+        sf = QFormLayout(source)
+        default_src = os.environ.get("DOWNLOADS_DIR", os.path.expanduser("~/Downloads"))
+        self.source_input = QLineEdit(self.settings.value("source/folder", default_src, type=str))
+        self.source_input.setClearButtonEnabled(True)
+        self.source_input.editingFinished.connect(self._on_source_change)
+        browse = QPushButton("Browse…")
+        browse.setIcon(theme_icon("folder-open", "document-open"))
+        browse.clicked.connect(self._browse_source)
+        src_row = QHBoxLayout()
+        src_row.addWidget(self.source_input, stretch=1)
+        src_row.addWidget(browse)
+        sf.addRow("Source folder:", src_row)
+        sf.addRow("", make_hint_label(
+            "Used by Map → “From file”. Created icons are always available from the library."
+        ))
+        layout.addWidget(source)
+
+        maint = QGroupBox("Maintenance")
+        ml = QHBoxLayout(maint)
+        restore_btn = QPushButton("Restore backup…")
+        restore_btn.setIcon(theme_icon("edit-undo", "document-revert"))
+        restore_btn.clicked.connect(self._restore_backup)
+        ml.addWidget(restore_btn)
+        self._restore_status = QLabel("")
+        ml.addWidget(self._restore_status)
+
+        refresh_btn = QPushButton("Refresh icon cache")
+        refresh_btn.setIcon(theme_icon("view-refresh", "system-reboot"))
+        refresh_btn.clicked.connect(self._force_refresh)
+        ml.addWidget(refresh_btn)
+        self._refresh_status = QLabel("")
+        ml.addWidget(self._refresh_status)
+        equalize_widths([restore_btn, refresh_btn])
+        ml.addStretch(1)
+        layout.addWidget(maint)
+
+        about = QGroupBox("About")
+        al = QVBoxLayout(about)
+        al.addWidget(QLabel("KAppIcon — change, create, and map application icons."))
+        al.addWidget(make_hint_label(
+            "Designed for Plasma / Breeze. Icons follow the freedesktop.org desktop entry standard."
+        ))
+        layout.addWidget(about)
+
+        layout.addStretch(1)
+
+    # ── Settings callbacks ───────────────────────────────────────────────
+    def _on_theme(self, theme):
+        self.settings.setValue("appearance/theme", theme)
+        apply_appearance_mode(theme)
+        # Repolish so palette()-based styles (hint text, etc.) pick up new colors
+        app = QApplication.instance()
+        if app:
+            for w in app.allWidgets():
+                w.style().unpolish(w)
+                w.style().polish(w)
+                w.update()
+
+    def _browse_source(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Source Folder", self.source_input.text())
+        if d:
+            self.source_input.setText(d)
+            self.settings.setValue("source/folder", d)
+            self._rescan_source()
+
+    def _on_source_change(self):
+        path = self.source_input.text()
+        self.settings.setValue("source/folder", path)
+        self._rescan_source()
+
+    def _icon_start_dir(self):
+        if hasattr(self, "source_input"):
+            folder = self.source_input.text().strip()
+            if folder and os.path.isdir(folder):
+                return folder
+        folder = self.settings.value(
+            "source/folder",
+            os.environ.get("DOWNLOADS_DIR", os.path.expanduser("~/Downloads")),
+            type=str,
+        )
+        if folder and os.path.isdir(folder):
+            return folder
+        return os.path.expanduser("~")
+
+    def _set_icon_source(self, source):
+        """Switch between custom files and system theme icons."""
+        self.icon_source = source
+        # Keep combo in sync without re-entrancy
+        if hasattr(self, "src_combo"):
+            idx = self.src_combo.findData(source)
+            if idx >= 0 and self.src_combo.currentIndex() != idx:
+                self.src_combo.blockSignals(True)
+                self.src_combo.setCurrentIndex(idx)
+                self.src_combo.blockSignals(False)
+
+        if source == "system":
+            self.file_search.setPlaceholderText("Filter by application name…")
+            self.file_search.clear()
+            self._fill_system_list()
+            self._clear_empty_icon_state()
+            if self.file_list.count() > 0:
+                self.file_list.setCurrentRow(0)
+            else:
+                self.preview_label.setText("No system icons")
+                self.info_label.setText("No theme icons found from installed apps.")
+                self.meta_label.setText("")
+            self._update_mapping_summary()
+            # Status only while Map is visible; cleared automatically on tab change
+            if self.statusBar() and self.main_tabs.currentIndex() == 0:
+                self.statusBar().showMessage(
+                    "Showing icons already used by installed applications.",
+                    5000,
+                )
+        else:
+            self.file_search.setPlaceholderText("Filter icons…")
+            self.file_search.clear()
+            self._fill_file_list(self.icon_files)
+            if self.icon_files:
+                self._clear_empty_icon_state()
+                self.file_list.setCurrentRow(0)
+            else:
+                self._show_empty_icon_state()
+            self._update_mapping_summary()
+            if self.statusBar() and self.main_tabs.currentIndex() == 0:
+                self.statusBar().showMessage(
+                    "Showing icon files from your source folder and library.",
+                    5000,
+                )
+
+    def _fill_file_list(self, files):
+        """Populate the icon list, or a single clickable browse row when empty."""
+        self.file_list.clear()
+        if not files:
+            item = QListWidgetItem("No icons found — click to browse…")
+            item.setData(Qt.ItemDataRole.UserRole, BROWSE_FOR_ICON)
+            folder_icon = QIcon.fromTheme("folder-open")
+            if folder_icon.isNull():
+                folder_icon = QIcon.fromTheme("document-open")
+            if not folder_icon.isNull():
+                item.setIcon(folder_icon)
+            item.setToolTip("Open a file browser to choose an .icns or .png icon")
+            self.file_list.addItem(item)
+            return
+        for fp in files:
+            item = QListWidgetItem(os.path.basename(fp))
+            item.setData(Qt.ItemDataRole.UserRole, fp)
+            ext = os.path.splitext(fp)[1].lower()
+            if ext == ".png":
+                pix = QPixmap(fp)
+                if not pix.isNull():
+                    item.setIcon(QIcon(pix.scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio,
+                                                   Qt.TransformationMode.SmoothTransformation)))
+            else:
+                ti = QIcon.fromTheme("image-x-generic")
+                if not ti.isNull():
+                    item.setIcon(QIcon(ti.pixmap(28, 28)))
+            self.file_list.addItem(item)
+
+    def _fill_system_list(self):
+        """List theme icons already used by installed applications."""
+        self.file_list.clear()
+        for icon_name, desktops in self.system_icons:
+            primary = pick_primary_provider(desktops)
+            provider_label = self.desktop_labels.get(
+                primary, os.path.splitext(primary)[0]
+            )
+            # Clear: this is the *source* of the icon, not the target app
+            label = f"{provider_label}'s icon"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, THEME_ICON_PREFIX + icon_name)
+            item.setData(Qt.ItemDataRole.UserRole + 1, provider_label)
+            item.setData(Qt.ItemDataRole.UserRole + 2, icon_name)
+            other = [self.desktop_labels.get(d, d) for d in desktops if d != primary]
+            tip = (
+                f"Use the same icon as: {provider_label}\n"
+                f"Theme name: {icon_name}\n"
+                f"Desktop: {primary}"
+            )
+            if other:
+                tip += "\nAlso used by: " + ", ".join(other[:8])
+                if len(other) > 8:
+                    tip += f" (+{len(other) - 8} more)"
+            item.setToolTip(tip)
+            theme_icon = QIcon.fromTheme(icon_name)
+            if not theme_icon.isNull():
+                item.setIcon(theme_icon)
+            else:
+                fallback = QIcon.fromTheme("image-x-generic")
+                if not fallback.isNull():
+                    item.setIcon(fallback)
+            self.file_list.addItem(item)
+
+        # Sort by friendly provider name for scannability
+        self.file_list.sortItems()
+
+    def _show_empty_icon_state(self):
+        self.preview_label.clear()
+        self.preview_label.setText("No icon files\nClick to browse")
+        self.preview_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.preview_label.setToolTip("Click to browse for an icon file")
+        self.info_label.setText("No custom icon selected")
+        self.info_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.info_label.setToolTip("Click to browse for an icon file")
+        self.meta_label.setText("Or switch to “From another app” above")
+        self._update_mapping_summary()
+
+    def _clear_empty_icon_state(self):
+        self.preview_label.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        self.preview_label.setToolTip("")
+        self.info_label.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        self.info_label.setToolTip("")
+
+    def _on_empty_icon_click(self, event):
+        # Only treat as browse when we're in the files empty state
+        if self.icon_source != "files":
+            return
+        cur = self.file_list.currentItem()
+        data = cur.data(Qt.ItemDataRole.UserRole) if cur else BROWSE_FOR_ICON
+        if data == BROWSE_FOR_ICON or not self.icon_files:
+            self._browse_for_icon_file()
+
+    def _on_file_item_clicked(self, item):
+        if item and item.data(Qt.ItemDataRole.UserRole) == BROWSE_FOR_ICON:
+            self._browse_for_icon_file()
+
+    def _browse_for_icon_file(self):
+        """Open a file browser so the user can pick an .icns/.png from anywhere.
+
+        Prefers kdialog on KDE (native open dialog — same stack as Dolphin),
+        then Qt's dialog. The selected file is added to the list so it can be
+        mapped immediately, even if it lives outside the source folder.
+        """
+        start = self._icon_start_dir()
+        path = None
+
+        if shutil.which("kdialog"):
+            try:
+                proc = subprocess.run(
+                    [
+                        "kdialog",
+                        "--title", "Select icon file",
+                        "--getopenfilename", start,
+                        "*.icns *.png *.ICNS *.PNG|Icon files\n*|All files",
+                    ],
+                    capture_output=True, text=True, timeout=600,
+                )
+                if proc.returncode == 0:
+                    candidate = proc.stdout.strip()
+                    if candidate and os.path.isfile(candidate):
+                        path = candidate
+            except Exception:
+                path = None
+        else:
+            chosen, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select icon file",
+                start,
+                "Icon files (*.icns *.png *.ICNS *.PNG);;All files (*)",
+            )
+            if chosen and os.path.isfile(chosen):
+                path = chosen
+
+        if path:
+            self._add_icon_file(path)
+
+    def _add_icon_file(self, path):
+        path = os.path.abspath(path)
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in ICON_EXTENSIONS:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Unsupported file",
+                f"Please choose an .icns or .png file.\n\nGot: {ext or '(no extension)'}",
+            )
+            return
+
+        if path not in self.icon_files:
+            self.icon_files.append(path)
+            # Prefer showing the file's directory as source when list was empty
+            parent = os.path.dirname(path)
+            if hasattr(self, "source_input") and parent and os.path.isdir(parent):
+                # Don't overwrite a populated source folder unless it was empty of icons
+                if self.file_list.count() == 0 or (
+                    self.file_list.count() == 1
+                    and self.file_list.item(0).data(Qt.ItemDataRole.UserRole) == BROWSE_FOR_ICON
+                ):
+                    self.source_input.setText(parent)
+                    self.settings.setValue("source/folder", parent)
+
+        self._fill_file_list(self.icon_files)
+        self._clear_empty_icon_state()
+        # Select the newly added file
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == path:
+                self.file_list.setCurrentItem(item)
+                break
+        self._update_mapping_summary()
+
+    def _rescan_source(self):
+        folder = self.source_input.text()
+        new_files = []
+        if os.path.isdir(folder):
+            try:
+                names = os.listdir(folder)
+            except OSError:
+                names = []
+            for f in sorted(names):
+                path = os.path.join(folder, f)
+                if os.path.isfile(path) and os.path.splitext(f)[1].lower() in ICON_EXTENSIONS:
+                    new_files.append(path)
+        # Keep any icons the user browsed to that live outside the source folder
+        for fp in self.icon_files:
+            if fp not in new_files and os.path.isfile(fp):
+                if os.path.dirname(fp) != os.path.abspath(folder):
+                    new_files.append(fp)
+        self.icon_files = new_files
+        self._fill_file_list(self.icon_files)
+        if self.icon_files:
+            self._clear_empty_icon_state()
+            self.file_list.setCurrentRow(0)
+            self.preview_label.setText("Select an icon")
+            self.info_label.setText("")
+            self.meta_label.setText("")
+        else:
+            self._show_empty_icon_state()
+
+    def _restore_backup(self):
+        backup_dir = os.path.expanduser("~/.local/share/kappicon/backups")
+        if not os.path.isdir(backup_dir):
+            self._restore_status.setText("No backups found")
+            QTimer.singleShot(2000, lambda: self._restore_status.setText(""))
+            return
+        backups = sorted(
+            [f for f in os.listdir(backup_dir) if ".backup." in f],
+            key=lambda f: os.path.getmtime(os.path.join(backup_dir, f)),
+            reverse=True,
+        )
+        if not backups:
+            self._restore_status.setText("No backups found")
+            QTimer.singleShot(2000, lambda: self._restore_status.setText(""))
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        choice, ok = QInputDialog.getItem(self, "Restore Backup", "Select backup to restore:", backups, 0, False)
+        if ok and choice:
+            src = os.path.join(backup_dir, choice)
+            desktop_name = choice.split(".backup.")[0]
+            dest_dir = os.path.expanduser("~/.local/share/applications")
+            dest = os.path.join(dest_dir, desktop_name)
+            try:
+                shutil.copy2(src, dest)
+                for cmd in (["kbuildsycoca6"], ["kbuildsycoca5"]):
+                    try:
+                        subprocess.run(cmd, capture_output=True, timeout=10)
+                        break
+                    except Exception:
+                        continue
+                self._restore_status.setText("Restored!")
+                QTimer.singleShot(2000, lambda: self._restore_status.setText(""))
+            except Exception as e:
+                self._restore_status.setText(f"Failed: {e}")
+                QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
+
+    def _force_refresh(self):
+        cmds = [
+            ["kbuildsycoca6"],
+            ["kbuildsycoca5"],
+        ]
+        for cmd in cmds:
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=10)
+                break
+            except Exception:
+                continue
+        for p in ("~/.icons", "~/.local/share/icons"):
+            ep = os.path.expanduser(p)
+            if os.path.isdir(ep):
+                try:
+                    subprocess.run(["gtk-update-icon-cache", "-f", "-t", ep], capture_output=True, timeout=10)
+                except Exception:
+                    pass
+        self._refresh_status.setText("Refreshed!")
+        QTimer.singleShot(2000, lambda: self._refresh_status.setText(""))
+
+    # ── Map tab callbacks ────────────────────────────────────────────────
+    def _on_file_select(self, current, previous):
+        if not current:
+            self._update_mapping_summary()
+            return
+        data = current.data(Qt.ItemDataRole.UserRole)
+        if not data or data == BROWSE_FOR_ICON:
+            self._update_mapping_summary()
+            return
+
+        if self._preview_tmpdir:
+            shutil.rmtree(self._preview_tmpdir, ignore_errors=True)
+            self._preview_tmpdir = None
+
+        # System / freedesktop theme icon
+        if isinstance(data, str) and data.startswith(THEME_ICON_PREFIX):
+            name = data[len(THEME_ICON_PREFIX):]
+            provider = current.data(Qt.ItemDataRole.UserRole + 1) or name
+            self._clear_empty_icon_state()
+            self.info_label.setText(f"{provider}'s icon")
+            self.meta_label.setText(
+                f"Copying the icon that “{provider}” uses\n"
+                f"(theme name: {name})"
+            )
+            theme_icon = QIcon.fromTheme(name)
+            if not theme_icon.isNull():
+                pix = theme_icon.pixmap(160, 160)
+                if not pix.isNull():
+                    self.preview_label.setPixmap(pix)
+                    self._update_mapping_summary()
+                    return
+            self.preview_label.setText("No preview")
+            self._update_mapping_summary()
+            return
+
+        # Custom file on disk
+        fp = data
+        if not os.path.isfile(fp):
+            self._update_mapping_summary()
+            return
+        self._clear_empty_icon_state()
+        self.info_label.setText(os.path.basename(fp))
+        size = os.path.getsize(fp)
+        size_s = f"{size / 1024:.0f} KB" if size < 1048576 else f"{size / 1048576:.1f} MB"
+        self.meta_label.setText(f"Custom icon file · {size_s}")
+        preview = extract_preview(fp)
+        if preview:
+            pix = QPixmap(preview)
+            if not pix.isNull():
+                scaled = pix.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation)
+                self.preview_label.setPixmap(scaled)
+                self._preview_tmpdir = os.path.dirname(preview)
+                if self._preview_tmpdir == os.path.dirname(fp):
+                    self._preview_tmpdir = None
+        else:
+            self.preview_label.setText("No preview")
+        self._update_mapping_summary()
+
+    def _update_mapping_summary(self):
+        """Keep the right-hand “icon → app” story in sync with both lists."""
+        ai = self.app_list.currentItem() if hasattr(self, "app_list") else None
+        fi = self.file_list.currentItem() if hasattr(self, "file_list") else None
+
+        # Target app card
+        if ai:
+            desktop = ai.data(Qt.ItemDataRole.UserRole)
+            display = ai.data(Qt.ItemDataRole.UserRole + 1) or ai.text()
+            cur_icon = ai.data(Qt.ItemDataRole.UserRole + 2)
+            self.target_name_label.setText(display)
+            self.target_meta_label.setText(f"Desktop file: {desktop}")
+            pix = resolve_icon(cur_icon)
+            if pix:
+                self.target_icon_label.setPixmap(
+                    pix.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+                )
+            else:
+                self.target_icon_label.setText("?")
+                self.target_icon_label.setPixmap(QPixmap())
+        else:
+            self.target_name_label.setText("Pick an app on the left")
+            self.target_meta_label.setText("This is the program whose icon will change.")
+            self.target_icon_label.clear()
+            self.target_icon_label.setText("")
+
+        # Plan sentence + apply button
+        icon_ok = False
+        icon_desc = None
+        if fi:
+            data = fi.data(Qt.ItemDataRole.UserRole)
+            if data and data != BROWSE_FOR_ICON:
+                icon_ok = True
+                if isinstance(data, str) and data.startswith(THEME_ICON_PREFIX):
+                    provider = fi.data(Qt.ItemDataRole.UserRole + 1) or data
+                    icon_desc = f"{provider}'s icon"
+                else:
+                    icon_desc = os.path.basename(str(data))
+
+        if icon_ok and ai:
+            display = ai.data(Qt.ItemDataRole.UserRole + 1) or ai.text()
+            self.plan_label.setText(
+                f"Will set {display}'s launcher icon to {icon_desc}."
+            )
+            self.select_btn.setText(f"Apply to {display}")
+            self.select_btn.setEnabled(True)
+            self.select_btn.setDefault(True)
+            if self.statusBar() and self.main_tabs.currentIndex() == 0:
+                self.statusBar().showMessage(
+                    f"Ready: apply {icon_desc} → {display}",
+                    8000,
+                )
+        elif icon_ok:
+            self.plan_label.setText("Now select the application to change (step 2).")
+            self.select_btn.setText("Apply")
+            self.select_btn.setEnabled(False)
+        elif ai:
+            self.plan_label.setText("Now select the icon to use (step 1).")
+            self.select_btn.setText("Apply")
+            self.select_btn.setEnabled(False)
+        else:
+            self.plan_label.setText("Select an icon (step 1) and an application (step 2).")
+            self.select_btn.setText("Apply")
+            self.select_btn.setEnabled(False)
+        self.reset_btn.setEnabled(bool(ai))
+
+    def _filter_files(self, text):
+        q = text.lower()
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            data = item.data(Qt.ItemDataRole.UserRole) or ""
+            hay = item.text().lower()
+            if isinstance(data, str):
+                hay += " " + data.lower()
+                tip = item.toolTip() or ""
+                hay += " " + tip.lower()
+            # include provider / theme name roles
+            for role in (Qt.ItemDataRole.UserRole + 1, Qt.ItemDataRole.UserRole + 2):
+                extra = item.data(role)
+                if extra:
+                    hay += " " + str(extra).lower()
+            item.setHidden(q not in hay if q else False)
+
+    def _filter_apps(self, text):
+        q = text.lower()
+        for i in range(self.app_list.count()):
+            item = self.app_list.item(i)
+            hay = item.text().lower()
+            desktop = item.data(Qt.ItemDataRole.UserRole) or ""
+            hay += " " + str(desktop).lower()
+            tip = item.toolTip() or ""
+            hay += " " + tip.lower()
+            item.setHidden(q not in hay if q else False)
+
+    def _accept(self):
+        fi = self.file_list.currentItem()
+        ai = self.app_list.currentItem()
+        if not fi or not ai:
+            return
+        data = fi.data(Qt.ItemDataRole.UserRole)
+        desktop = ai.data(Qt.ItemDataRole.UserRole)
+        if data == BROWSE_FOR_ICON or not data:
+            if self.icon_source == "files":
+                self._browse_for_icon_file()
+            return
+        if not desktop:
+            return
+        if isinstance(data, str) and data.startswith(THEME_ICON_PREFIX):
+            self.selected_file = data
+            self.selected_app = desktop
+            self.close()
+            return
+        if not os.path.isfile(data):
+            return
+        self.selected_file = data
+        self.selected_app = desktop
+        self.close()
+
+    def _reset_app_icon(self):
+        ai = self.app_list.currentItem()
+        if not ai:
+            return
+        desktop = ai.data(Qt.ItemDataRole.UserRole)
+        display = ai.data(Qt.ItemDataRole.UserRole + 1) or ai.text()
+        from PyQt6.QtWidgets import QMessageBox
+        confirm = QMessageBox.question(
+            self,
+            "Reset Icon?",
+            f"Are you sure you want to reset {display}'s icon to the default system icon?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.selected_file = "RESET"
+        self.selected_app = desktop
+        self.close()
+
+    def closeEvent(self, event):
+        if self._preview_tmpdir:
+            shutil.rmtree(self._preview_tmpdir, ignore_errors=True)
+        super().closeEvent(event)
+
+
+# ── Scan + run ───────────────────────────────────────────────────────────
+app = QApplication([])
+apply_breeze_style(app)
+# Apply saved scheme before the window is built (so first paint is correct)
+_settings_early = QSettings("KAppIcon", "KAppIcon")
+apply_appearance_mode(_settings_early.value("appearance/theme", "system", type=str))
+
+settings = QSettings("KAppIcon", "KAppIcon")
+source_folder = settings.value("source/folder",
+    os.environ.get("DOWNLOADS_DIR", os.path.expanduser("~/Downloads")), type=str)
+
+def scan_icons(folder):
+    files = []
+    if os.path.isdir(folder):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return files
+        for f in sorted(names):
+            path = os.path.join(folder, f)
+            if os.path.isfile(path) and os.path.splitext(f)[1].lower() in ICON_EXTENSIONS:
+                files.append(path)
+    return files
+
+icon_files = scan_icons(source_folder)
+# Always include icons created in the KAppIcon library
+for p in scan_icons(LIBRARY_DIR):
+    if p not in icon_files:
+        icon_files.append(p)
+
+app_data = []
+for dp in DESKTOP_LIST_RAW:
+    basename = os.path.basename(dp)
+    display_name, icon_name = parse_desktop_fields(dp)
+    app_data.append((basename, icon_name, display_name, dp))
+# Stable sort by friendly name
+app_data.sort(key=lambda t: (t[2] or t[0]).lower())
+
+# Always open the window — even with zero custom files. System theme icons
+# are available via the System source toggle.
+win = CombinedWindow(icon_files, app_data)
+win.show()
+# If there are no custom files but system icons exist, land on System so the
+# window is immediately useful (e.g. Shelly → Discover's icon).
+if not icon_files and win.system_icons:
+    win._set_icon_source("system")
+elif not icon_files:
+    from PyQt6.QtWidgets import QMessageBox
+    QMessageBox.information(
+        win,
+        "No icons found",
+        f"No .icns or .png files found in:\n\n{source_folder}\n\n"
+        "Click the empty list to browse for a file, switch to System for "
+        "theme icons already used by installed apps, or set a different "
+        "folder under Settings → Source Folder.",
+    )
+app.exec()
+
+if win.selected_file and win.selected_app:
+    print(win.selected_file)
+    print(win.selected_app)
+    print("BACKUP=1" if settings.value("backups/enabled", False, type=bool) else "BACKUP=0")
+else:
+    sys.exit(1)
+PYEOF
+)
+PY_STATUS=$?
+
+# Exit if cancelled (user closed window without mapping)
+if [ $PY_STATUS -ne 0 ] || [ -z "$RESULT" ]; then
+    if [ $PY_STATUS -ne 0 ] && [ $PY_STATUS -ne 1 ]; then
+        echo "❌ GUI failed (exit $PY_STATUS). Is PyQt6 installed? Try: python3 -c 'import PyQt6'"
+        exit 1
+    fi
+    echo "Cancelled."
+    exit 0
+fi
+
+SELECTED_ICON=$(echo "$RESULT" | sed -n '1p')
+SELECTED_APP=$(echo "$RESULT" | sed -n '2p')
+BACKUP_ENABLED=$(echo "$RESULT" | sed -n '3p' | cut -d= -f2)
+
+if [ -z "$SELECTED_ICON" ] || [ -z "$SELECTED_APP" ]; then
+    echo "Cancelled."
+    exit 0
+fi
+
+if [ "$SELECTED_ICON" = "RESET" ]; then
+    USER_PATH="$HOME/.local/share/applications/$SELECTED_APP"
+    if [ -f "$USER_PATH" ]; then
+        SYS_PATH=""
+        for d in $(get_desktop_dirs); do
+            if [ "$d" != "$HOME/.local/share/applications" ] && [ -f "$d/$SELECTED_APP" ]; then
+                SYS_PATH="$d/$SELECTED_APP"
+                break
+            fi
+        done
+        
+        if [ -n "$SYS_PATH" ] && [ -f "$SYS_PATH" ]; then
+            ORIG_ICON=$(grep -E '^Icon=' "$SYS_PATH" | head -n 1 | cut -d= -f2-)
+            if [ -n "$ORIG_ICON" ]; then
+                ICON_SED=$(printf '%s\n' "$ORIG_ICON" | sed -e 's/[&|\\]/\\&/g')
+                sed -i "s|^Icon=.*|Icon=$ICON_SED|" "$USER_PATH"
+                show_info "Reset $SELECTED_APP icon back to '$ORIG_ICON'"
+            else
+                sed -i "/^Icon=/d" "$USER_PATH"
+                show_info "Removed custom icon from $SELECTED_APP"
+            fi
+        else
+            sed -i "/^Icon=/d" "$USER_PATH"
+            show_info "Removed custom icon from $SELECTED_APP"
+        fi
+    fi
+    
+    kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null
+    gtk-update-icon-cache -f -t ~/.icons 2>/dev/null
+    gtk-update-icon-cache -f -t ~/.local/share/icons 2>/dev/null
+    
+    qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
+        var desktops = desktops();
+        for (var i = 0; i < desktops.length; i++) {
+            desktops[i].currentConfigGroup = new Array('General');
+            desktops[i].reloadConfig();
+        }
+    " 2>/dev/null
+    exit 0
+fi
+
+# 2. Resolve Icon= value — theme name or converted custom file
+APP_CLEAN_NAME=$(basename "$SELECTED_APP" .desktop)
+PNG_OUTPUT="$TARGET_DIR/${APP_CLEAN_NAME}.png"
+ICON_VALUE=""
+
+# Safe cleanup — only deletes if path is under /tmp, always cd HOME first
+safe_cleanup() {
+    local dir="$1"
+    case "$dir" in
+        /tmp/*)
+            cd "$HOME" 2>/dev/null || true
+            rm -rf "$dir"
+            ;;
+        *)
+            echo "Refusing to remove $dir — not in /tmp" >&2
+            ;;
+    esac
+}
+
+if [[ "$SELECTED_ICON" == theme:* ]]; then
+    # System theme icon — write the freedesktop name directly (e.g. plasmadiscover)
+    ICON_VALUE="${SELECTED_ICON#theme:}"
+    if [ -z "$ICON_VALUE" ]; then
+        show_error "Empty theme icon name."
+        exit 1
+    fi
+else
+    SELECTED_ICON_PATH="$SELECTED_ICON"
+    if [ ! -f "$SELECTED_ICON_PATH" ]; then
+        show_error "Icon file not found:\n$SELECTED_ICON_PATH"
+        exit 1
+    fi
+
+    WORK_DIR=$(mktemp -d)
+    cp "$SELECTED_ICON_PATH" "$WORK_DIR/source_file"
+
+    FILE_EXT="${SELECTED_ICON_PATH##*.}"
+    FILE_EXT=$(echo "$FILE_EXT" | tr '[:upper:]' '[:lower:]')
+
+    case "$FILE_EXT" in
+        icns)
+            (cd "$WORK_DIR" && icns2png -x source_file) > /dev/null 2>&1
+            EXTRACTED_FILE=$(find "$WORK_DIR" -maxdepth 1 \( -name '*1024x1024*.png' -o -name '*512x512*.png' \) 2>/dev/null | head -n 1)
+            if [ -z "$EXTRACTED_FILE" ]; then
+                EXTRACTED_FILE=$(ls -S "$WORK_DIR"/*.png 2>/dev/null | head -n 1)
+            fi
+            if [ -f "$EXTRACTED_FILE" ]; then
+                "$MAGICK_CMD" "$EXTRACTED_FILE" -fuzz 10% -trim +repage -resize 512x512 -background none -gravity center -extent 512x512 "$PNG_OUTPUT"
+            else
+                show_error "Could not extract a valid PNG from this .icns file."
+                safe_cleanup "$WORK_DIR"
+                exit 1
+            fi
+            ;;
+        png|jpg|jpeg|webp|bmp|gif)
+            "$MAGICK_CMD" "$WORK_DIR/source_file" -fuzz 10% -trim +repage -resize 512x512 -background none -gravity center -extent 512x512 "$PNG_OUTPUT" 2>/dev/null
+            if [ ! -f "$PNG_OUTPUT" ]; then
+                show_error "Could not process this image file (.$FILE_EXT)."
+                safe_cleanup "$WORK_DIR"
+                exit 1
+            fi
+            ;;
+        *)
+            show_error "Unsupported file type: .$FILE_EXT\nUse PNG, JPG, WEBP, or ICNS."
+            safe_cleanup "$WORK_DIR"
+            exit 1
+            ;;
+    esac
+
+    safe_cleanup "$WORK_DIR"
+    ICON_VALUE="$PNG_OUTPUT"
+fi
+
+# 3. Overwrite user local app config
+USER_APP_DIR="$HOME/.local/share/applications"
+mkdir -p "$USER_APP_DIR"
+APP_PATH=""
+
+if [ -f "$USER_APP_DIR/$SELECTED_APP" ]; then
+    APP_PATH="$USER_APP_DIR/$SELECTED_APP"
+else
+    for d in $(get_desktop_dirs); do
+        if [ -f "$d/$SELECTED_APP" ]; then
+            APP_PATH="$d/$SELECTED_APP"
+            break
+        fi
+    done
+fi
+
+if [ -z "$APP_PATH" ] || [ ! -f "$APP_PATH" ]; then
+    show_error "Could not find desktop entry: $SELECTED_APP"
+    exit 1
+fi
+
+# Backup if enabled
+if [ "$BACKUP_ENABLED" = "1" ]; then
+    BACKUP_DIR="$HOME/.local/share/kappicon/backups"
+    mkdir -p "$BACKUP_DIR"
+    cp "$APP_PATH" "$BACKUP_DIR/$(basename "$SELECTED_APP").backup.$(date +%Y%m%d%H%M%S)"
+fi
+
+if [ "$APP_PATH" != "$USER_APP_DIR/$SELECTED_APP" ]; then
+    cp "$APP_PATH" "$USER_APP_DIR/$SELECTED_APP"
+fi
+
+# Update Icon= line, or append one under [Desktop Entry] if missing
+# Escape & \ for sed replacement safety (theme names are usually plain)
+ICON_SED=$(printf '%s\n' "$ICON_VALUE" | sed -e 's/[&|\\]/\\&/g')
+if grep -qE '^Icon=' "$USER_APP_DIR/$SELECTED_APP"; then
+    sed -i "s|^Icon=.*|Icon=$ICON_SED|" "$USER_APP_DIR/$SELECTED_APP"
+else
+    if grep -qE '^\[Desktop Entry\]' "$USER_APP_DIR/$SELECTED_APP"; then
+        sed -i "/^\[Desktop Entry\]/a Icon=$ICON_SED" "$USER_APP_DIR/$SELECTED_APP"
+    else
+        printf '%s\n' "[Desktop Entry]" "Icon=$ICON_VALUE" >> "$USER_APP_DIR/$SELECTED_APP"
+    fi
+fi
+
+# Notify user of success using fallback notification functions
+if [[ "$SELECTED_ICON" == theme:* ]]; then
+    show_info "Set $SELECTED_APP icon to system icon “${SELECTED_ICON#theme:}”"
+else
+    show_info "Custom icon successfully mapped to $SELECTED_APP"
+fi
+
+# Force refresh everything instantly
+kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
+update-desktop-database "$HOME/.local/share/applications" 2>/dev/null
+gtk-update-icon-cache -f -t ~/.icons 2>/dev/null
+gtk-update-icon-cache -f -t ~/.local/share/icons 2>/dev/null
+
+qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
+    var desktops = desktops();
+    for (var i = 0; i < desktops.length; i++) {
+        desktops[i].currentConfigGroup = new Array('General');
+        desktops[i].reloadConfig();
+    }
+" 2>/dev/null

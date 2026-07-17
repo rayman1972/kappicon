@@ -1,0 +1,377 @@
+#!/bin/bash
+
+# ── Config ───────────────────────────────────────────────────────────────
+CONFIG_DIR="$HOME/.config/KAppIcon"
+CONFIG_FILE="$CONFIG_DIR/KAppIcon.conf"
+BACKUP_DIR="$HOME/.local/share/kappicon/backups"
+TARGET_DIR="$HOME/Pictures/KAppIcon"
+mkdir -p "$TARGET_DIR" "$CONFIG_DIR" "$BACKUP_DIR"
+
+# Read/write config (QSettings INI: key "source/folder" → [source] folder=...)
+cfg_get() {
+    local key="$1" default="$2"
+    local section="${key%%/*}"
+    local option="${key#*/}"
+    if [ "$section" = "$key" ]; then
+        section="General"
+        option="$key"
+    fi
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "$default"
+        return
+    fi
+    local val
+    val=$(python3 - "$CONFIG_FILE" "$section" "$option" "$default" <<'PY'
+import sys
+from configparser import ConfigParser
+path, section, option, default = sys.argv[1:5]
+cp = ConfigParser()
+cp.optionxform = str  # preserve case
+try:
+    cp.read(path)
+except Exception:
+    print(default)
+    raise SystemExit
+if cp.has_option(section, option):
+    print(cp.get(section, option))
+elif section != "General" and cp.has_option("General", f"{section}/{option}"):
+    # legacy flat key written as source/folder=...
+    print(cp.get("General", f"{section}/{option}"))
+else:
+    # legacy flat file without sections: source/folder=value
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{section}/{option}=") or line.startswith(f"{option}="):
+                    print(line.split("=", 1)[1])
+                    raise SystemExit
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    print(default)
+PY
+)
+    echo "${val:-$default}"
+}
+
+cfg_set() {
+    local key="$1" val="$2"
+    local section="${key%%/*}"
+    local option="${key#*/}"
+    if [ "$section" = "$key" ]; then
+        section="General"
+        option="$key"
+    fi
+    mkdir -p "$CONFIG_DIR"
+    python3 - "$CONFIG_FILE" "$section" "$option" "$val" <<'PY'
+import sys
+from configparser import ConfigParser
+path, section, option, val = sys.argv[1:5]
+cp = ConfigParser()
+cp.optionxform = str
+if __import__("os").path.isfile(path):
+    try:
+        cp.read(path)
+    except Exception:
+        pass
+if not cp.has_section(section):
+    cp.add_section(section)
+cp.set(section, option, val)
+with open(path, "w") as f:
+    cp.write(f)
+PY
+}
+
+DOWNLOADS_DIR=$(cfg_get "source/folder" "$HOME/Downloads")
+BACKUP_ENABLED=$(cfg_get "backups/enabled" "false")
+
+if ! command -v fzf &>/dev/null; then
+    echo "❌ fzf is not installed. Please install it first (or run the GUI: kappicon-gui)." >&2
+    exit 1
+fi
+
+MAGICK_CMD="magick"
+if ! command -v magick &>/dev/null; then
+    if command -v convert &>/dev/null; then
+        MAGICK_CMD="convert"
+    else
+        echo "❌ ImageMagick is not installed. Please install it (magick or convert)." >&2
+        exit 1
+    fi
+fi
+
+# ── Helpers: desktop file locations ──────────────────────────────────────
+get_desktop_dirs() {
+    local dirs=()
+    local xdg_dirs="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    IFS=':' read -r -a split_dirs <<< "$xdg_dirs"
+    for d in "${split_dirs[@]}" "$HOME/.local/share"; do
+        [ -d "$d/applications" ] && dirs+=("$d/applications")
+    done
+    # Flatpak exports
+    [ -d "/var/lib/flatpak/exports/share/applications" ] && dirs+=("/var/lib/flatpak/exports/share/applications")
+    [ -d "$HOME/.local/share/flatpak/exports/share/applications" ] && dirs+=("$HOME/.local/share/flatpak/exports/share/applications")
+    # Snap
+    [ -d "/var/lib/snapd/desktop/applications" ] && dirs+=("/var/lib/snapd/desktop/applications")
+    
+    printf "%s\n" "${dirs[@]}" | sort -u
+}
+
+find_desktop_files() {
+    for d in $(get_desktop_dirs); do
+        find "$d" -name "*.desktop" 2>/dev/null
+    done
+}
+
+# ── Helper: safe cleanup ─────────────────────────────────────────────────
+safe_cleanup() {
+    local dir="$1"
+    case "$dir" in
+        /tmp/*) cd "$HOME" 2>/dev/null || true; rm -rf "$dir" ;;
+        *) echo "Refusing to remove $dir — not in /tmp" >&2 ;;
+    esac
+}
+
+# ── Helper: force icon refresh ───────────────────────────────────────────
+do_refresh() {
+    echo "🔄 Refreshing icon caches..."
+    kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null
+    for p in ~/.icons ~/.local/share/icons; do
+        [ -d "$p" ] && gtk-update-icon-cache -f -t "$p" 2>/dev/null
+    done
+    echo "✅ Icon caches refreshed."
+}
+
+# ── Helper: list backups ─────────────────────────────────────────────────
+do_restore() {
+    if [ ! -d "$BACKUP_DIR" ]; then
+        echo "❌ No backups directory found."
+        exit 1
+    fi
+    mapfile -t backups < <(find "$BACKUP_DIR" -maxdepth 1 -name "*.backup.*" -printf "%f\n" 2>/dev/null | sort -r)
+    if [ ${#backups[@]} -eq 0 ]; then
+        echo "❌ No backups found in $BACKUP_DIR"
+        exit 1
+    fi
+    echo "📋 Available backups:"
+    selected=$(printf '%s\n' "${backups[@]}" | fzf --height 40% --reverse --prompt="Restore > ")
+    if [ -z "$selected" ]; then
+        echo "Cancelled."
+        exit 0
+    fi
+    desktop_name="${selected%%.backup.*}"
+    src="$BACKUP_DIR/$selected"
+    dest="$HOME/.local/share/applications/$desktop_name"
+    cp "$src" "$dest"
+    echo "✅ Restored $desktop_name from backup."
+    do_refresh
+}
+
+# ── Helper: interactive settings ─────────────────────────────────────────
+do_settings() {
+    echo ""
+    echo "═══ KAppIcon Settings ═══"
+    echo ""
+    echo "  1) Source Folder    : $DOWNLOADS_DIR"
+    echo "  2) Auto Backups     : $BACKUP_ENABLED"
+    echo "  3) Force Refresh"
+    echo "  4) Restore Backup"
+    echo "  5) Done"
+    echo ""
+    read -rp "  Choose [1-5]: " choice
+    case "$choice" in
+        1)
+            read -rp "  Enter new source folder: " new_path
+            if [ -d "$new_path" ]; then
+                cfg_set "source/folder" "$new_path"
+                DOWNLOADS_DIR="$new_path"
+                echo "  ✅ Source folder updated."
+            else
+                echo "  ❌ Directory does not exist."
+            fi
+            do_settings
+            ;;
+        2)
+            if [ "$BACKUP_ENABLED" = "true" ]; then
+                cfg_set "backups/enabled" "false"
+                BACKUP_ENABLED="false"
+                echo "  ✅ Automatic backups disabled."
+            else
+                cfg_set "backups/enabled" "true"
+                BACKUP_ENABLED="true"
+                echo "  ✅ Automatic backups enabled."
+            fi
+            do_settings
+            ;;
+        3) do_refresh; do_settings ;;
+        4) do_restore; do_settings ;;
+        5) echo "Done." ;;
+        *) echo "  Invalid choice."; do_settings ;;
+    esac
+}
+
+# ── Parse flags ──────────────────────────────────────────────────────────
+case "${1:-}" in
+    --settings)  do_settings; exit 0 ;;
+    --restore)   do_restore; exit 0 ;;
+    --refresh)   do_refresh; exit 0 ;;
+    --help|-h)
+        echo "Usage: kappicon [OPTION]"
+        echo ""
+        echo "Options:"
+        echo "  (none)       Launch the interactive icon mapper"
+        echo "  --settings   Configure source folder, backups, etc."
+        echo "  --restore    Restore a .desktop file from backup"
+        echo "  --refresh    Force refresh icon caches"
+        echo "  --help       Show this help"
+        exit 0
+        ;;
+esac
+
+# ── Main: interactive icon mapper ────────────────────────────────────────
+if [ ! -d "$DOWNLOADS_DIR" ]; then
+    echo "❌ Source folder not found: $DOWNLOADS_DIR"
+    echo "   Run: kappicon --settings   (option 1) to set a different folder."
+    exit 1
+fi
+cd "$DOWNLOADS_DIR" || { echo "❌ Cannot enter source folder: $DOWNLOADS_DIR"; exit 1; }
+# Support common icon/image formats (case-insensitive)
+mapfile -t ICNS_FILES < <(find . -maxdepth 1 -type f \( \
+    -iname '*.icns' -o -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \
+    -o -iname '*.webp' -o -iname '*.bmp' -o -iname '*.gif' \
+\) -printf '%f\n' 2>/dev/null | sort)
+
+if [ ${#ICNS_FILES[@]} -eq 0 ]; then
+    echo "❌ No icon files found in:"
+    echo "   $DOWNLOADS_DIR"
+    echo ""
+    echo "   Supported: .icns .png .jpg .webp"
+    echo "   Or create icons in the GUI:  kappicon-gui  (Create tab)"
+    echo "   Or change folder:           kappicon --settings"
+    exit 1
+fi
+
+echo "Select the icon file you want to use:"
+SELECTED_ICNS=$(printf '%s\n' "${ICNS_FILES[@]}" | fzf --height 40% --reverse)
+
+if [ -z "$SELECTED_ICNS" ]; then
+    echo "Cancelled."
+    exit 0
+fi
+
+echo "🔍 Select the app you want to map this icon to:"
+SELECTED_LINE=$(find_desktop_files | \
+    xargs -r grep -H -m 1 '^Name=' 2>/dev/null | \
+    awk -F: '{ split($1, a, "/"); name=$0; sub(/^[^:]*:[^=]*=/, "", name); print name " [" a[length(a)] "]" }' | \
+    sort -u | fzf --height 50% --reverse)
+
+if [ -z "$SELECTED_LINE" ]; then
+    echo "Cancelled."
+    exit 0
+fi
+
+# Extract basename of desktop file (e.g. gimp.desktop) from inside brackets
+SELECTED_APP=$(echo "$SELECTED_LINE" | sed -n 's/.*\[\(.*\)\].*/\1/p')
+
+if [ -z "$SELECTED_APP" ]; then
+    echo "Cancelled."
+    exit 0
+fi
+
+# Clean app name for filename
+APP_CLEAN_NAME=$(basename "$SELECTED_APP" .desktop)
+PNG_OUTPUT="$TARGET_DIR/${APP_CLEAN_NAME}.png"
+
+# Create isolated workspace
+WORK_DIR=$(mktemp -d)
+cp "$DOWNLOADS_DIR/$SELECTED_ICNS" "$WORK_DIR/source_file"
+
+FILE_EXT="${SELECTED_ICNS##*.}"
+FILE_EXT=$(echo "$FILE_EXT" | tr '[:upper:]' '[:lower:]')
+
+case "$FILE_EXT" in
+    icns)
+        echo "🚀 Extracting image assets safely..."
+        (cd "$WORK_DIR" && icns2png -x source_file) > /dev/null 2>&1
+        EXTRACTED_FILE=$(find "$WORK_DIR" -maxdepth 1 \( -name '*1024x1024*.png' -o -name '*512x512*.png' \) 2>/dev/null | head -n 1)
+        if [ -z "$EXTRACTED_FILE" ]; then
+            EXTRACTED_FILE=$(ls -S "$WORK_DIR"/*.png 2>/dev/null | head -n 1)
+        fi
+        if [ -f "$EXTRACTED_FILE" ]; then
+            echo "📐 Applying the icon..."
+            "$MAGICK_CMD" "$EXTRACTED_FILE" -fuzz 10% -trim +repage -resize 512x512 -background none -gravity center -extent 512x512 "$PNG_OUTPUT"
+        else
+            echo "❌ Extraction failed! Could not extract a valid PNG from this .icns file."
+            safe_cleanup "$WORK_DIR"
+            exit 1
+        fi
+        ;;
+    png|jpg|jpeg|webp|bmp|gif)
+        echo "📐 Applying the icon..."
+        "$MAGICK_CMD" "$WORK_DIR/source_file" -fuzz 10% -trim +repage -resize 512x512 -background none -gravity center -extent 512x512 "$PNG_OUTPUT" 2>/dev/null
+        if [ ! -f "$PNG_OUTPUT" ]; then
+            echo "❌ Could not process this image file (.$FILE_EXT)."
+            safe_cleanup "$WORK_DIR"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "❌ Unsupported file type: .$FILE_EXT (use png/jpg/webp/icns)"
+        safe_cleanup "$WORK_DIR"
+        exit 1
+        ;;
+esac
+
+safe_cleanup "$WORK_DIR"
+echo "✅ Icon saved as: $PNG_OUTPUT"
+
+# Overwrite user local app config — prefer an existing user override if present
+USER_APP_DIR="$HOME/.local/share/applications"
+mkdir -p "$USER_APP_DIR"
+APP_PATH=""
+
+if [ -f "$USER_APP_DIR/$SELECTED_APP" ]; then
+    APP_PATH="$USER_APP_DIR/$SELECTED_APP"
+else
+    for d in $(get_desktop_dirs); do
+        if [ -f "$d/$SELECTED_APP" ]; then
+            APP_PATH="$d/$SELECTED_APP"
+            break
+        fi
+    done
+fi
+
+if [ -z "$APP_PATH" ] || [ ! -f "$APP_PATH" ]; then
+    echo "❌ Could not find desktop entry: $SELECTED_APP"
+    exit 1
+fi
+
+# Backup if enabled
+if [ "$BACKUP_ENABLED" = "true" ]; then
+    cp "$APP_PATH" "$BACKUP_DIR/$(basename "$SELECTED_APP").backup.$(date +%Y%m%d%H%M%S)"
+    echo "📦 Backup saved."
+fi
+
+if [ "$APP_PATH" != "$USER_APP_DIR/$SELECTED_APP" ]; then
+    cp "$APP_PATH" "$USER_APP_DIR/$SELECTED_APP"
+fi
+
+# Escape & and \ for sed replacement safety
+ICON_SED=$(printf '%s\n' "$PNG_OUTPUT" | sed -e 's/[&|\\]/\\&/g')
+
+if grep -qE '^Icon=' "$USER_APP_DIR/$SELECTED_APP"; then
+    sed -i "s|^Icon=.*|Icon=$ICON_SED|" "$USER_APP_DIR/$SELECTED_APP"
+else
+    if grep -qE '^\[Desktop Entry\]' "$USER_APP_DIR/$SELECTED_APP"; then
+        sed -i "/^\[Desktop Entry\]/a Icon=$ICON_SED" "$USER_APP_DIR/$SELECTED_APP"
+    else
+        printf '%s\n' "[Desktop Entry]" "Icon=$PNG_OUTPUT" >> "$USER_APP_DIR/$SELECTED_APP"
+    fi
+fi
+
+echo "🎉 Success! Custom icon fully assigned to $SELECTED_APP"
+echo "   Icon file: $PNG_OUTPUT"
+do_refresh

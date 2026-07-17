@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=KAppIcon (CLI)
+Comment=Change application icons from the terminal
+Exec=kappicon
+Icon=kappicon
+Terminal=true
+Categories=Utility;Qt;KDE;
+StartupNotify=false
