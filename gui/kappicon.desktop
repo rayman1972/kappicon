@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=KAppIcon
+Name=kAppIcon
 GenericName=App Icon Manager
 Comment=Change, create, and map application icons
-Exec=kappicon-gui
+Exec=kappicon
 Icon=kappicon
 Terminal=false
 Categories=Utility;Qt;KDE;Graphics;

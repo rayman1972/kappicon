@@ -22,32 +22,36 @@ check_update() {
 
 # ── Update mode ──────────────────────────────────────────────────────────
 if [ "${1:-}" = "--update" ]; then
-    echo "🔄 Updating KAppIcon..."
+    echo "🔄 Updating kAppIcon..."
     if [ -d .git ]; then
         git pull --rebase 2>/dev/null || { echo "❌ git pull failed — are you in the repo directory?"; exit 1; }
     else
         echo "📥 Downloading latest files..."
         mkdir -p cli gui
-        curl -sfL "$REPO_URL/cli/kappicon" -o cli/kappicon || { echo "❌ Download failed."; exit 1; }
+        curl -sfL "$REPO_URL/cli/kappicon-cli" -o cli/kappicon-cli || { echo "❌ Download failed."; exit 1; }
         curl -sfL "$REPO_URL/gui/kappicon" -o gui/kappicon
+        curl -sfL "$REPO_URL/gui/kappicon.desktop" -o gui/kappicon.desktop
         curl -sfL "$REPO_URL/install.sh" -o install.sh
         curl -sfL "$REPO_URL/VERSION" -o VERSION
     fi
     echo "📦 Installing updated files..."
     mkdir -p "$INSTALL_DIR" ~/.local/share/applications ~/.local/share/icons ~/.local/share/kappicon/icons
-    ln -f cli/kappicon "$INSTALL_DIR/kappicon"
-    ln -f gui/kappicon "$INSTALL_DIR/kappicon-gui"
-    chmod +x "$INSTALL_DIR/kappicon" "$INSTALL_DIR/kappicon-gui"
-    # Drop leftover names from the old rebrand attempt (if still present)
-    rm -f "$INSTALL_DIR/apply-mac-icon" "$INSTALL_DIR/apply-mac-icon-gui" \
+    # GUI: kappicon · CLI: kappicon-cli
+    ln -f gui/kappicon "$INSTALL_DIR/kappicon"
+    ln -f cli/kappicon-cli "$INSTALL_DIR/kappicon-cli"
+    chmod +x "$INSTALL_DIR/kappicon" "$INSTALL_DIR/kappicon-cli"
+    # Drop leftover names from older installs / rebrand
+    # CLI is terminal-only — never ship a menu entry for it.
+    rm -f "$INSTALL_DIR/kappicon-gui" \
+        "$INSTALL_DIR/apply-mac-icon" "$INSTALL_DIR/apply-mac-icon-gui" \
         ~/.local/share/icons/macosicons.png ~/.local/share/icons/macosicons-gui.png \
         ~/.local/share/applications/macosicons.desktop \
-        ~/.local/share/applications/macosicons-gui.desktop 2>/dev/null || true
+        ~/.local/share/applications/macosicons-gui.desktop \
+        ~/.local/share/applications/kappicon-cli.desktop 2>/dev/null || true
     [ -f assets/kappicon.png ] && cp assets/kappicon.png ~/.local/share/icons/kappicon.png
     [ -f assets/kappicon-gui.png ] && cp assets/kappicon-gui.png ~/.local/share/icons/kappicon-gui.png
-    # GUI is the main menu entry; CLI uses a distinct filename so it does not overwrite.
+    # GUI is the only application menu entry.
     cp gui/kappicon.desktop ~/.local/share/applications/kappicon.desktop
-    [ -f cli/kappicon-cli.desktop ] && cp cli/kappicon-cli.desktop ~/.local/share/applications/kappicon-cli.desktop
     # Clean accidental overwrite from older installs
     if grep -q 'KAppIcon (CLI)' ~/.local/share/applications/kappicon.desktop 2>/dev/null; then
         cp gui/kappicon.desktop ~/.local/share/applications/kappicon.desktop
@@ -58,7 +62,7 @@ if [ "${1:-}" = "--update" ]; then
     exit 0
 fi
 
-echo "🎨 Installing KAppIcon (CLI, GUI & Icon Editor) for Linux..."
+echo "🎨 Installing kAppIcon (GUI & CLI) for Linux..."
 
 check_update
 
@@ -207,14 +211,18 @@ install_deps
 
 mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/icons ~/.local/share/kappicon/icons
 
-ln -f cli/kappicon ~/.local/bin/kappicon
-ln -f gui/kappicon ~/.local/bin/kappicon-gui
-chmod +x ~/.local/bin/kappicon ~/.local/bin/kappicon-gui
-# Drop leftover names from the old rebrand attempt (if still present)
-rm -f ~/.local/bin/apply-mac-icon ~/.local/bin/apply-mac-icon-gui \
+# GUI: kappicon · CLI: kappicon-cli
+ln -f gui/kappicon ~/.local/bin/kappicon
+ln -f cli/kappicon-cli ~/.local/bin/kappicon-cli
+chmod +x ~/.local/bin/kappicon ~/.local/bin/kappicon-cli
+# Drop leftover names from older installs / rebrand
+# CLI is terminal-only — never ship a menu entry for it.
+rm -f ~/.local/bin/kappicon-gui \
+    ~/.local/bin/apply-mac-icon ~/.local/bin/apply-mac-icon-gui \
     ~/.local/share/icons/macosicons.png ~/.local/share/icons/macosicons-gui.png \
     ~/.local/share/applications/macosicons.desktop \
-    ~/.local/share/applications/macosicons-gui.desktop 2>/dev/null || true
+    ~/.local/share/applications/macosicons-gui.desktop \
+    ~/.local/share/applications/kappicon-cli.desktop 2>/dev/null || true
 
 if [ -f assets/kappicon.png ]; then
     cp assets/kappicon.png ~/.local/share/icons/kappicon.png
@@ -223,9 +231,8 @@ if [ -f assets/kappicon-gui.png ]; then
     cp assets/kappicon-gui.png ~/.local/share/icons/kappicon-gui.png
 fi
 
-# Desktop launchers — distinct filenames for GUI and CLI
+# Desktop launcher — GUI only (CLI is run from the terminal)
 cp gui/kappicon.desktop ~/.local/share/applications/kappicon.desktop
-[ -f cli/kappicon-cli.desktop ] && cp cli/kappicon-cli.desktop ~/.local/share/applications/kappicon-cli.desktop
 
 if command -v kbuildsycoca6 &> /dev/null; then
     kbuildsycoca6 --noincremental
@@ -236,5 +243,5 @@ fi
 mkdir -p "$(dirname "$LOCAL_VERSION_FILE")"
 [ -f VERSION ] && cp VERSION "$LOCAL_VERSION_FILE"
 
-echo "✅ Done! Run:  kappicon-gui   or search for “KAppIcon” in the app menu."
-echo "   CLI:        kappicon --help"
+echo "✅ Done! Run:  kappicon   or search for “kAppIcon” in the app menu."
+echo "   CLI:        kappicon-cli --help"

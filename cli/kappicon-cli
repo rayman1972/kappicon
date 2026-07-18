@@ -72,7 +72,7 @@ acquire_apply_lock() {
     exec 9>"$LOCK_FILE" || return 1
     if command -v flock &>/dev/null; then
         if ! flock -w 45 9; then
-            echo "❌ Another KAppIcon operation is in progress (lock timeout)." >&2
+            echo "❌ Another kAppIcon operation is in progress (lock timeout)." >&2
             return 1
         fi
     fi
@@ -337,7 +337,7 @@ DOWNLOADS_DIR=$(cfg_get "source/folder" "$HOME/Downloads")
 BACKUP_ENABLED=$(cfg_get "backups/enabled" "false")
 
 if ! command -v fzf &>/dev/null; then
-    echo "❌ fzf is not installed. Please install it first (or run the GUI: kappicon-gui)." >&2
+    echo "❌ fzf is not installed. Please install it first (or run the GUI: kappicon)." >&2
     exit 1
 fi
 
@@ -470,7 +470,7 @@ do_restore() {
 # ── Helper: interactive settings ─────────────────────────────────────────
 do_settings() {
     echo ""
-    echo "═══ KAppIcon Settings ═══"
+    echo "═══ kAppIcon Settings ═══"
     echo ""
     echo "  1) Source Folder    : $DOWNLOADS_DIR"
     echo "  2) Auto Backups     : $BACKUP_ENABLED"
@@ -518,7 +518,7 @@ case "${1:-}" in
     --restore)   do_restore; exit 0 ;;
     --refresh)   do_refresh; exit 0 ;;
     --help|-h)
-        echo "Usage: kappicon [OPTION]"
+        echo "Usage: kappicon-cli [OPTION]"
         echo ""
         echo "Options:"
         echo "  (none)       Launch the interactive icon mapper"
@@ -533,7 +533,7 @@ esac
 # ── Main: interactive icon mapper ────────────────────────────────────────
 if [ ! -d "$DOWNLOADS_DIR" ]; then
     echo "❌ Source folder not found: $DOWNLOADS_DIR"
-    echo "   Run: kappicon --settings   (option 1) to set a different folder."
+    echo "   Run: kappicon-cli --settings   (option 1) to set a different folder."
     exit 1
 fi
 cd "$DOWNLOADS_DIR" || { echo "❌ Cannot enter source folder: $DOWNLOADS_DIR"; exit 1; }
@@ -549,8 +549,8 @@ if [ ${#ICNS_FILES[@]} -eq 0 ]; then
     echo "   $DOWNLOADS_DIR"
     echo ""
     echo "   Supported: .icns .png .jpg .webp .svg"
-    echo "   Or create icons in the GUI:  kappicon-gui  (Create tab)"
-    echo "   Or change folder:           kappicon --settings"
+    echo "   Or create icons in the GUI:  kappicon  (Create tab)"
+    echo "   Or change folder:           kappicon-cli --settings"
     exit 1
 fi
 

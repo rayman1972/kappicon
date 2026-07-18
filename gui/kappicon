@@ -60,7 +60,7 @@ acquire_apply_lock() {
     exec 9>"$LOCK_FILE" || return 1
     if command -v flock &>/dev/null; then
         if ! flock -w 45 9; then
-            show_error "Another KAppIcon operation is in progress (lock timeout)."
+            show_error "Another kAppIcon operation is in progress (lock timeout)."
             return 1
         fi
     fi
@@ -1040,9 +1040,9 @@ def apply_breeze_style(app: QApplication):
     app._kappicon_system_palette = QPalette(app.palette())
     # Desktop file / Wayland app id
     app.setDesktopFileName("kappicon")
-    app.setApplicationName("KAppIcon")
-    app.setOrganizationName("KAppIcon")
-    app.setApplicationDisplayName("KAppIcon")
+    app.setApplicationName("kAppIcon")
+    app.setOrganizationName("KAppIcon")  # keep config path ~/.config/KAppIcon
+    app.setApplicationDisplayName("kAppIcon")
 
 
 def make_light_palette():
@@ -1179,7 +1179,7 @@ class CombinedWindow(QMainWindow):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("KAppIcon")
+        self.setWindowTitle("kAppIcon")
         self.resize(920, 640)
         self.setMinimumSize(720, 520)
 
@@ -1252,7 +1252,7 @@ class CombinedWindow(QMainWindow):
         exit_action = file_menu.addAction("&Exit")
         exit_action.setIcon(theme_icon("application-exit", "exit"))
         exit_action.setShortcut("Ctrl+Q")
-        exit_action.setStatusTip("Exit KAppIcon")
+        exit_action.setStatusTip("Exit kAppIcon")
         exit_action.triggered.connect(self.close)
 
         # Edit Menu (Create canvas history)
@@ -1309,7 +1309,7 @@ class CombinedWindow(QMainWindow):
 
         help_menu.addSeparator()
 
-        about_action = help_menu.addAction("&About KAppIcon")
+        about_action = help_menu.addAction("&About kAppIcon")
         about_action.setIcon(theme_icon("help-about", "help-hint"))
         about_action.triggered.connect(self._show_about_dialog)
 
@@ -1330,8 +1330,8 @@ class CombinedWindow(QMainWindow):
         from PyQt6.QtWidgets import QMessageBox
         QMessageBox.about(
             self,
-            "About KAppIcon",
-            "<h3>KAppIcon</h3>"
+            "About kAppIcon",
+            "<h3>kAppIcon</h3>"
             "<p>Version 3.0.0</p>"
             "<p>A Linux utility to change application icons, reuse theme icons from other apps, "
             "and design your own custom icons.</p>"
@@ -2063,9 +2063,9 @@ class CombinedWindow(QMainWindow):
         from PyQt6.QtWidgets import QMessageBox
         QMessageBox.information(
             self,
-            "KAppIcon Help & Workflow",
-            "<h2>KAppIcon Documentation</h2>"
-            "<p>KAppIcon is a Linux utility to customize launcher icons for your installed applications "
+            "kAppIcon Help & Workflow",
+            "<h2>kAppIcon Documentation</h2>"
+            "<p>kAppIcon is a Linux utility to customize launcher icons for your installed applications "
             "following the freedesktop.org desktop entry specifications.</p>"
             
             "<h3>🔄 Workflow 1: Map an Icon to an Application</h3>"
@@ -2335,7 +2335,7 @@ class CombinedWindow(QMainWindow):
 
         about = QGroupBox("About")
         al = QVBoxLayout(about)
-        al.addWidget(QLabel("KAppIcon — change, create, and map application icons."))
+        al.addWidget(QLabel("kAppIcon — change, create, and map application icons."))
         al.addWidget(make_hint_label(
             "Designed for Plasma / Breeze. Icons follow the freedesktop.org desktop entry standard."
         ))

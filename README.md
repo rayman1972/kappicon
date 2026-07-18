@@ -1,8 +1,8 @@
-# KAppIcon
+# kAppIcon
 
 **Version 3.0** — customize Linux application launcher icons without root.
 
-KAppIcon updates your user-level [freedesktop](https://specifications.freedesktop.org/desktop-entry-spec/) `.desktop` files, installs icons into your personal icon theme when needed, and refreshes Plasma / GTK icon caches so menus and panels pick up the change.
+kAppIcon updates your user-level [freedesktop](https://specifications.freedesktop.org/desktop-entry-spec/) `.desktop` files, installs icons into your personal icon theme when needed, and refreshes Plasma / GTK icon caches so menus and panels pick up the change.
 
 **Source:** [github.com/rayman1972/kappicon](https://github.com/rayman1972/kappicon)
 
@@ -43,7 +43,7 @@ Draw or import, **Undo** / **Redo** mistakes (Ctrl+Z), then save a standard 512�
 | **Shapes** | When applying custom images: keep as designed, or mask to square / rounded / circle |
 | **Reset** | Restore an app’s system icon from Map |
 | **Backups** | Optional auto-backup of `.desktop` files before changes + restore UI |
-| **CLI** | Terminal mapper with `fzf` (`kappicon`) |
+| **CLI** | Terminal mapper with `fzf` (`kappicon-cli`) |
 | **Safe by design** | User overrides only (`~/.local/share/applications/`), atomic writes, apply lock, validated desktop ids |
 
 Supported image types include **PNG, JPG, WEBP, SVG, ICNS, BMP, GIF, XPM**.
@@ -89,10 +89,10 @@ Ensure `~/.local/bin` is on your `PATH`.
 ### GUI
 
 ```bash
-kappicon-gui
+kappicon
 ```
 
-Or open **KAppIcon** from the application menu.
+Or open **kAppIcon** from the application menu.
 
 **Tabs**
 
@@ -106,11 +106,11 @@ Or open **KAppIcon** from the application menu.
 ### CLI
 
 ```bash
-kappicon --help
-kappicon              # interactive icon → app mapper (fzf)
-kappicon --settings
-kappicon --restore
-kappicon --refresh
+kappicon-cli --help
+kappicon-cli              # interactive icon → app mapper (fzf)
+kappicon-cli --settings
+kappicon-cli --restore
+kappicon-cli --refresh
 ```
 
 ## Paths
