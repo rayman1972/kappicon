@@ -36,6 +36,15 @@ xdg_user_dir() {
 XDG_DOWNLOAD_DIR=$(xdg_user_dir DOWNLOAD "$HOME/Downloads")
 XDG_PICTURES_DIR=$(xdg_user_dir PICTURES "$HOME/Pictures")
 
+# Run host tools when packaged as Flatpak (icon cache / kbuildsycoca).
+run_host() {
+    if [ -n "${FLATPAK_ID:-}" ] && command -v flatpak-spawn >/dev/null 2>&1; then
+        flatpak-spawn --host -- "$@"
+    else
+        "$@"
+    fi
+}
+
 # ── Config ───────────────────────────────────────────────────────────────
 CONFIG_DIR="${CONFIG_DIR:-$XDG_CONFIG_HOME/KAppIcon}"
 CONFIG_FILE="$CONFIG_DIR/KAppIcon.conf"
@@ -401,6 +410,12 @@ get_desktop_dirs() {
         [ -n "$d" ] || continue
         [ -d "$d/applications" ] && dirs+=("$d/applications")
     done
+    # Flatpak sandbox: host OS trees appear under /run/host
+    if [ -n "${FLATPAK_ID:-}" ]; then
+        for d in /run/host/usr/share /run/host/usr/local/share; do
+            [ -d "$d/applications" ] && dirs+=("$d/applications")
+        done
+    fi
     # Flatpak exports (system + user; user may live under XDG_DATA_HOME)
     [ -d "/var/lib/flatpak/exports/share/applications" ] && dirs+=("/var/lib/flatpak/exports/share/applications")
     [ -d "$XDG_DATA_HOME/flatpak/exports/share/applications" ] && dirs+=("$XDG_DATA_HOME/flatpak/exports/share/applications")
@@ -411,6 +426,7 @@ get_desktop_dirs() {
     fi
     # Snap
     [ -d "/var/lib/snapd/desktop/applications" ] && dirs+=("/var/lib/snapd/desktop/applications")
+    [ -d "/run/host/var/lib/snapd/desktop/applications" ] && dirs+=("/run/host/var/lib/snapd/desktop/applications")
 
     printf "%s\n" "${dirs[@]}" | sort -u
 }
@@ -443,13 +459,17 @@ list_apps_for_picker() {
 # ── Helper: force icon refresh ───────────────────────────────────────────
 do_refresh() {
     echo "🔄 Refreshing icon caches..."
-    kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
-    update-desktop-database "$USER_APPS_DIR" 2>/dev/null
+    run_host kbuildsycoca6 --noincremental 2>/dev/null \
+        || run_host kbuildsycoca6 2>/dev/null \
+        || run_host kbuildsycoca5 --noincremental 2>/dev/null \
+        || run_host kbuildsycoca5 2>/dev/null \
+        || true
+    run_host update-desktop-database "$USER_APPS_DIR" 2>/dev/null || true
     if [ -d "$USER_ICONS_DIR/hicolor" ]; then
-        gtk-update-icon-cache -f -t "$USER_ICONS_DIR/hicolor" 2>/dev/null || true
+        run_host gtk-update-icon-cache -f -t "$USER_ICONS_DIR/hicolor" 2>/dev/null || true
     fi
     for p in "$HOME/.icons" "$USER_ICONS_DIR"; do
-        [ -d "$p" ] && gtk-update-icon-cache -f -t "$p" 2>/dev/null
+        [ -d "$p" ] && run_host gtk-update-icon-cache -f -t "$p" 2>/dev/null || true
     done
     echo "✅ Icon caches refreshed."
 }

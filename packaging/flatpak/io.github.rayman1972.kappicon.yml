@@ -1,0 +1,92 @@
+# Flatpak manifest for kAppIcon
+# Build (user install):
+#   flatpak-builder --user --install --force-clean build-dir \
+#     packaging/flatpak/io.github.rayman1972.kappicon.yml
+#
+# Note: This app edits host launcher icons. The sandbox intentionally allows
+# home + system application/icon trees and host cache refresh via flatpak-spawn.
+
+app-id: io.github.rayman1972.kappicon
+runtime: org.kde.Platform
+runtime-version: '6.10'
+sdk: org.kde.Sdk
+base: com.riverbankcomputing.PyQt.BaseApp
+base-version: '6.10'
+command: kappicon
+finish-args:
+  # Display
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  # Must edit real user launchers / icons / config (core feature).
+  # host-os exposes the host /usr as /run/host/usr (plain /usr is reserved).
+  - --filesystem=home
+  - --filesystem=host-os:ro
+  - --filesystem=/var/lib/flatpak/exports/share:ro
+  - --filesystem=xdg-data/flatpak/exports/share:ro
+  # Host tools: kbuildsycoca, update-desktop-database, gtk-update-icon-cache
+  - --talk-name=org.freedesktop.Flatpak
+  - --talk-name=org.kde.kglobalaccel
+  - --talk-name=org.kde.StatusNotifierWatcher
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/man
+  - /share/doc
+  - '*.a'
+  - '*.la'
+cleanup-commands:
+  - /app/cleanup-BaseApp.sh
+modules:
+  # ImageMagick for rasterize / shape masks
+  - name: imagemagick
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --without-magick-plus-plus
+      - --without-perl
+      - --without-x
+      - --with-png
+      - --with-jpeg
+      - --with-webp
+      - --with-rsvg
+    sources:
+      - type: archive
+        url: https://github.com/ImageMagick/ImageMagick/archive/refs/tags/7.1.1-43.tar.gz
+        sha256: ceb972266b23dc7c1cfce0da5a7f0c9acfb4dc81f40eb542a49476fedbc2618f
+
+  # icns2png for Apple .icns sources
+  - name: libicns
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+    sources:
+      - type: archive
+        url: https://downloads.sourceforge.net/project/icns/libicns-0.8.1.tar.gz
+        sha256: 335f10782fc79855cf02beac4926c4bf9f800a742445afbbf7729dab384555c2
+      # GCC 14+: png2icns.c uses unlink() without unistd.h
+      - type: shell
+        commands:
+          - sed -i '1i#include <unistd.h>' icnsutils/png2icns.c
+
+  # fzf (CLI): use host binary via flatpak-spawn if needed; GUI is primary.
+
+  - name: kappicon
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 gui/kappicon /app/bin/kappicon
+      - install -Dm755 cli/kappicon-cli /app/bin/kappicon-cli
+      - install -Dm644 gui/kappicon.desktop /app/share/applications/io.github.rayman1972.kappicon.desktop
+      - desktop-file-edit --set-key=Icon --set-value=io.github.rayman1972.kappicon /app/share/applications/io.github.rayman1972.kappicon.desktop
+      - desktop-file-edit --set-key=Exec --set-value=kappicon /app/share/applications/io.github.rayman1972.kappicon.desktop
+      - install -Dm644 data/io.github.rayman1972.kappicon.metainfo.xml /app/share/metainfo/io.github.rayman1972.kappicon.metainfo.xml
+      - install -Dm644 assets/kappicon.png /app/share/icons/hicolor/256x256/apps/io.github.rayman1972.kappicon.png
+      - install -Dm644 assets/kappicon.png /app/share/icons/hicolor/128x128/apps/io.github.rayman1972.kappicon.png
+      # Alias for metainfo stock icon name used by distro packages
+      - install -Dm644 assets/kappicon.png /app/share/icons/hicolor/256x256/apps/kappicon.png
+      - install -Dm644 LICENSE /app/share/licenses/kappicon/LICENSE
+      - install -Dm644 README.md /app/share/doc/kappicon/README.md
+    sources:
+      - type: dir
+        path: ../..

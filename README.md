@@ -43,6 +43,19 @@ yay -S kappicon-git
 
 PKGBUILDs are also kept in-tree under [`packaging/aur/`](packaging/aur/) (see [packaging/aur/README.md](packaging/aur/README.md) for updates).
 
+### Flatpak (local build)
+
+App id: **`io.github.rayman1972.kappicon`** — see [`packaging/flatpak/`](packaging/flatpak/).
+
+```bash
+flatpak-builder --user --install --force-clean \
+  packaging/flatpak/build-dir \
+  packaging/flatpak/io.github.rayman1972.kappicon.yml
+flatpak run io.github.rayman1972.kappicon
+```
+
+Not on Flathub yet. The sandbox grants **home + host-os** access on purpose so launchers and system icon themes can be read/written.
+
 ## Screenshots
 
 ### Map — pick a file icon and an application

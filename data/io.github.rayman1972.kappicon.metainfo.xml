@@ -34,12 +34,14 @@
   <url type="vcs-browser">https://github.com/rayman1972/kappicon</url>
 
   <launchable type="desktop-id">kappicon.desktop</launchable>
+  <launchable type="desktop-id">io.github.rayman1972.kappicon.desktop</launchable>
   <provides>
     <binary>kappicon</binary>
     <binary>kappicon-cli</binary>
   </provides>
-  <!-- stock name matches Icon= in kappicon.desktop / hicolor install -->
+  <!-- stock: AUR uses Icon=kappicon; Flatpak renames icon to the app-id -->
   <icon type="stock">kappicon</icon>
+  <icon type="stock">io.github.rayman1972.kappicon</icon>
   <icon type="remote" height="256" width="256">https://raw.githubusercontent.com/rayman1972/kappicon/main/assets/kappicon.png</icon>
 
   <categories>

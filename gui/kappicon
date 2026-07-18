@@ -36,6 +36,16 @@ xdg_user_dir() {
 XDG_DOWNLOAD_DIR=$(xdg_user_dir DOWNLOAD "$HOME/Downloads")
 XDG_PICTURES_DIR=$(xdg_user_dir PICTURES "$HOME/Pictures")
 
+# Inside Flatpak, prefer host paths for launcher/icon integration when HOME is the real home
+# (manifest grants --filesystem=home). Cache tools may need host execution.
+run_host() {
+    if [ -n "${FLATPAK_ID:-}" ] && command -v flatpak-spawn >/dev/null 2>&1; then
+        flatpak-spawn --host -- "$@"
+    else
+        "$@"
+    fi
+}
+
 CONFIG_DIR="${CONFIG_DIR:-$XDG_CONFIG_HOME/KAppIcon}"
 DATA_DIR="${DATA_DIR:-$XDG_DATA_HOME/kappicon}"
 USER_APPS_DIR="${USER_APPS_DIR:-$XDG_DATA_HOME/applications}"
@@ -249,6 +259,12 @@ get_desktop_dirs() {
         [ -n "$d" ] || continue
         [ -d "$d/applications" ] && dirs+=("$d/applications")
     done
+    # Flatpak sandbox: host OS trees appear under /run/host
+    if [ -n "${FLATPAK_ID:-}" ]; then
+        for d in /run/host/usr/share /run/host/usr/local/share; do
+            [ -d "$d/applications" ] && dirs+=("$d/applications")
+        done
+    fi
     # Flatpak exports (system + user; user may live under XDG_DATA_HOME)
     [ -d "/var/lib/flatpak/exports/share/applications" ] && dirs+=("/var/lib/flatpak/exports/share/applications")
     [ -d "$XDG_DATA_HOME/flatpak/exports/share/applications" ] && dirs+=("$XDG_DATA_HOME/flatpak/exports/share/applications")
@@ -257,8 +273,9 @@ get_desktop_dirs() {
             dirs+=("$HOME/.local/share/flatpak/exports/share/applications")
         [ -d "$HOME/.local/share/applications" ] && dirs+=("$HOME/.local/share/applications")
     fi
-    # Snap
+    # Snap (host path when sandboxed)
     [ -d "/var/lib/snapd/desktop/applications" ] && dirs+=("/var/lib/snapd/desktop/applications")
+    [ -d "/run/host/var/lib/snapd/desktop/applications" ] && dirs+=("/run/host/var/lib/snapd/desktop/applications")
 
     printf "%s\n" "${dirs[@]}" | sort -u
 }
@@ -362,6 +379,13 @@ def _env_path(key, *fallback_parts):
     if v:
         return v
     return os.path.join(*fallback_parts)
+
+
+def _run_host(cmd, **kwargs):
+    """Run a command on the host when inside Flatpak (for icon cache tools)."""
+    if os.environ.get("FLATPAK_ID") and shutil.which("flatpak-spawn"):
+        cmd = ["flatpak-spawn", "--host", "--"] + list(cmd)
+    return subprocess.run(cmd, **kwargs)
 
 
 def xdg_config_home():
@@ -481,6 +505,11 @@ def discover_icon_themes():
         d = d.strip()
         if d:
             roots.append((os.path.join(d, "icons"), False))
+    # Flatpak: host OS share is mounted under /run/host
+    if os.environ.get("FLATPAK_ID"):
+        for d in ("/run/host/usr/share", "/run/host/usr/local/share"):
+            roots.append((os.path.join(d, "icons"), False))
+
     # Deduplicate while preserving order
     _seen_roots = set()
     _uniq_roots = []
@@ -2891,12 +2920,12 @@ class CombinedWindow(QMainWindow):
                 raise
             for cmd in (["kbuildsycoca6"], ["kbuildsycoca5"]):
                 try:
-                    subprocess.run(cmd, capture_output=True, timeout=10)
+                    _run_host(cmd, capture_output=True, timeout=10)
                     break
                 except Exception:
                     continue
             try:
-                subprocess.run(
+                _run_host(
                     ["update-desktop-database", dest_dir],
                     capture_output=True, timeout=10,
                 )
@@ -2915,7 +2944,7 @@ class CombinedWindow(QMainWindow):
         ]
         for cmd in cmds:
             try:
-                subprocess.run(cmd, capture_output=True, timeout=10)
+                _run_host(cmd, capture_output=True, timeout=10)
                 break
             except Exception:
                 continue
@@ -2926,11 +2955,14 @@ class CombinedWindow(QMainWindow):
         for ep in icon_roots:
             if os.path.isdir(ep):
                 try:
-                    subprocess.run(["gtk-update-icon-cache", "-f", "-t", ep], capture_output=True, timeout=10)
+                    _run_host(
+                        ["gtk-update-icon-cache", "-f", "-t", ep],
+                        capture_output=True, timeout=10,
+                    )
                 except Exception:
                     pass
         try:
-            subprocess.run(
+            _run_host(
                 ["update-desktop-database", USER_APPS_DIR],
                 capture_output=True, timeout=10,
             )
@@ -3298,15 +3330,19 @@ case "$SELECTED_ICON" in
 esac
 
 refresh_icon_caches() {
-    kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
-    update-desktop-database "$USER_APPS_DIR" 2>/dev/null
+    run_host kbuildsycoca6 --noincremental 2>/dev/null \
+        || run_host kbuildsycoca6 2>/dev/null \
+        || run_host kbuildsycoca5 --noincremental 2>/dev/null \
+        || run_host kbuildsycoca5 2>/dev/null \
+        || true
+    run_host update-desktop-database "$USER_APPS_DIR" 2>/dev/null || true
     if [ -d "$USER_ICONS_DIR/hicolor" ]; then
-        gtk-update-icon-cache -f -t "$USER_ICONS_DIR/hicolor" 2>/dev/null || true
+        run_host gtk-update-icon-cache -f -t "$USER_ICONS_DIR/hicolor" 2>/dev/null || true
     fi
     for p in "$HOME/.icons" "$USER_ICONS_DIR"; do
-        [ -d "$p" ] && gtk-update-icon-cache -f -t "$p" 2>/dev/null
+        [ -d "$p" ] && run_host gtk-update-icon-cache -f -t "$p" 2>/dev/null || true
     done
-    qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
+    run_host qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
         var desktops = desktops();
         for (var i = 0; i < desktops.length; i++) {
             desktops[i].currentConfigGroup = new Array('General');

@@ -5,3 +5,7 @@ packaging/aur/*/src/
 packaging/aur/*/pkg/
 packaging/aur/*/*.tar.gz
 packaging/aur/kappicon-git/kappicon/
+packaging/flatpak/build-dir/
+packaging/flatpak/repo/
+packaging/flatpak/.flatpak-builder/
+*.flatpak
