@@ -304,6 +304,8 @@ from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, pyqtSignal
 
 ICON_EXTENSIONS = {".icns", ".png", ".jpg", ".jpeg", ".webp"}
 IMAGE_IMPORT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+# Single size for library icons (imports + saves) so Map/apply always sees equal assets
+STANDARD_ICON_SIZE = 512
 LIBRARY_DIR = os.environ.get(
     "LIBRARY_DIR", os.path.expanduser("~/.local/share/kappicon/icons")
 )
@@ -781,29 +783,38 @@ class PixelCanvas(QFrame):
         self.update()
         self._touch()
 
-    def load_from_file(self, path, fit=True):
+    def load_from_file(self, path, fit=True, size=None):
+        """Load an image onto the canvas.
+
+        If *size* is set, the grid is resized first (imports use STANDARD_ICON_SIZE
+        so every imported file lands on the same dimensions).
+        """
         img = QImage(path)
         if img.isNull():
             return False
         img = img.convertToFormat(QImage.Format.Format_ARGB32)
+        if size is not None:
+            size = max(8, min(512, int(size)))
+            self.grid_size = size
+        g = self.grid_size
         if fit:
             # Letterbox into square grid, preserving aspect, transparent pad
-            canvas = QImage(self.grid_size, self.grid_size, QImage.Format.Format_ARGB32)
+            canvas = QImage(g, g, QImage.Format.Format_ARGB32)
             canvas.fill(Qt.GlobalColor.transparent)
             scaled = img.scaled(
-                self.grid_size, self.grid_size,
+                g, g,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            x = (self.grid_size - scaled.width()) // 2
-            y = (self.grid_size - scaled.height()) // 2
+            x = (g - scaled.width()) // 2
+            y = (g - scaled.height()) // 2
             p = QPainter(canvas)
             p.drawImage(x, y, scaled)
             p.end()
             self._image = canvas
         else:
             self._image = img.scaled(
-                self.grid_size, self.grid_size,
+                g, g,
                 Qt.AspectRatioMode.IgnoreAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             ).convertToFormat(QImage.Format.Format_ARGB32)
@@ -1516,7 +1527,8 @@ class CombinedWindow(QMainWindow):
         canvas_box = QGroupBox("Canvas")
         center = QVBoxLayout(canvas_box)
         center.addWidget(make_hint_label(
-            "Draw with the pen, or import a photo or logo. It is scaled into the canvas."
+            "Draw with the pen, or import a photo or logo. "
+            f"Imports are always fitted into a {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE} canvas."
         ))
         self.pixel_canvas = PixelCanvas(64)
         self.pixel_canvas.changed.connect(self._editor_on_change)
@@ -1532,7 +1544,9 @@ class CombinedWindow(QMainWindow):
         import_btn.setIcon(theme_icon("document-open", "document-import"))
         import_btn.clicked.connect(self._editor_import)
         rl.addWidget(import_btn)
-        rl.addWidget(make_hint_label("PNG, JPG, WEBP, BMP, GIF"))
+        rl.addWidget(make_hint_label(
+            f"PNG, JPG, WEBP, BMP, GIF — scaled to {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}"
+        ))
 
         rl.addWidget(QLabel("Name"))
         self.editor_name = QLineEdit()
@@ -1652,6 +1666,53 @@ class CombinedWindow(QMainWindow):
         if self.pixel_canvas.tool == "picker":
             self._editor_update_color_btn()
 
+    def _editor_sync_size_combo(self, size):
+        """Keep the canvas-size dropdown in sync without re-triggering resize."""
+        if not hasattr(self, "size_combo"):
+            return
+        idx = self.size_combo.findData(int(size))
+        if idx < 0:
+            return
+        self.size_combo.blockSignals(True)
+        self.size_combo.setCurrentIndex(idx)
+        self.size_combo.blockSignals(False)
+
+    def _editor_export_image(self, img):
+        """Normalize canvas to STANDARD_ICON_SIZE square for the library.
+
+        Pixel art (smaller grids) is enlarged with nearest-neighbor so edges
+        stay crisp; larger images are reduced smoothly.
+        """
+        target = STANDARD_ICON_SIZE
+        if img.isNull():
+            return img
+        if img.width() == target and img.height() == target:
+            return img.convertToFormat(QImage.Format.Format_ARGB32)
+        # Non-square → letterbox into square first
+        if img.width() != img.height():
+            square = QImage(max(img.width(), img.height()),
+                            max(img.width(), img.height()),
+                            QImage.Format.Format_ARGB32)
+            square.fill(Qt.GlobalColor.transparent)
+            p = QPainter(square)
+            p.drawImage(
+                (square.width() - img.width()) // 2,
+                (square.height() - img.height()) // 2,
+                img,
+            )
+            p.end()
+            img = square
+        mode = (
+            Qt.TransformationMode.FastTransformation
+            if img.width() <= target
+            else Qt.TransformationMode.SmoothTransformation
+        )
+        return img.scaled(
+            target, target,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            mode,
+        ).convertToFormat(QImage.Format.Format_ARGB32)
+
     def _editor_import(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -1661,13 +1722,19 @@ class CombinedWindow(QMainWindow):
         )
         if not path:
             return
-        if not self.pixel_canvas.load_from_file(path, fit=True):
+        # Always import onto the standard library size so every saved icon matches
+        if not self.pixel_canvas.load_from_file(
+            path, fit=True, size=STANDARD_ICON_SIZE
+        ):
             QMessageBox.warning(self, "Import failed", f"Could not load:\n{path}")
             return
+        self._editor_sync_size_combo(STANDARD_ICON_SIZE)
         base = os.path.splitext(os.path.basename(path))[0]
         if not self.editor_name.text().strip():
             self.editor_name.setText(base)
-        self.editor_status.setText(f"Imported {os.path.basename(path)}")
+        self.editor_status.setText(
+            f"Imported {os.path.basename(path)} → {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}"
+        )
         QTimer.singleShot(2500, lambda: self.editor_status.setText(""))
 
     def _editor_sanitize_name(self, name):
@@ -1795,15 +1862,8 @@ class CombinedWindow(QMainWindow):
         if not path_is_under(path, LIBRARY_DIR):
             QMessageBox.warning(self, "Save failed", "Refusing to write outside the icon library.")
             return None
-        # Export at least 512px for crisp desktop icons when source grid is smaller
-        img = self.pixel_canvas.image()
-        export = img
-        if img.width() < 512:
-            export = img.scaled(
-                512, 512,
-                Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
+        # Always write STANDARD_ICON_SIZE² so Map / apply / library stay uniform
+        export = self._editor_export_image(self.pixel_canvas.image())
         # Atomic save: write temp sibling then os.replace (no half-written PNG)
         try:
             fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".png", dir=LIBRARY_DIR)
@@ -1860,9 +1920,12 @@ class CombinedWindow(QMainWindow):
             "<h3>🎨 Workflow 2: Create Custom Icons</h3>"
             "<ol>"
             "<li>Open the <b>Create</b> tab.</li>"
-            "<li>Set a canvas size (e.g., 16x16, 32x32, 64x64, etc.) or click <i>Import image...</i> to import an existing graphic.</li>"
+            f"<li>Set a canvas size for pixel art (16×16 … 512×512), or click <i>Import image…</i> — "
+            f"imports are always fitted to <b>{STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}</b>.</li>"
             "<li>Draw pixel art using the <b>Pen</b>, <b>Eraser</b>, <b>Fill</b>, and <b>Color Picker</b> tools.</li>"
-            "<li>Enter a name in the <i>Save Name</i> field and click <i>Save icon</i> or <i>Save and use in Map</i>.</li>"
+            f"<li>Save writes a <b>{STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}</b> PNG to your icon library "
+            "(same size for every icon).</li>"
+            "<li>Click <i>Save icon</i> or <i>Save and use in Map</i>.</li>"
             "</ol>"
             
             "<h3>🛠️ Resetting & Library Maintenance</h3>"
@@ -1931,8 +1994,11 @@ class CombinedWindow(QMainWindow):
     def _editor_open_library_item(self, item):
         path = item.data(Qt.ItemDataRole.UserRole)
         if path and os.path.isfile(path):
-            # Load into canvas at current grid size
-            self.pixel_canvas.load_from_file(path, fit=True)
+            # Re-open at the standard size so re-edits stay uniform with imports
+            self.pixel_canvas.load_from_file(
+                path, fit=True, size=STANDARD_ICON_SIZE
+            )
+            self._editor_sync_size_combo(STANDARD_ICON_SIZE)
             # Matches disk until the user draws again
             self.pixel_canvas.mark_clean()
             self.editor_name.setText(os.path.splitext(os.path.basename(path))[0])

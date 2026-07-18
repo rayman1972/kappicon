@@ -29,7 +29,7 @@ KAppIcon updates your user-level [freedesktop](https://specifications.freedeskto
 | Area | What you get |
 |------|----------------|
 | **Map** | Assign icons from files, from another installed app, or from an installed icon theme pack (Tela, WhiteSur, Breeze, …) |
-| **Create** | Pixel canvas (pen / eraser / fill / picker), import PNG·JPG·WEBP·…, save into a personal library |
+| **Create** | Pixel canvas (pen / eraser / fill / picker); imports and saves are always **512×512** PNGs in your library |
 | **Shapes** | When applying custom images: keep as designed, or mask to square / rounded / circle |
 | **Reset** | Restore an app’s system icon from Map |
 | **Backups** | Optional auto-backup of `.desktop` files before changes + restore UI |
