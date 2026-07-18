@@ -298,7 +298,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import (
     QPixmap, QIcon, QColor, QPainter, QPainterPath, QPalette,
-    QCursor, QImage, QPen,
+    QCursor, QImage, QPen, QKeySequence, QShortcut, QAction,
 )
 from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, pyqtSignal
 
@@ -714,6 +714,10 @@ def resolve_icon(icon_name):
 class PixelCanvas(QFrame):
     """Simple pixel grid editor for designing icons."""
     changed = pyqtSignal()
+    history_changed = pyqtSignal()  # undo/redo availability changed
+
+    # Cap memory: each 512² ARGB snapshot ≈ 1 MiB
+    MAX_HISTORY = 40
 
     def __init__(self, grid_size=64, parent=None):
         super().__init__(parent)
@@ -722,15 +726,19 @@ class PixelCanvas(QFrame):
         self.color = QColor(0, 120, 215, 255)
         self.show_grid = True
         self._drawing = False
+        self._stroke_undo_pushed = False  # one undo entry per pen/eraser stroke
         self._dirty = False
         self._image = QImage(grid_size, grid_size, QImage.Format.Format_ARGB32)
         self._image.fill(Qt.GlobalColor.transparent)
+        self._undo_stack = []  # list[QImage]
+        self._redo_stack = []
         self.setMinimumSize(280, 280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFrameShadow(QFrame.Shadow.Sunken)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def image(self):
         return self._image
@@ -748,20 +756,74 @@ class PixelCanvas(QFrame):
         blank.fill(Qt.GlobalColor.transparent)
         return self._image == blank
 
+    def can_undo(self):
+        return bool(self._undo_stack)
+
+    def can_redo(self):
+        return bool(self._redo_stack)
+
+    def clear_history(self):
+        """Drop undo/redo (e.g. after opening a library icon as a fresh base)."""
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.history_changed.emit()
+
+    def _snapshot(self):
+        return self._image.copy()
+
+    def _push_undo(self):
+        """Save current canvas so the next mutation can be undone."""
+        self._undo_stack.append(self._snapshot())
+        while len(self._undo_stack) > self.MAX_HISTORY:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self.history_changed.emit()
+
+    def undo(self):
+        if not self._undo_stack:
+            return False
+        self._redo_stack.append(self._snapshot())
+        self._image = self._undo_stack.pop()
+        self.grid_size = self._image.width()
+        self._drawing = False
+        self._stroke_undo_pushed = False
+        self.update()
+        self._touch()
+        self.history_changed.emit()
+        return True
+
+    def redo(self):
+        if not self._redo_stack:
+            return False
+        self._undo_stack.append(self._snapshot())
+        while len(self._undo_stack) > self.MAX_HISTORY:
+            self._undo_stack.pop(0)
+        self._image = self._redo_stack.pop()
+        self.grid_size = self._image.width()
+        self._drawing = False
+        self._stroke_undo_pushed = False
+        self.update()
+        self._touch()
+        self.history_changed.emit()
+        return True
 
     def _touch(self):
         self._dirty = True
         self.changed.emit()
 
-    def set_image(self, img: QImage):
+    def set_image(self, img: QImage, *, record_undo=True):
         if img.isNull():
             return
+        if record_undo:
+            self._push_undo()
         self._image = img.convertToFormat(QImage.Format.Format_ARGB32)
         self.grid_size = self._image.width()
         self.update()
         self._touch()
 
-    def clear(self, color=None):
+    def clear(self, color=None, *, record_undo=True):
+        if record_undo:
+            self._push_undo()
         if color is None:
             self._image.fill(Qt.GlobalColor.transparent)
         else:
@@ -769,10 +831,12 @@ class PixelCanvas(QFrame):
         self.update()
         self._touch()
 
-    def resize_grid(self, size):
+    def resize_grid(self, size, *, record_undo=True):
         size = max(8, min(512, int(size)))
         if size == self.grid_size:
             return
+        if record_undo:
+            self._push_undo()
         scaled = self._image.scaled(
             size, size,
             Qt.AspectRatioMode.IgnoreAspectRatio,
@@ -783,7 +847,7 @@ class PixelCanvas(QFrame):
         self.update()
         self._touch()
 
-    def load_from_file(self, path, fit=True, size=None):
+    def load_from_file(self, path, fit=True, size=None, *, record_undo=True):
         """Load an image onto the canvas.
 
         If *size* is set, the grid is resized first (imports use STANDARD_ICON_SIZE
@@ -793,6 +857,8 @@ class PixelCanvas(QFrame):
         if img.isNull():
             return False
         img = img.convertToFormat(QImage.Format.Format_ARGB32)
+        if record_undo:
+            self._push_undo()
         if size is not None:
             size = max(8, min(512, int(size)))
             self.grid_size = size
@@ -836,15 +902,25 @@ class PixelCanvas(QFrame):
             return x, y
         return None
 
-    def _apply_tool(self, x, y):
+    def _apply_tool(self, x, y, *, begin_stroke=False):
+        if self.tool == "picker":
+            self.color = self._image.pixelColor(x, y)
+            self.changed.emit()  # color swatch only — not a canvas edit
+            return
+        # One history entry per stroke (press) or fill click
+        if begin_stroke or self.tool == "fill":
+            if self.tool == "fill":
+                target = self._image.pixelColor(x, y)
+                if target == self.color:
+                    return  # no-op fill — don't pollute history
+                self._push_undo()
+            elif begin_stroke and not self._stroke_undo_pushed:
+                self._push_undo()
+                self._stroke_undo_pushed = True
         if self.tool == "pen":
             self._image.setPixelColor(x, y, self.color)
         elif self.tool == "eraser":
             self._image.setPixelColor(x, y, QColor(0, 0, 0, 0))
-        elif self.tool == "picker":
-            self.color = self._image.pixelColor(x, y)
-            self.changed.emit()  # color swatch only — not a canvas edit
-            return
         elif self.tool == "fill":
             self._flood_fill(x, y, self.color)
         self.update()
@@ -921,8 +997,10 @@ class PixelCanvas(QFrame):
         cell = self._pos_to_cell(event.position())
         if not cell:
             return
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         self._drawing = self.tool in ("pen", "eraser")
-        self._apply_tool(*cell)
+        self._stroke_undo_pushed = False
+        self._apply_tool(*cell, begin_stroke=True)
 
     def mouseMoveEvent(self, event):
         if not self._drawing:
@@ -931,10 +1009,23 @@ class PixelCanvas(QFrame):
             return
         cell = self._pos_to_cell(event.position())
         if cell:
-            self._apply_tool(*cell)
+            self._apply_tool(*cell, begin_stroke=False)
 
     def mouseReleaseEvent(self, event):
         self._drawing = False
+        self._stroke_undo_pushed = False
+
+    def keyPressEvent(self, event):
+        # Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y when the canvas has focus
+        if event.matches(QKeySequence.StandardKey.Undo):
+            self.undo()
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Redo):
+            self.redo()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 # ── KDE / Breeze helpers ─────────────────────────────────────────────────
@@ -1163,6 +1254,22 @@ class CombinedWindow(QMainWindow):
         exit_action.setShortcut("Ctrl+Q")
         exit_action.setStatusTip("Exit KAppIcon")
         exit_action.triggered.connect(self.close)
+
+        # Edit Menu (Create canvas history)
+        edit_menu = menubar.addMenu("&Edit")
+        self.undo_action = edit_menu.addAction("&Undo")
+        self.undo_action.setIcon(theme_icon("edit-undo", "edit-undo"))
+        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.undo_action.setStatusTip("Undo the last Create-tab canvas change")
+        self.undo_action.setEnabled(False)
+        self.undo_action.triggered.connect(self._editor_undo)
+
+        self.redo_action = edit_menu.addAction("&Redo")
+        self.redo_action.setIcon(theme_icon("edit-redo", "edit-redo"))
+        self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self.redo_action.setStatusTip("Redo the last undone Create-tab change")
+        self.redo_action.setEnabled(False)
+        self.redo_action.triggered.connect(self._editor_redo)
 
         # Options Menu
         options_menu = menubar.addMenu("&Options")
@@ -1516,8 +1623,27 @@ class CombinedWindow(QMainWindow):
 
         tl.addStretch(1)
 
+        # History: undo / redo / clear
+        hist_row = QHBoxLayout()
+        hist_row.setSpacing(6)
+        self.undo_btn = QPushButton("Undo")
+        self.undo_btn.setIcon(theme_icon("edit-undo", "edit-undo"))
+        self.undo_btn.setToolTip("Undo last change (Ctrl+Z)")
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.clicked.connect(self._editor_undo)
+        hist_row.addWidget(self.undo_btn)
+
+        self.redo_btn = QPushButton("Redo")
+        self.redo_btn.setIcon(theme_icon("edit-redo", "edit-redo"))
+        self.redo_btn.setToolTip("Redo (Ctrl+Shift+Z or Ctrl+Y)")
+        self.redo_btn.setEnabled(False)
+        self.redo_btn.clicked.connect(self._editor_redo)
+        hist_row.addWidget(self.redo_btn)
+        tl.addLayout(hist_row)
+
         clear_btn = QPushButton("Clear canvas")
         clear_btn.setIcon(theme_icon("edit-clear", "edit-delete"))
+        clear_btn.setToolTip("Erase everything (can be undone)")
         clear_btn.clicked.connect(lambda: self.pixel_canvas.clear())
         tl.addWidget(clear_btn)
 
@@ -1528,12 +1654,26 @@ class CombinedWindow(QMainWindow):
         center = QVBoxLayout(canvas_box)
         center.addWidget(make_hint_label(
             "Draw with the pen, or import a photo or logo. "
-            f"Imports are always fitted into a {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE} canvas."
+            f"Imports are always fitted into a {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE} canvas. "
+            "Undo last step with Ctrl+Z."
         ))
         self.pixel_canvas = PixelCanvas(64)
         self.pixel_canvas.changed.connect(self._editor_on_change)
+        self.pixel_canvas.history_changed.connect(self._editor_update_history_buttons)
         center.addWidget(self.pixel_canvas, stretch=1)
         layout.addWidget(canvas_box, stretch=1)
+
+        # App-wide shortcuts so Undo works even when a list has focus on Create tab
+        self._undo_sc = QShortcut(QKeySequence.StandardKey.Undo, self)
+        self._undo_sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._undo_sc.activated.connect(self._editor_undo)
+        self._redo_sc = QShortcut(QKeySequence.StandardKey.Redo, self)
+        self._redo_sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._redo_sc.activated.connect(self._editor_redo)
+        # Extra Redo for Ctrl+Y (common on some desktops)
+        self._redo_sc_y = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self._redo_sc_y.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._redo_sc_y.activated.connect(self._editor_redo)
 
         # Right: actions + library
         right = QGroupBox("Library")
@@ -1651,6 +1791,35 @@ class CombinedWindow(QMainWindow):
         self.color_btn.setIcon(QIcon(pix))
         label = c.name(QColor.NameFormat.HexArgb) if c.alpha() < 255 else c.name()
         self.color_btn.setText(label)
+
+    def _editor_update_history_buttons(self):
+        can_u = self.pixel_canvas.can_undo()
+        can_r = self.pixel_canvas.can_redo()
+        if hasattr(self, "undo_btn"):
+            self.undo_btn.setEnabled(can_u)
+        if hasattr(self, "redo_btn"):
+            self.redo_btn.setEnabled(can_r)
+        if hasattr(self, "undo_action"):
+            self.undo_action.setEnabled(can_u)
+        if hasattr(self, "redo_action"):
+            self.redo_action.setEnabled(can_r)
+
+    def _editor_undo(self):
+        # Only act when Create tab is visible (avoid surprising Map)
+        if hasattr(self, "main_tabs") and self.main_tabs.currentIndex() != 1:
+            return
+        if self.pixel_canvas.undo():
+            self._editor_sync_size_combo(self.pixel_canvas.grid_size)
+            self.editor_status.setText("Undid last change")
+            QTimer.singleShot(1500, lambda: self.editor_status.setText(""))
+
+    def _editor_redo(self):
+        if hasattr(self, "main_tabs") and self.main_tabs.currentIndex() != 1:
+            return
+        if self.pixel_canvas.redo():
+            self._editor_sync_size_combo(self.pixel_canvas.grid_size)
+            self.editor_status.setText("Redid change")
+            QTimer.singleShot(1500, lambda: self.editor_status.setText(""))
 
     def _editor_resize(self):
         size = self.size_combo.currentData()
@@ -1923,6 +2092,7 @@ class CombinedWindow(QMainWindow):
             f"<li>Set a canvas size for pixel art (16×16 … 512×512), or click <i>Import image…</i> — "
             f"imports are always fitted to <b>{STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}</b>.</li>"
             "<li>Draw pixel art using the <b>Pen</b>, <b>Eraser</b>, <b>Fill</b>, and <b>Color Picker</b> tools.</li>"
+            "<li><b>Undo</b> / <b>Redo</b> (Ctrl+Z / Ctrl+Shift+Z) reverse mistakes without clearing the canvas.</li>"
             f"<li>Save writes a <b>{STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}</b> PNG to your icon library "
             "(same size for every icon).</li>"
             "<li>Click <i>Save icon</i> or <i>Save and use in Map</i>.</li>"

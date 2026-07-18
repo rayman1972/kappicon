@@ -37,7 +37,7 @@ Browse packs such as **WhiteSur**, **Tela**, **Breeze**, or any theme under `~/.
 | **Map · From file** | Assign downloaded or library images (PNG, ICNS, SVG, …) to a launcher |
 | **Map · From another app** | Copy the theme icon another installed app already uses (e.g. give Shelly Discover’s icon) |
 | **Map · From icon theme** | Cross-use icons from **any installed icon theme pack** (WhiteSur, Tela, Breeze, Papirus, …) — pick a theme set, browse its app icons, apply one to a different program |
-| **Create** | Pixel canvas (pen / eraser / fill / picker); imports and saves are always **512×512** PNGs in your library |
+| **Create** | Pixel canvas (pen / eraser / fill / picker) with **undo/redo**; imports and saves are always **512×512** PNGs in your library |
 | **Shapes** | When applying custom images: keep as designed, or mask to square / rounded / circle |
 | **Reset** | Restore an app’s system icon from Map |
 | **Backups** | Optional auto-backup of `.desktop` files before changes + restore UI |
