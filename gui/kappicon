@@ -905,8 +905,60 @@ def _system_desktop_roots():
     return out
 
 
+def _icon_looks_like_kappicon_apply(icon):
+    """True if Icon= is clearly from kAppIcon (theme name or render path)."""
+    if not icon:
+        return False
+    icon = str(icon).strip()
+    if icon.startswith("kappicon-"):
+        return True
+    # Absolute / file: path under our data or Pictures render dir
+    path = icon[5:] if icon.startswith("file:") else icon
+    if not os.path.isabs(path):
+        return False
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        real = path
+    for root in (DATA_DIR, TARGET_DIR, LIBRARY_DIR):
+        try:
+            if path_is_under(real, root):
+                return True
+        except Exception:
+            pass
+    # Common default even if TARGET_DIR env differs mid-session
+    pictures_k = os.path.join(os.path.expanduser("~"), "Pictures", "KAppIcon")
+    try:
+        if path_is_under(real, pictures_k):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_icon_override(icon, system_icon, system_path):
+    """
+    Only treat as an icon override we care about:
+    - System launcher exists and Icon= differs, or
+    - Icon= was applied by kAppIcon (kappicon-* name / our paths).
+
+    Skip Steam/game shortcuts and other user-only .desktop files that are
+    not icon customizations of a system app.
+    """
+    icon = (icon or "").strip()
+    system_icon = (system_icon or "").strip()
+    if _icon_looks_like_kappicon_apply(icon):
+        return True
+    if not system_path:
+        return False
+    # System app with a different Icon= (customized theme name or file)
+    if icon != system_icon:
+        return True
+    return False
+
+
 def scan_user_launcher_overrides():
-    """User .desktop files under XDG applications (launcher overrides)."""
+    """User .desktop files that customize icons (not every Steam shortcut)."""
     rows = []
     user_dir = USER_APPS_DIR
     if not os.path.isdir(user_dir):
@@ -916,8 +968,18 @@ def scan_user_launcher_overrides():
     except OSError:
         return rows
     sys_roots = _system_desktop_roots()
+    skip_ids = {
+        "kappicon.desktop",
+        "io.github.rayman1972.kappicon.desktop",
+    }
     for name in names:
         if not is_valid_desktop_id(name):
+            continue
+        if name in skip_ids:
+            continue
+        # Steam / Proton helpers: user-only game launchers, not icon overrides
+        low = name.lower()
+        if low.startswith("steam_app") or low.startswith("steam."):
             continue
         path = os.path.join(user_dir, name)
         if not os.path.isfile(path):
@@ -931,6 +993,8 @@ def scan_user_launcher_overrides():
                 system_path = cand
                 _, system_icon = parse_desktop_fields(cand)
                 break
+        if not _is_icon_override(icon, system_icon, system_path):
+            continue
         rows.append({
             "desktop_id": name,
             "path": path,
@@ -2913,8 +2977,9 @@ class CombinedWindow(QMainWindow):
         layout.setSpacing(layout_spacing())
 
         layout.addWidget(make_hint_label(
-            "Launchers you (or kAppIcon) have customized under your user applications folder. "
-            "Reset restores the system icon when a system .desktop exists."
+            "System apps whose icons you changed (user .desktop with a different Icon=). "
+            "Steam/game shortcuts and other user-only launchers are hidden. "
+            "Reset restores the system icon when possible."
         ))
 
         filt_row = QHBoxLayout()
@@ -2987,8 +3052,8 @@ class CombinedWindow(QMainWindow):
             self.overrides_list.addItem(item)
         n = self.overrides_list.count()
         self.overrides_status.setText(
-            f"{n} user launcher override(s) in {USER_APPS_DIR}"
-            if n else f"No user overrides in {USER_APPS_DIR}"
+            f"{n} icon override(s) (customized system apps)"
+            if n else "No icon overrides yet — change an app on Map to see it here"
         )
         self._filter_overrides_list(self.overrides_search.text() if hasattr(self, "overrides_search") else "")
 
