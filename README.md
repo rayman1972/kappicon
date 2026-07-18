@@ -160,6 +160,14 @@ Paths follow the [XDG Base Directory](https://specifications.freedesktop.org/bas
 - Custom image files are installed under the user **hicolor** theme (and often referenced by name) so Plasma menus refresh reliably.
 - SVG sources can be used as-is when shape is *As designed*; other shapes re-export a masked 512×512 PNG.
 
+## Origins
+
+kAppIcon grew out of **[macosicons-linux](https://github.com/system-rw/macosicons-linux)** by [System RW](https://github.com/system-rw) (MIT). Their project is a focused tool for mapping custom images (including macOS-style `.icns`) onto Linux launchers.
+
+This repository continues under the same MIT license as a **substantial rework and expansion**: multi-source mapping (file / another app / installed icon theme packs), a Create tab with undo/redo, safer apply/restore paths, XDG-aware install, and a rebranded GUI + CLI (`kappicon` / `kappicon-cli`). Thanks to the original author for the idea and the base that made this possible.
+
 ## License
 
-See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
+
+Copyright notices include the original author (System RW) and later substantial contributions in this project.
