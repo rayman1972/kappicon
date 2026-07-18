@@ -1,14 +1,211 @@
 #!/bin/bash
 DOWNLOADS_DIR="$HOME/Downloads"
 TARGET_DIR="$HOME/Pictures/KAppIcon"
-LIBRARY_DIR="$HOME/.local/share/kappicon/icons"
-mkdir -p "$TARGET_DIR" "$LIBRARY_DIR"
+DATA_DIR="$HOME/.local/share/kappicon"
+LIBRARY_DIR="$DATA_DIR/icons"
+BACKUP_DIR_DEFAULT="$DATA_DIR/backups"
+LOCK_FILE="$DATA_DIR/apply.lock"
+mkdir -p "$TARGET_DIR" "$LIBRARY_DIR" "$BACKUP_DIR_DEFAULT"
+
+# Track temp workdirs for EXIT/INT/TERM cleanup
+WORK_DIR=""
+cleanup_on_exit() {
+    [ -n "${WORK_DIR:-}" ] && safe_cleanup "$WORK_DIR"
+    WORK_DIR=""
+}
+trap cleanup_on_exit EXIT INT TERM HUP
+
+# Freedesktop desktop ids are basenames; never allow path components.
+is_valid_desktop_id() {
+    local id="$1"
+    [ -n "$id" ] || return 1
+    case "$id" in
+        */*|*"\\"*|*".."*|*$'\n'*|*$'\r'*|.*|"") return 1 ;;
+    esac
+    [[ "$id" == *.desktop ]] || return 1
+    [ "$(basename -- "$id")" = "$id" ] || return 1
+    [ "${#id}" -gt 8 ] || return 1
+    return 0
+}
+
+is_temp_path() {
+    local p="$1" real base
+    [ -n "$p" ] || return 1
+    real=$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")
+    [ -n "$real" ] && [ "$real" != "/" ] || return 1
+    for base in /tmp /var/tmp "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}"; do
+        [ -n "$base" ] || continue
+        base=$(readlink -f "$base" 2>/dev/null || printf '%s' "$base")
+        [ -n "$base" ] && [ "$base" != "/" ] || continue
+        case "$real" in
+            "$base"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+safe_cleanup() {
+    local dir="$1"
+    [ -n "$dir" ] || return 0
+    if is_temp_path "$dir"; then
+        cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
+        rm -rf -- "$dir"
+    else
+        echo "Refusing to remove $dir — not under a temp directory" >&2
+    fi
+}
+
+acquire_apply_lock() {
+    mkdir -p "$DATA_DIR"
+    exec 9>"$LOCK_FILE" || return 1
+    if command -v flock &>/dev/null; then
+        if ! flock -w 45 9; then
+            show_error "Another KAppIcon operation is in progress (lock timeout)."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+atomic_replace() {
+    local src="$1" dest="$2"
+    mv -f -- "$src" "$dest"
+}
+
+# Unique backup: timestamp + pid + random (no same-second clobber).
+backup_desktop_file() {
+    local src="$1"
+    local backup_dir="${2:-$BACKUP_DIR_DEFAULT}"
+    local base dest
+    [ -f "$src" ] || return 1
+    mkdir -p "$backup_dir" || return 1
+    base=$(basename -- "$src")
+    is_valid_desktop_id "$base" || return 1
+    dest="$backup_dir/${base}.backup.$(date +%Y%m%d%H%M%S).$$.$RANDOM"
+    while [ -e "$dest" ]; do
+        dest="$backup_dir/${base}.backup.$(date +%Y%m%d%H%M%S).$$.$RANDOM"
+    done
+    cp -a -- "$src" "$dest" || return 1
+    printf '%s\n' "$dest"
+}
+
+# Set Icon= only inside [Desktop Entry], atomically.
+set_desktop_icon() {
+    local desktop_file="$1" icon_value="$2"
+    python3 - "$desktop_file" "$icon_value" <<'PY'
+import os, sys, tempfile
+
+path, icon = sys.argv[1], sys.argv[2]
+if not path or not icon:
+    sys.exit("empty path or icon")
+
+try:
+    with open(path, "r", errors="replace") as f:
+        lines = f.readlines()
+except OSError as e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
+
+out = []
+in_entry = False
+icon_set = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if in_entry and not icon_set:
+            out.append(f"Icon={icon}\n")
+            icon_set = True
+        in_entry = stripped == "[Desktop Entry]"
+        out.append(line if line.endswith("\n") else line + "\n")
+        continue
+    if in_entry and stripped.startswith("Icon="):
+        if not icon_set:
+            out.append(f"Icon={icon}\n")
+            icon_set = True
+        continue
+    out.append(line if line.endswith("\n") or line == "" else line + "\n")
+
+if in_entry and not icon_set:
+    out.append(f"Icon={icon}\n")
+elif not icon_set:
+    out.insert(0, "[Desktop Entry]\n")
+    out.insert(1, f"Icon={icon}\n")
+
+dirn = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".desktop", dir=dirn)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.writelines(out)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+}
+
+clear_desktop_icon() {
+    local desktop_file="$1"
+    python3 - "$desktop_file" <<'PY'
+import os, sys, tempfile
+
+path = sys.argv[1]
+try:
+    with open(path, "r", errors="replace") as f:
+        lines = f.readlines()
+except OSError as e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
+
+out = []
+in_entry = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        in_entry = stripped == "[Desktop Entry]"
+        out.append(line if line.endswith("\n") else line + "\n")
+        continue
+    if in_entry and stripped.startswith("Icon="):
+        continue
+    out.append(line if line.endswith("\n") or line == "" else line + "\n")
+
+dirn = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".desktop", dir=dirn)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.writelines(out)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+}
 
 get_desktop_dirs() {
     local dirs=()
     local xdg_dirs="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    local d
+    local -a split_dirs=()
     IFS=':' read -r -a split_dirs <<< "$xdg_dirs"
     for d in "${split_dirs[@]}" "$HOME/.local/share"; do
+        [ -n "$d" ] || continue
         [ -d "$d/applications" ] && dirs+=("$d/applications")
     done
     # Flatpak exports
@@ -16,14 +213,34 @@ get_desktop_dirs() {
     [ -d "$HOME/.local/share/flatpak/exports/share/applications" ] && dirs+=("$HOME/.local/share/flatpak/exports/share/applications")
     # Snap
     [ -d "/var/lib/snapd/desktop/applications" ] && dirs+=("/var/lib/snapd/desktop/applications")
-    
+
     printf "%s\n" "${dirs[@]}" | sort -u
 }
 
+# Never word-split directory paths that contain spaces.
 find_desktop_files() {
-    for d in $(get_desktop_dirs); do
+    local d
+    while IFS= read -r d; do
+        [ -n "$d" ] && [ -d "$d" ] || continue
         find "$d" -name "*.desktop" 2>/dev/null
-    done
+    done < <(get_desktop_dirs)
+}
+
+find_desktop_path() {
+    local id="$1" d
+    local user_dir="$HOME/.local/share/applications"
+    if [ -f "$user_dir/$id" ]; then
+        printf '%s\n' "$user_dir/$id"
+        return 0
+    fi
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if [ -f "$d/$id" ]; then
+            printf '%s\n' "$d/$id"
+            return 0
+        fi
+    done < <(get_desktop_dirs)
+    return 1
 }
 
 show_error() {
@@ -56,8 +273,11 @@ MAGICK_CMD="magick"
 if ! command -v magick &>/dev/null; then
     if command -v convert &>/dev/null; then
         MAGICK_CMD="convert"
+    else
+        MAGICK_CMD=""
     fi
 fi
+# ImageMagick is only required when rasterizing custom files (not theme icons).
 
 # 1. UNIFIED PyQt6 WINDOW — Map icons, edit/create icons, settings
 DESKTOP_LIST=$(find_desktop_files | sort -u)
@@ -110,6 +330,201 @@ def collect_system_icons(app_data):
     return sorted(by_icon.items(), key=lambda kv: kv[0].lower())
 
 
+THEME_ICON_FILE_EXTS = {".png", ".svg", ".svgz", ".xpm", ".jpg", ".jpeg", ".webp"}
+# Prefer larger / scalable assets when a theme ships multiple sizes of the same name
+_THEME_SIZE_SCORE = {
+    "scalable": 1000,
+    "512x512": 512, "512": 512,
+    "256x256": 256, "256": 256,
+    "128x128": 128, "128": 128,
+    "96x96": 96, "96": 96,
+    "72x72": 72, "72": 72,
+    "64x64": 64, "64": 64,
+    "48x48": 48, "48": 48,
+    "32x32": 32, "32": 32,
+    "24x24": 24, "24": 24,
+    "22x22": 22, "22": 22,
+    "16x16": 16, "16": 16,
+    "symbolic": 10,
+}
+
+
+def _theme_index_name(theme_dir):
+    """Human-readable Name= from index.theme, if present."""
+    index = os.path.join(theme_dir, "index.theme")
+    if not os.path.isfile(index):
+        return None
+    try:
+        with open(index, "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("Name=") and not line.startswith("Name["):
+                    return line.split("=", 1)[1].strip() or None
+    except OSError:
+        pass
+    return None
+
+
+def _is_cursor_theme(theme_dir, folder_name):
+    low = folder_name.lower()
+    if "cursor" in low:
+        return True
+    # Cursor themes often only have cursors/ and index.theme
+    try:
+        entries = set(os.listdir(theme_dir))
+    except OSError:
+        return True
+    meaningful = entries - {"index.theme", "icon-theme.cache", "cursors", "cursor.theme"}
+    if "cursors" in entries and not any(
+        os.path.isdir(os.path.join(theme_dir, e)) and e not in ("cursors",)
+        for e in meaningful
+    ):
+        return True
+    return False
+
+
+def discover_icon_themes():
+    """Installed icon themes (custom + system), newest user themes first.
+
+    Returns list of dicts: {id, name, path, is_user}
+    """
+    roots = [
+        (os.path.expanduser("~/.local/share/icons"), True),
+        (os.path.expanduser("~/.icons"), True),
+        ("/usr/local/share/icons", False),
+        ("/usr/share/icons", False),
+    ]
+    seen_paths = set()
+    themes = []
+    for root, is_user in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for folder in names:
+            path = os.path.join(root, folder)
+            if not os.path.isdir(path):
+                continue
+            real = os.path.realpath(path)
+            if real in seen_paths:
+                continue
+            if _is_cursor_theme(path, folder):
+                continue
+            # Prefer themes with index.theme or an apps/ tree
+            has_index = os.path.isfile(os.path.join(path, "index.theme"))
+            has_apps = False
+            try:
+                for dirpath, dirnames, _files in os.walk(path):
+                    base = os.path.basename(dirpath).lower()
+                    if base in ("apps", "applications"):
+                        has_apps = True
+                        break
+                    # Don't descend forever into huge trees for detection
+                    if dirpath.count(os.sep) - path.count(os.sep) > 3:
+                        dirnames.clear()
+            except OSError:
+                pass
+            if not has_index and not has_apps:
+                continue
+            seen_paths.add(real)
+            display = _theme_index_name(path) or folder
+            themes.append({
+                "id": folder,
+                "name": display,
+                "path": path,
+                "is_user": is_user,
+            })
+    # User themes first, then A–Z by display name
+    themes.sort(key=lambda t: (0 if t["is_user"] else 1, t["name"].lower()))
+    return themes
+
+
+def _path_size_score(dirpath):
+    parts = dirpath.replace("\\", "/").split("/")
+    score = 0
+    for p in parts:
+        pl = p.lower()
+        if pl in _THEME_SIZE_SCORE:
+            score = max(score, _THEME_SIZE_SCORE[pl])
+        # "48" style
+        if pl.isdigit():
+            score = max(score, int(pl))
+    return score
+
+
+def scan_theme_icons(theme_path, contexts=None):
+    """Icons in a theme pack. Returns [(icon_name, best_file_path), ...].
+
+    Focuses on application icons by default (apps / applications).
+
+    Supports both common layouts:
+      - Theme/48x48/apps/foo.png   (Breeze, Tela, …)
+      - Theme/apps/scalable/foo.svg (WhiteSur, McMojave, …)
+
+    Follows directory symlinks (e.g. WhiteSur-dark/apps/scalable → WhiteSur/…).
+    """
+    if contexts is None:
+        contexts = {"apps", "applications"}
+    best = {}  # name -> (score, path)
+    if not theme_path or not os.path.isdir(theme_path):
+        return []
+
+    visited = set()
+    try:
+        walker = os.walk(theme_path, followlinks=True)
+    except OSError:
+        return []
+
+    for dirpath, dirnames, filenames in walker:
+        try:
+            real_dir = os.path.realpath(dirpath)
+        except OSError:
+            continue
+        # Avoid cycles when following @2x / inheritance symlinks
+        if real_dir in visited:
+            dirnames[:] = []
+            continue
+        visited.add(real_dir)
+
+        norm = dirpath.replace("\\", "/")
+        low_parts = [p.lower() for p in norm.split("/") if p]
+        if "cursors" in low_parts:
+            dirnames[:] = []
+            continue
+
+        # Context may be any path component (…/apps/32, …/48x48/apps, or …/apps@2x/…)
+        # WhiteSur uses apps@2x → apps symlinks; strip the @scale suffix.
+        def _context_key(part: str) -> str:
+            return part.split("@", 1)[0]
+
+        if not any(_context_key(p) in contexts for p in low_parts):
+            continue
+
+        size_score = _path_size_score(dirpath)
+        # WhiteSur-style: Theme/apps/scalable → basename is scalable (scored);
+        # Theme/apps/32 → basename is 32 (scored as int in _path_size_score).
+        for fname in filenames:
+            root, ext = os.path.splitext(fname)
+            if ext.lower() not in THEME_ICON_FILE_EXTS:
+                continue
+            if not root or root.endswith("@2x"):
+                continue
+            score = size_score
+            # Prefer full-color over symbolic variants
+            if root.endswith("-symbolic") or "symbolic" in low_parts:
+                score -= 50
+            path = os.path.join(dirpath, fname)
+            prev = best.get(root)
+            if prev is None or score > prev[0]:
+                best[root] = (score, path)
+
+    items = [(name, path) for name, (_s, path) in best.items()]
+    items.sort(key=lambda t: t[0].lower())
+    return items
+
+
 def make_rounded_pixmap(pixmap, radius=18):
     size = pixmap.size()
     rounded = QPixmap(size)
@@ -125,20 +540,32 @@ def make_rounded_pixmap(pixmap, radius=18):
 
 
 def extract_preview(file_path):
+    """Return a path QPixmap can load. For .icns, extracts into a temp dir.
+
+    On success with .icns the returned path lives under a temp dir; the caller
+    owns cleanup of that directory (dirname of the returned path).
+    """
+    if not file_path or not os.path.isfile(file_path):
+        return None
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
-        # QPixmap can load these directly
+    if ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".svg", ".svgz", ".xpm"}:
+        # QPixmap / QIcon can load these directly
         return file_path
-    tmpdir = tempfile.mkdtemp()
+    if ext != ".icns":
+        return None
+    tmpdir = tempfile.mkdtemp(prefix="kappicon-preview-")
     try:
-        if ext == ".icns":
-            subprocess.run(["icns2png", "-x", file_path], cwd=tmpdir, capture_output=True, timeout=10)
-            candidates = sorted(
-                [f for f in os.listdir(tmpdir) if f.endswith(".png")],
-                key=lambda f: os.path.getsize(os.path.join(tmpdir, f)), reverse=True,
-            )
-            if candidates:
-                return os.path.join(tmpdir, candidates[0])
+        subprocess.run(
+            ["icns2png", "-x", file_path],
+            cwd=tmpdir, capture_output=True, timeout=15, check=False,
+        )
+        candidates = sorted(
+            [f for f in os.listdir(tmpdir) if f.endswith(".png")],
+            key=lambda f: os.path.getsize(os.path.join(tmpdir, f)), reverse=True,
+        )
+        if candidates:
+            # Caller must clean dirname(returned path)
+            return os.path.join(tmpdir, candidates[0])
     except Exception:
         pass
     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -198,6 +625,8 @@ def friendly_desktop_label(desktop_basename, desktop_path_lookup):
 
 def pick_primary_provider(desktops):
     """Choose the most representative .desktop that uses a shared theme icon."""
+    if not desktops:
+        return None
     def score(d):
         low = d.lower()
         s = 0
@@ -210,6 +639,41 @@ def pick_primary_provider(desktops):
         s -= len(low) // 20
         return s
     return sorted(desktops, key=score, reverse=True)[0]
+
+
+def is_valid_desktop_id(desktop_id):
+    """True if desktop_id is a safe freedesktop basename (no path components)."""
+    if not desktop_id or not isinstance(desktop_id, str):
+        return False
+    if "\n" in desktop_id or "\r" in desktop_id or "\0" in desktop_id:
+        return False
+    if os.path.sep in desktop_id or (os.path.altsep and os.path.altsep in desktop_id):
+        return False
+    if "/" in desktop_id or "\\" in desktop_id or ".." in desktop_id:
+        return False
+    if desktop_id.startswith("."):
+        return False
+    if not desktop_id.endswith(".desktop"):
+        return False
+    if os.path.basename(desktop_id) != desktop_id:
+        return False
+    # Non-empty stem (".desktop" alone is 8 chars)
+    if len(desktop_id) <= 8:
+        return False
+    return True
+
+
+def path_is_under(path, root):
+    """True if path resolves inside root (after realpath)."""
+    try:
+        real_path = os.path.realpath(path)
+        real_root = os.path.realpath(root)
+    except OSError:
+        return False
+    if real_path == real_root:
+        return True
+    prefix = real_root if real_root.endswith(os.sep) else real_root + os.sep
+    return real_path.startswith(prefix)
 
 
 def resolve_icon(icon_name):
@@ -604,7 +1068,9 @@ class CombinedWindow(QMainWindow):
         self.desktop_labels = {d[0]: d[2] for d in app_data}
         # theme icons already referenced by installed .desktop files
         self.system_icons = collect_system_icons([(d[0], d[1]) for d in app_data])
-        self.icon_source = "files"  # "files" | "system"
+        self.installed_themes = discover_icon_themes()
+        self._theme_icons_cache = {}  # theme path -> [(name, file_path), ...]
+        self.icon_source = "files"  # "files" | "system" | "icontheme"
         self.selected_file = None   # path or "theme:<name>"
         self.selected_app = None
         self._preview_tmpdir = None
@@ -785,9 +1251,44 @@ class CombinedWindow(QMainWindow):
             "From another app",
             "system",
         )
+        self.src_combo.addItem(
+            theme_icon("preferences-desktop-icons", "games-card", "folder-image"),
+            "From icon theme",
+            "icontheme",
+        )
         self.src_combo.currentIndexChanged.connect(self._on_src_combo)
         src_row.addWidget(self.src_combo, stretch=1)
         ib.addLayout(src_row)
+
+        # Theme pack picker (only when source = From icon theme)
+        self.theme_row_w = QWidget()
+        theme_row = QHBoxLayout(self.theme_row_w)
+        theme_row.setContentsMargins(0, 0, 0, 0)
+        theme_row.addWidget(QLabel("Theme set:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.theme_combo.setMinimumContentsLength(18)
+        for t in self.installed_themes:
+            label = t["name"]
+            if t["is_user"]:
+                label = f"{label}  (user)"
+            self.theme_combo.addItem(
+                theme_icon("preferences-desktop-icons", "folder"),
+                label,
+                t["path"],
+            )
+        if self.theme_combo.count() == 0:
+            self.theme_combo.addItem("(no icon themes found)", "")
+        # Prefer last-used theme or first user theme
+        saved_theme = self.settings.value("map/icon_theme_path", "", type=str)
+        if saved_theme:
+            idx = self.theme_combo.findData(saved_theme)
+            if idx >= 0:
+                self.theme_combo.setCurrentIndex(idx)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_pack_changed)
+        theme_row.addWidget(self.theme_combo, stretch=1)
+        self.theme_row_w.setVisible(False)
+        ib.addWidget(self.theme_row_w)
 
         # Keep button aliases for older call sites
         self.src_files_btn = self.src_combo  # duck-typed via _set_icon_source
@@ -902,23 +1403,27 @@ class CombinedWindow(QMainWindow):
         rl.addStretch(1)
 
         # KDE-style dialog buttons (Apply is the primary action)
+        # Keep short fixed labels so long app names never clip the Apply button.
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Close
         )
         self.select_btn = self.button_box.button(QDialogButtonBox.StandardButton.Apply)
-        self.select_btn.setText("Apply icon")
+        self.select_btn.setText("Apply")
         self.select_btn.setEnabled(False)
         self.select_btn.setIcon(theme_icon("dialog-ok-apply", "dialog-ok"))
-        
+        self.select_btn.setToolTip("Apply the selected icon to the selected application")
+
         self.reset_btn = self.button_box.addButton("Reset to default", QDialogButtonBox.ButtonRole.ActionRole)
         self.reset_btn.setIcon(theme_icon("edit-clear-all", "edit-undo", "document-revert"))
         self.reset_btn.setEnabled(False)
+        self.reset_btn.setToolTip("Restore this application’s original icon")
         self.reset_btn.clicked.connect(self._reset_app_icon)
 
         close_btn = self.button_box.button(QDialogButtonBox.StandardButton.Close)
         close_btn.setText("Close")
-        
-        equalize_widths([self.select_btn, self.reset_btn, close_btn])
+
+        # Do not force Apply to the same width as long labels — that clips “Apply to …”.
+        equalize_widths([self.reset_btn, close_btn])
         self.button_box.rejected.connect(self.close)
         self.button_box.clicked.connect(self._on_dialog_button)
         rl.addWidget(self.button_box)
@@ -1169,7 +1674,14 @@ class CombinedWindow(QMainWindow):
         name = (name or "").strip()
         if not name:
             name = f"icon-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in name).strip("-") or "icon"
+        # Drop path separators / traversal before char filter
+        name = name.replace("\\", "/").split("/")[-1]
+        name = name.replace("..", ".")
+        safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in name).strip(".-") or "icon"
+        # Collapse ".." remnants and force basename
+        safe = os.path.basename(safe)
+        if not safe or safe in (".", ".."):
+            safe = "icon"
         if not safe.lower().endswith(".png"):
             safe += ".png"
         return safe
@@ -1177,7 +1689,12 @@ class CombinedWindow(QMainWindow):
     def _editor_save_path(self, name=None):
         if name is None:
             name = self.editor_name.text()
-        return os.path.join(LIBRARY_DIR, self._editor_sanitize_name(name))
+        safe = self._editor_sanitize_name(name)
+        path = os.path.join(LIBRARY_DIR, safe)
+        # Hard guard: never write outside the icon library
+        if not path_is_under(path, LIBRARY_DIR):
+            path = os.path.join(LIBRARY_DIR, "icon.png")
+        return path
 
     def _editor_canvas_has_content_to_save(self):
         """False when the canvas is blank or has not been edited since last save."""
@@ -1275,6 +1792,9 @@ class CombinedWindow(QMainWindow):
                 return None
 
         os.makedirs(LIBRARY_DIR, exist_ok=True)
+        if not path_is_under(path, LIBRARY_DIR):
+            QMessageBox.warning(self, "Save failed", "Refusing to write outside the icon library.")
+            return None
         # Export at least 512px for crisp desktop icons when source grid is smaller
         img = self.pixel_canvas.image()
         export = img
@@ -1284,8 +1804,28 @@ class CombinedWindow(QMainWindow):
                 Qt.AspectRatioMode.IgnoreAspectRatio,
                 Qt.TransformationMode.FastTransformation,
             )
-        if not export.save(path, "PNG"):
-            QMessageBox.warning(self, "Save failed", f"Could not write:\n{path}")
+        # Atomic save: write temp sibling then os.replace (no half-written PNG)
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".png", dir=LIBRARY_DIR)
+            os.close(fd)
+        except OSError as e:
+            QMessageBox.warning(self, "Save failed", f"Could not create temp file:\n{e}")
+            return None
+        try:
+            if not export.save(tmp, "PNG"):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                QMessageBox.warning(self, "Save failed", f"Could not write:\n{path}")
+                return None
+            os.replace(tmp, path)
+        except Exception as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            QMessageBox.warning(self, "Save failed", f"Could not write:\n{e}")
             return None
         self.pixel_canvas.mark_clean()
         self._refresh_library_list()
@@ -1308,8 +1848,11 @@ class CombinedWindow(QMainWindow):
             
             "<h3>🔄 Workflow 1: Map an Icon to an Application</h3>"
             "<ol>"
-            "<li><b>Select Icon Source</b> (Step 1): Choose <i>From file</i> (your custom/downloaded PNGs or ICNS) "
-            "or <i>From another app</i> (extracts theme icon names from existing launchers). Select the icon in the list.</li>"
+            "<li><b>Select Icon Source</b> (Step 1): "
+            "<i>From file</i> (downloaded PNGs/ICNS), "
+            "<i>From another app</i> (icons used by installed launchers), or "
+            "<i>From icon theme</i> (browse an installed pack such as Tela or WhiteSur). "
+            "Select the icon in the list.</li>"
             "<li><b>Select Target Application</b> (Step 2): Select the application whose launcher you want to customize.</li>"
             "<li><b>Apply</b>: Click <i>Apply icon</i> to copy the launcher into your local user directory and change the Icon field.</li>"
             "</ol>"
@@ -1414,8 +1957,15 @@ class CombinedWindow(QMainWindow):
             return
         path = item.data(Qt.ItemDataRole.UserRole)
         if path and os.path.isfile(path):
-            filename = os.path.basename(path)
             from PyQt6.QtWidgets import QMessageBox
+            # Only allow deleting files that live inside the icon library
+            if not path_is_under(path, LIBRARY_DIR):
+                QMessageBox.warning(
+                    self, "Error",
+                    "Refusing to delete a file outside the icon library.",
+                )
+                return
+            filename = os.path.basename(path)
             confirm = QMessageBox.question(
                 self,
                 "Delete Icon?",
@@ -1466,6 +2016,44 @@ class CombinedWindow(QMainWindow):
         look_l.addLayout(theme_row)
         layout.addWidget(look)
 
+        shape_box = QGroupBox("Applied icon shape")
+        shape_l = QVBoxLayout(shape_box)
+        shape_l.addWidget(make_hint_label(
+            "How icons are shaped when you Apply them. "
+            "No guessing — pick the look you want."
+        ))
+        self.shape_group = QButtonGroup(self)
+        self.shape_as_is = QRadioButton("As designed")
+        self.shape_square = QRadioButton("Square")
+        self.shape_rounded = QRadioButton("Rounded corners")
+        self.shape_circle = QRadioButton("Circle")
+        self.shape_group.addButton(self.shape_as_is)
+        self.shape_group.addButton(self.shape_square)
+        self.shape_group.addButton(self.shape_rounded)
+        self.shape_group.addButton(self.shape_circle)
+        cur_shape = self.settings.value("icons/shape", "as-is", type=str)
+        {
+            "square": self.shape_square,
+            "rounded": self.shape_rounded,
+            "circle": self.shape_circle,
+        }.get(cur_shape, self.shape_as_is).setChecked(True)
+        self.shape_as_is.toggled.connect(lambda on: on and self._on_icon_shape("as-is"))
+        self.shape_square.toggled.connect(lambda on: on and self._on_icon_shape("square"))
+        self.shape_rounded.toggled.connect(lambda on: on and self._on_icon_shape("rounded"))
+        self.shape_circle.toggled.connect(lambda on: on and self._on_icon_shape("circle"))
+        shape_row = QHBoxLayout()
+        shape_row.addWidget(self.shape_as_is)
+        shape_row.addWidget(self.shape_square)
+        shape_row.addWidget(self.shape_rounded)
+        shape_row.addWidget(self.shape_circle)
+        shape_row.addStretch(1)
+        shape_l.addLayout(shape_row)
+        shape_l.addWidget(make_hint_label(
+            "As designed: keep the file’s own shape (best for themed SVGs). "
+            "Square / Rounded / Circle: re-export a PNG with that mask."
+        ))
+        layout.addWidget(shape_box)
+
         backups = QGroupBox("Backups")
         bl = QVBoxLayout(backups)
         self.backup_check = QCheckBox("Create a backup of .desktop files before changing them")
@@ -1478,8 +2066,9 @@ class CombinedWindow(QMainWindow):
         layout.addWidget(backups)
 
         source = QGroupBox("Icon files")
-        sf = QFormLayout(source)
+        sf = QVBoxLayout(source)
         default_src = os.environ.get("DOWNLOADS_DIR", os.path.expanduser("~/Downloads"))
+        sf.addWidget(QLabel("Source folder"))
         self.source_input = QLineEdit(self.settings.value("source/folder", default_src, type=str))
         self.source_input.setClearButtonEnabled(True)
         self.source_input.editingFinished.connect(self._on_source_change)
@@ -1489,9 +2078,10 @@ class CombinedWindow(QMainWindow):
         src_row = QHBoxLayout()
         src_row.addWidget(self.source_input, stretch=1)
         src_row.addWidget(browse)
-        sf.addRow("Source folder:", src_row)
-        sf.addRow("", make_hint_label(
-            "Used by Map → “From file”. Created icons are always available from the library."
+        sf.addLayout(src_row)
+        # Full-width hint (FormLayout was wrapping this awkwardly in a narrow field column)
+        sf.addWidget(make_hint_label(
+            "Used by Map → From file. Icons you create are kept in the library automatically."
         ))
         layout.addWidget(source)
 
@@ -1536,6 +2126,20 @@ class CombinedWindow(QMainWindow):
                 w.style().polish(w)
                 w.update()
 
+    def _on_icon_shape(self, shape):
+        self.settings.setValue("icons/shape", shape)
+        if self.statusBar():
+            labels = {
+                "as-is": "As designed — keep original shape",
+                "square": "Square — no rounded mask",
+                "rounded": "Rounded corners",
+                "circle": "Circle",
+            }
+            self.statusBar().showMessage(
+                f"Applied icon shape: {labels.get(shape, shape)}",
+                4000,
+            )
+
     def _browse_source(self):
         d = QFileDialog.getExistingDirectory(self, "Select Source Folder", self.source_input.text())
         if d:
@@ -1563,7 +2167,7 @@ class CombinedWindow(QMainWindow):
         return os.path.expanduser("~")
 
     def _set_icon_source(self, source):
-        """Switch between custom files and system theme icons."""
+        """Switch between files / app icons / installed icon theme packs."""
         self.icon_source = source
         # Keep combo in sync without re-entrancy
         if hasattr(self, "src_combo"):
@@ -1572,6 +2176,9 @@ class CombinedWindow(QMainWindow):
                 self.src_combo.blockSignals(True)
                 self.src_combo.setCurrentIndex(idx)
                 self.src_combo.blockSignals(False)
+
+        if hasattr(self, "theme_row_w"):
+            self.theme_row_w.setVisible(source == "icontheme")
 
         if source == "system":
             self.file_search.setPlaceholderText("Filter by application name…")
@@ -1585,10 +2192,27 @@ class CombinedWindow(QMainWindow):
                 self.info_label.setText("No theme icons found from installed apps.")
                 self.meta_label.setText("")
             self._update_mapping_summary()
-            # Status only while Map is visible; cleared automatically on tab change
             if self.statusBar() and self.main_tabs.currentIndex() == 0:
                 self.statusBar().showMessage(
                     "Showing icons already used by installed applications.",
+                    5000,
+                )
+        elif source == "icontheme":
+            self.file_search.setPlaceholderText("Filter theme icons (e.g. firefox)…")
+            self.file_search.clear()
+            self._fill_icon_theme_list()
+            self._clear_empty_icon_state()
+            if self.file_list.count() > 0:
+                self.file_list.setCurrentRow(0)
+            else:
+                self.preview_label.setText("No icons in theme")
+                self.info_label.setText("This theme set has no app icons, or none were found.")
+                self.meta_label.setText("")
+            self._update_mapping_summary()
+            if self.statusBar() and self.main_tabs.currentIndex() == 0:
+                tname = self.theme_combo.currentText() if hasattr(self, "theme_combo") else "theme"
+                self.statusBar().showMessage(
+                    f"Browsing icons from theme set: {tname}",
                     5000,
                 )
         else:
@@ -1606,6 +2230,23 @@ class CombinedWindow(QMainWindow):
                     "Showing icon files from your source folder and library.",
                     5000,
                 )
+
+    def _on_theme_pack_changed(self, _idx=None):
+        if self.icon_source != "icontheme":
+            return
+        path = self.theme_combo.currentData() if hasattr(self, "theme_combo") else None
+        if path:
+            self.settings.setValue("map/icon_theme_path", path)
+        self.file_search.clear()
+        self._fill_icon_theme_list()
+        if self.file_list.count() > 0:
+            self.file_list.setCurrentRow(0)
+            self._clear_empty_icon_state()
+        else:
+            self.preview_label.setText("No icons in theme")
+            self.info_label.setText("This theme set has no app icons, or none were found.")
+            self.meta_label.setText("")
+        self._update_mapping_summary()
 
     def _fill_file_list(self, files):
         """Populate the icon list, or a single clickable browse row when empty."""
@@ -1640,7 +2281,11 @@ class CombinedWindow(QMainWindow):
         """List theme icons already used by installed applications."""
         self.file_list.clear()
         for icon_name, desktops in self.system_icons:
+            if not desktops:
+                continue
             primary = pick_primary_provider(desktops)
+            if not primary:
+                continue
             provider_label = self.desktop_labels.get(
                 primary, os.path.splitext(primary)[0]
             )
@@ -1673,6 +2318,53 @@ class CombinedWindow(QMainWindow):
         # Sort by friendly provider name for scannability
         self.file_list.sortItems()
 
+    def _fill_icon_theme_list(self):
+        """List app icons from the selected installed icon theme pack."""
+        self.file_list.clear()
+        theme_path = self.theme_combo.currentData() if hasattr(self, "theme_combo") else None
+        if not theme_path or not os.path.isdir(theme_path):
+            item = QListWidgetItem("No icon themes found")
+            item.setData(Qt.ItemDataRole.UserRole, BROWSE_FOR_ICON)
+            self.file_list.addItem(item)
+            return
+
+        # Re-scan if uncached or previous scan found nothing (layout edge cases)
+        if theme_path not in self._theme_icons_cache or not self._theme_icons_cache[theme_path]:
+            if self.statusBar():
+                self.statusBar().showMessage("Scanning theme icons…")
+            QApplication.processEvents()
+            self._theme_icons_cache[theme_path] = scan_theme_icons(theme_path)
+            if self.statusBar():
+                n = len(self._theme_icons_cache[theme_path])
+                self.statusBar().showMessage(f"Found {n} icons in theme.", 4000)
+
+        icons = self._theme_icons_cache[theme_path]
+        theme_label = self.theme_combo.currentText()
+        # List icons without embedding thousands of pixmaps (keeps UI snappy);
+        # the right-hand preview still loads the selected file.
+        show_list_icons = len(icons) <= 400
+        for name, path in icons:
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, path)  # absolute file → applied as custom PNG path
+            item.setData(Qt.ItemDataRole.UserRole + 1, theme_label)
+            item.setData(Qt.ItemDataRole.UserRole + 2, name)
+            item.setToolTip(
+                f"Icon: {name}\n"
+                f"Theme set: {theme_label}\n"
+                f"File: {path}\n\n"
+                "Applied as this file (independent of the active Plasma icon theme)."
+            )
+            if show_list_icons:
+                ic = QIcon(path)
+                if not ic.isNull():
+                    item.setIcon(ic)
+            self.file_list.addItem(item)
+
+        if not icons:
+            item = QListWidgetItem("No app icons in this theme")
+            item.setData(Qt.ItemDataRole.UserRole, BROWSE_FOR_ICON)
+            self.file_list.addItem(item)
+
     def _show_empty_icon_state(self):
         self.preview_label.clear()
         self.preview_label.setText("No icon files\nClick to browse")
@@ -1681,7 +2373,9 @@ class CombinedWindow(QMainWindow):
         self.info_label.setText("No custom icon selected")
         self.info_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.info_label.setToolTip("Click to browse for an icon file")
-        self.meta_label.setText("Or switch to “From another app” above")
+        self.meta_label.setText(
+            "Or switch to “From another app” / “From icon theme” above"
+        )
         self._update_mapping_summary()
 
     def _clear_empty_icon_state(self):
@@ -1811,8 +2505,17 @@ class CombinedWindow(QMainWindow):
             self._restore_status.setText("No backups found")
             QTimer.singleShot(2000, lambda: self._restore_status.setText(""))
             return
+        try:
+            names = os.listdir(backup_dir)
+        except OSError:
+            names = []
         backups = sorted(
-            [f for f in os.listdir(backup_dir) if ".backup." in f],
+            [
+                f for f in names
+                if ".backup." in f
+                and os.path.sep not in f
+                and ".." not in f
+            ],
             key=lambda f: os.path.getmtime(os.path.join(backup_dir, f)),
             reverse=True,
         )
@@ -1821,25 +2524,59 @@ class CombinedWindow(QMainWindow):
             QTimer.singleShot(2000, lambda: self._restore_status.setText(""))
             return
         from PyQt6.QtWidgets import QInputDialog
-        choice, ok = QInputDialog.getItem(self, "Restore Backup", "Select backup to restore:", backups, 0, False)
-        if ok and choice:
-            src = os.path.join(backup_dir, choice)
-            desktop_name = choice.split(".backup.")[0]
-            dest_dir = os.path.expanduser("~/.local/share/applications")
-            dest = os.path.join(dest_dir, desktop_name)
+        choice, ok = QInputDialog.getItem(
+            self, "Restore Backup", "Select backup to restore:", backups, 0, False
+        )
+        if not (ok and choice):
+            return
+        # Choice is a basename only — never trust path components
+        if os.path.sep in choice or ".." in choice or choice in (".", ".."):
+            self._restore_status.setText("Invalid backup name")
+            QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
+            return
+        src = os.path.join(backup_dir, choice)
+        desktop_name = choice.split(".backup.")[0]
+        if not is_valid_desktop_id(desktop_name):
+            self._restore_status.setText("Invalid desktop id in backup name")
+            QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
+            return
+        dest_dir = os.path.expanduser("~/.local/share/applications")
+        dest = os.path.join(dest_dir, desktop_name)
+        try:
+            if not os.path.isfile(src) or not path_is_under(src, backup_dir):
+                raise OSError("backup path escaped backup directory")
+            os.makedirs(dest_dir, exist_ok=True)
+            # Atomic restore: copy to temp sibling then replace
+            fd, tmp = tempfile.mkstemp(prefix=".kappicon-restore-", dir=dest_dir)
+            os.close(fd)
             try:
-                shutil.copy2(src, dest)
-                for cmd in (["kbuildsycoca6"], ["kbuildsycoca5"]):
-                    try:
-                        subprocess.run(cmd, capture_output=True, timeout=10)
-                        break
-                    except Exception:
-                        continue
-                self._restore_status.setText("Restored!")
-                QTimer.singleShot(2000, lambda: self._restore_status.setText(""))
-            except Exception as e:
-                self._restore_status.setText(f"Failed: {e}")
-                QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
+                shutil.copy2(src, tmp)
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, dest)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            for cmd in (["kbuildsycoca6"], ["kbuildsycoca5"]):
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=10)
+                    break
+                except Exception:
+                    continue
+            try:
+                subprocess.run(
+                    ["update-desktop-database", dest_dir],
+                    capture_output=True, timeout=10,
+                )
+            except Exception:
+                pass
+            self._restore_status.setText("Restored!")
+            QTimer.singleShot(2000, lambda: self._restore_status.setText(""))
+        except Exception as e:
+            self._restore_status.setText(f"Failed: {e}")
+            QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
 
     def _force_refresh(self):
         cmds = [
@@ -1897,26 +2634,36 @@ class CombinedWindow(QMainWindow):
             self._update_mapping_summary()
             return
 
-        # Custom file on disk
+        # Custom file on disk (also: icons picked from an icon theme pack)
         fp = data
         if not os.path.isfile(fp):
             self._update_mapping_summary()
             return
         self._clear_empty_icon_state()
-        self.info_label.setText(os.path.basename(fp))
-        size = os.path.getsize(fp)
-        size_s = f"{size / 1024:.0f} KB" if size < 1048576 else f"{size / 1048576:.1f} MB"
-        self.meta_label.setText(f"Custom icon file · {size_s}")
+        icon_name = current.data(Qt.ItemDataRole.UserRole + 2)
+        theme_label = current.data(Qt.ItemDataRole.UserRole + 1)
+        if icon_name and self.icon_source == "icontheme":
+            self.info_label.setText(str(icon_name))
+            self.meta_label.setText(f"From icon theme · {theme_label}")
+        else:
+            self.info_label.setText(os.path.basename(fp))
+            size = os.path.getsize(fp)
+            size_s = f"{size / 1024:.0f} KB" if size < 1048576 else f"{size / 1048576:.1f} MB"
+            self.meta_label.setText(f"Custom icon file · {size_s}")
         preview = extract_preview(fp)
+        pix = QPixmap()
         if preview:
             pix = QPixmap(preview)
-            if not pix.isNull():
-                scaled = pix.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio,
-                                    Qt.TransformationMode.SmoothTransformation)
-                self.preview_label.setPixmap(scaled)
-                self._preview_tmpdir = os.path.dirname(preview)
-                if self._preview_tmpdir == os.path.dirname(fp):
-                    self._preview_tmpdir = None
+            if pix.isNull():
+                # SVG / theme assets often resolve better via QIcon
+                pix = QIcon(preview).pixmap(128, 128)
+        if not pix.isNull():
+            scaled = pix.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation)
+            self.preview_label.setPixmap(scaled)
+            self._preview_tmpdir = os.path.dirname(preview) if preview else None
+            if self._preview_tmpdir == os.path.dirname(fp):
+                self._preview_tmpdir = None
         else:
             self.preview_label.setText("No preview")
         self._update_mapping_summary()
@@ -1961,14 +2708,16 @@ class CombinedWindow(QMainWindow):
                 else:
                     icon_desc = os.path.basename(str(data))
 
+        # Always keep the button caption short; long names go in plan + tooltip.
+        self.select_btn.setText("Apply")
         if icon_ok and ai:
             display = ai.data(Qt.ItemDataRole.UserRole + 1) or ai.text()
             self.plan_label.setText(
                 f"Will set {display}'s launcher icon to {icon_desc}."
             )
-            self.select_btn.setText(f"Apply to {display}")
             self.select_btn.setEnabled(True)
             self.select_btn.setDefault(True)
+            self.select_btn.setToolTip(f"Apply to {display}")
             if self.statusBar() and self.main_tabs.currentIndex() == 0:
                 self.statusBar().showMessage(
                     f"Ready: apply {icon_desc} → {display}",
@@ -1976,16 +2725,16 @@ class CombinedWindow(QMainWindow):
                 )
         elif icon_ok:
             self.plan_label.setText("Now select the application to change (step 2).")
-            self.select_btn.setText("Apply")
             self.select_btn.setEnabled(False)
+            self.select_btn.setToolTip("Select an application first")
         elif ai:
             self.plan_label.setText("Now select the icon to use (step 1).")
-            self.select_btn.setText("Apply")
             self.select_btn.setEnabled(False)
+            self.select_btn.setToolTip("Select an icon first")
         else:
             self.plan_label.setText("Select an icon (step 1) and an application (step 2).")
-            self.select_btn.setText("Apply")
             self.select_btn.setEnabled(False)
+            self.select_btn.setToolTip("Select an icon and an application")
         self.reset_btn.setEnabled(bool(ai))
 
     def _filter_files(self, text):
@@ -2027,14 +2776,18 @@ class CombinedWindow(QMainWindow):
             if self.icon_source == "files":
                 self._browse_for_icon_file()
             return
-        if not desktop:
+        if not desktop or not is_valid_desktop_id(desktop):
             return
         if isinstance(data, str) and data.startswith(THEME_ICON_PREFIX):
+            theme_name = data[len(THEME_ICON_PREFIX):]
+            # Theme icon names must not smuggle path separators into Icon=
+            if not theme_name or any(c in theme_name for c in "/\\\n\r"):
+                return
             self.selected_file = data
             self.selected_app = desktop
             self.close()
             return
-        if not os.path.isfile(data):
+        if not isinstance(data, str) or not os.path.isfile(data):
             return
         self.selected_file = data
         self.selected_app = desktop
@@ -2045,6 +2798,8 @@ class CombinedWindow(QMainWindow):
         if not ai:
             return
         desktop = ai.data(Qt.ItemDataRole.UserRole)
+        if not desktop or not is_valid_desktop_id(desktop):
+            return
         display = ai.data(Qt.ItemDataRole.UserRole + 1) or ai.text()
         from PyQt6.QtWidgets import QMessageBox
         confirm = QMessageBox.question(
@@ -2096,11 +2851,40 @@ for p in scan_icons(LIBRARY_DIR):
     if p not in icon_files:
         icon_files.append(p)
 
-app_data = []
+def desktop_path_priority(path):
+    """Higher = preferred when the same .desktop id exists in multiple places.
+
+    User overrides (~/.local/share/applications) must win over /usr/share so we
+    don't list Ark twice (system + customized copy).
+    """
+    path = os.path.normpath(path).replace("\\", "/")
+    home_apps = os.path.normpath(os.path.expanduser("~/.local/share/applications")).replace("\\", "/")
+    if path.startswith(home_apps + "/") or path == home_apps:
+        return 100
+    if "/.local/share/flatpak/" in path:
+        return 50
+    if "/flatpak/" in path:
+        return 40
+    if path.startswith("/usr/local/"):
+        return 20
+    return 10
+
+
+# One entry per desktop file id — prefer the user override when present
+_by_desktop_id = {}
 for dp in DESKTOP_LIST_RAW:
-    basename = os.path.basename(dp)
+    if not dp or not os.path.isfile(dp):
+        continue
+    bid = os.path.basename(dp)
+    pr = desktop_path_priority(dp)
+    prev = _by_desktop_id.get(bid)
+    if prev is None or pr > prev[0]:
+        _by_desktop_id[bid] = (pr, dp)
+
+app_data = []
+for bid, (_pr, dp) in _by_desktop_id.items():
     display_name, icon_name = parse_desktop_fields(dp)
-    app_data.append((basename, icon_name, display_name, dp))
+    app_data.append((bid, icon_name, display_name, dp))
 # Stable sort by friendly name
 app_data.sort(key=lambda t: (t[2] or t[0]).lower())
 
@@ -2144,81 +2928,212 @@ if [ $PY_STATUS -ne 0 ] || [ -z "$RESULT" ]; then
     exit 0
 fi
 
-SELECTED_ICON=$(echo "$RESULT" | sed -n '1p')
-SELECTED_APP=$(echo "$RESULT" | sed -n '2p')
-BACKUP_ENABLED=$(echo "$RESULT" | sed -n '3p' | cut -d= -f2)
+# Parse GUI result carefully (paths may contain spaces; must not contain newlines)
+SELECTED_ICON=$(printf '%s\n' "$RESULT" | sed -n '1p')
+SELECTED_APP=$(printf '%s\n' "$RESULT" | sed -n '2p')
+BACKUP_ENABLED=$(printf '%s\n' "$RESULT" | sed -n '3p' | cut -d= -f2)
 
 if [ -z "$SELECTED_ICON" ] || [ -z "$SELECTED_APP" ]; then
     echo "Cancelled."
     exit 0
 fi
 
-if [ "$SELECTED_ICON" = "RESET" ]; then
-    USER_PATH="$HOME/.local/share/applications/$SELECTED_APP"
-    if [ -f "$USER_PATH" ]; then
-        SYS_PATH=""
-        for d in $(get_desktop_dirs); do
-            if [ "$d" != "$HOME/.local/share/applications" ] && [ -f "$d/$SELECTED_APP" ]; then
-                SYS_PATH="$d/$SELECTED_APP"
-                break
-            fi
-        done
-        
-        if [ -n "$SYS_PATH" ] && [ -f "$SYS_PATH" ]; then
-            ORIG_ICON=$(grep -E '^Icon=' "$SYS_PATH" | head -n 1 | cut -d= -f2-)
-            if [ -n "$ORIG_ICON" ]; then
-                ICON_SED=$(printf '%s\n' "$ORIG_ICON" | sed -e 's/[&|\\]/\\&/g')
-                sed -i "s|^Icon=.*|Icon=$ICON_SED|" "$USER_PATH"
-                show_info "Reset $SELECTED_APP icon back to '$ORIG_ICON'"
-            else
-                sed -i "/^Icon=/d" "$USER_PATH"
-                show_info "Removed custom icon from $SELECTED_APP"
-            fi
-        else
-            sed -i "/^Icon=/d" "$USER_PATH"
-            show_info "Removed custom icon from $SELECTED_APP"
-        fi
-    fi
-    
+# Guard: desktop id must be a safe basename (blocks path traversal from GUI bugs)
+if ! is_valid_desktop_id "$SELECTED_APP"; then
+    show_error "Invalid application id:\n$SELECTED_APP"
+    exit 1
+fi
+
+# Reject control characters / newlines in icon selection
+case "$SELECTED_ICON" in
+    *$'\n'*|*$'\r'*) show_error "Invalid icon selection (control characters)."; exit 1 ;;
+esac
+
+refresh_icon_caches() {
     kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
     update-desktop-database "$HOME/.local/share/applications" 2>/dev/null
-    gtk-update-icon-cache -f -t ~/.icons 2>/dev/null
-    gtk-update-icon-cache -f -t ~/.local/share/icons 2>/dev/null
-    
+    if [ -d "$HOME/.local/share/icons/hicolor" ]; then
+        gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+    fi
+    for p in "$HOME/.icons" "$HOME/.local/share/icons"; do
+        [ -d "$p" ] && gtk-update-icon-cache -f -t "$p" 2>/dev/null
+    done
     qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
         var desktops = desktops();
         for (var i = 0; i < desktops.length; i++) {
             desktops[i].currentConfigGroup = new Array('General');
             desktops[i].reloadConfig();
         }
-    " 2>/dev/null
+    " 2>/dev/null || true
+}
+
+if [ "$SELECTED_ICON" = "RESET" ]; then
+    if ! acquire_apply_lock; then
+        exit 1
+    fi
+    USER_PATH="$HOME/.local/share/applications/$SELECTED_APP"
+    if [ -f "$USER_PATH" ]; then
+        SYS_PATH=""
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            if [ "$d" != "$HOME/.local/share/applications" ] && [ -f "$d/$SELECTED_APP" ]; then
+                SYS_PATH="$d/$SELECTED_APP"
+                break
+            fi
+        done < <(get_desktop_dirs)
+
+        if [ -n "$SYS_PATH" ] && [ -f "$SYS_PATH" ]; then
+            # Only read Icon= from the [Desktop Entry] section of the system file
+            ORIG_ICON=$(python3 - "$SYS_PATH" <<'PY'
+import sys
+path = sys.argv[1]
+in_entry = False
+try:
+    with open(path, "r", errors="replace") as f:
+        for raw in f:
+            line = raw.strip()
+            if line.startswith("[") and line.endswith("]"):
+                in_entry = line == "[Desktop Entry]"
+                continue
+            if in_entry and line.startswith("Icon="):
+                print(line.split("=", 1)[1])
+                raise SystemExit
+except SystemExit:
+    raise
+except OSError:
+    pass
+PY
+)
+            if [ -n "$ORIG_ICON" ]; then
+                if set_desktop_icon "$USER_PATH" "$ORIG_ICON"; then
+                    show_info "Reset $SELECTED_APP icon back to '$ORIG_ICON'"
+                else
+                    show_error "Failed to reset icon for $SELECTED_APP"
+                    exit 1
+                fi
+            else
+                if clear_desktop_icon "$USER_PATH"; then
+                    show_info "Removed custom icon from $SELECTED_APP"
+                else
+                    show_error "Failed to clear icon for $SELECTED_APP"
+                    exit 1
+                fi
+            fi
+        else
+            if clear_desktop_icon "$USER_PATH"; then
+                show_info "Removed custom icon from $SELECTED_APP"
+            else
+                show_error "Failed to clear icon for $SELECTED_APP"
+                exit 1
+            fi
+        fi
+    else
+        show_info "No user override for $SELECTED_APP — already using the system icon."
+    fi
+
+    refresh_icon_caches
     exit 0
 fi
 
 # 2. Resolve Icon= value — theme name or converted custom file
-APP_CLEAN_NAME=$(basename "$SELECTED_APP" .desktop)
+APP_CLEAN_NAME=$(basename -- "$SELECTED_APP" .desktop)
+APP_CLEAN_NAME=$(printf '%s' "$APP_CLEAN_NAME" | tr -c 'A-Za-z0-9._+-' '_' | sed 's/^_\+//;s/_\+$//')
+[ -n "$APP_CLEAN_NAME" ] || APP_CLEAN_NAME="app"
 PNG_OUTPUT="$TARGET_DIR/${APP_CLEAN_NAME}.png"
 ICON_VALUE=""
 
-# Safe cleanup — only deletes if path is under /tmp, always cd HOME first
-safe_cleanup() {
-    local dir="$1"
-    case "$dir" in
-        /tmp/*)
-            cd "$HOME" 2>/dev/null || true
-            rm -rf "$dir"
+# User shape preference from Settings (no guessing)
+ICON_SHAPE=$(python3 -c '
+from PyQt6.QtCore import QSettings
+s = QSettings("KAppIcon", "KAppIcon")
+v = s.value("icons/shape", "as-is")
+print(v if v else "as-is")
+' 2>/dev/null || echo "as-is")
+ICON_SHAPE=$(printf '%s' "$ICON_SHAPE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+case "$ICON_SHAPE" in
+    as-is|square|rounded|circle) ;;
+    *) ICON_SHAPE="as-is" ;;
+esac
+
+# Rasterize SRC → OUT at 512² with optional mask (square / rounded / circle).
+# Writes via a temp file then renames onto OUT (atomic install).
+render_icon_png() {
+    local src="$1" out="$2" shape="$3"
+    local size=512
+    local radius=96   # ~19% of size — macOS-like rounded corners
+    local half=$((size / 2))
+    local tmp staged
+    if [ -z "$MAGICK_CMD" ]; then
+        echo "ImageMagick is not installed (need magick or convert)." >&2
+        return 1
+    fi
+    tmp=$(mktemp "${TMPDIR:-/tmp}/kappicon-XXXXXX") || return 1
+    staged=$(mktemp "${TMPDIR:-/tmp}/kappicon-out-XXXXXX") || { rm -f -- "$tmp"; return 1; }
+
+    # Base: scale onto transparent square — never trim/fuzz (preserves soft edges)
+    if ! "$MAGICK_CMD" "$src" -background none -alpha set \
+        -resize "${size}x${size}" -gravity center -extent "${size}x${size}" \
+        "$tmp" 2>/dev/null; then
+        rm -f -- "$tmp" "$staged"
+        return 1
+    fi
+
+    case "$shape" in
+        circle)
+            if ! "$MAGICK_CMD" "$tmp" \
+                \( +clone -threshold -1 -negate -fill white \
+                   -draw "circle ${half},${half} ${half},0" \) \
+                -alpha off -compose copy_opacity -composite \
+                "$staged" 2>/dev/null; then
+                rm -f -- "$tmp" "$staged"
+                return 1
+            fi
             ;;
-        *)
-            echo "Refusing to remove $dir — not in /tmp" >&2
+        rounded)
+            if ! "$MAGICK_CMD" "$tmp" \
+                \( -size "${size}x${size}" xc:none -fill white \
+                   -draw "roundrectangle 0,0 $((size - 1)),$((size - 1)) ${radius},${radius}" \) \
+                -compose DstIn -composite \
+                "$staged" 2>/dev/null; then
+                rm -f -- "$tmp" "$staged"
+                return 1
+            fi
+            ;;
+        square|as-is|*)
+            if ! cp -- "$tmp" "$staged"; then
+                rm -f -- "$tmp" "$staged"
+                return 1
+            fi
             ;;
     esac
+    rm -f -- "$tmp"
+    if [ ! -s "$staged" ]; then
+        rm -f -- "$staged"
+        return 1
+    fi
+    mkdir -p -- "$(dirname -- "$out")" || { rm -f -- "$staged"; return 1; }
+    if ! atomic_replace "$staged" "$out"; then
+        rm -f -- "$staged"
+        return 1
+    fi
+    [ -f "$out" ]
 }
 
+# Serialize mutations of shared state (desktop + hicolor + rendered PNG)
+if ! acquire_apply_lock; then
+    exit 1
+fi
+
 if [[ "$SELECTED_ICON" == theme:* ]]; then
-    # System theme icon — write the freedesktop name directly (e.g. plasmadiscover)
+    # System theme icon name — always a freedesktop name (shape N/A; theme draws it)
     ICON_VALUE="${SELECTED_ICON#theme:}"
     if [ -z "$ICON_VALUE" ]; then
         show_error "Empty theme icon name."
+        exit 1
+    fi
+    # Theme names must be free of path seps / shell metacharacters
+    if [[ "$ICON_VALUE" =~ [[:space:]/\\] ]] || [[ "$ICON_VALUE" == *".."* ]]; then
+        show_error "Invalid theme icon name."
         exit 1
     fi
 else
@@ -2228,89 +3143,153 @@ else
         exit 1
     fi
 
-    WORK_DIR=$(mktemp -d)
-    cp "$SELECTED_ICON_PATH" "$WORK_DIR/source_file"
+    # Resolve symlinks (theme packs often link dark → light variants)
+    SELECTED_ICON_PATH=$(readlink -f "$SELECTED_ICON_PATH" 2>/dev/null || printf '%s' "$SELECTED_ICON_PATH")
+    if [ ! -f "$SELECTED_ICON_PATH" ]; then
+        show_error "Icon file not found after resolving symlink:\n$SELECTED_ICON_PATH"
+        exit 1
+    fi
 
     FILE_EXT="${SELECTED_ICON_PATH##*.}"
-    FILE_EXT=$(echo "$FILE_EXT" | tr '[:upper:]' '[:lower:]')
+    FILE_EXT=$(printf '%s' "$FILE_EXT" | tr '[:upper:]' '[:lower:]')
 
-    case "$FILE_EXT" in
-        icns)
-            (cd "$WORK_DIR" && icns2png -x source_file) > /dev/null 2>&1
-            EXTRACTED_FILE=$(find "$WORK_DIR" -maxdepth 1 \( -name '*1024x1024*.png' -o -name '*512x512*.png' \) 2>/dev/null | head -n 1)
-            if [ -z "$EXTRACTED_FILE" ]; then
-                EXTRACTED_FILE=$(ls -S "$WORK_DIR"/*.png 2>/dev/null | head -n 1)
-            fi
-            if [ -f "$EXTRACTED_FILE" ]; then
-                "$MAGICK_CMD" "$EXTRACTED_FILE" -fuzz 10% -trim +repage -resize 512x512 -background none -gravity center -extent 512x512 "$PNG_OUTPUT"
-            else
-                show_error "Could not extract a valid PNG from this .icns file."
-                safe_cleanup "$WORK_DIR"
-                exit 1
-            fi
-            ;;
-        png|jpg|jpeg|webp|bmp|gif)
-            "$MAGICK_CMD" "$WORK_DIR/source_file" -fuzz 10% -trim +repage -resize 512x512 -background none -gravity center -extent 512x512 "$PNG_OUTPUT" 2>/dev/null
-            if [ ! -f "$PNG_OUTPUT" ]; then
-                show_error "Could not process this image file (.$FILE_EXT)."
-                safe_cleanup "$WORK_DIR"
-                exit 1
-            fi
-            ;;
-        *)
-            show_error "Unsupported file type: .$FILE_EXT\nUse PNG, JPG, WEBP, or ICNS."
-            safe_cleanup "$WORK_DIR"
+    # As designed + SVG: use original file (Plasma keeps full quality / shape)
+    if [ "$ICON_SHAPE" = "as-is" ] && [[ "$FILE_EXT" == svg || "$FILE_EXT" == svgz ]]; then
+        ICON_VALUE="$SELECTED_ICON_PATH"
+    else
+        WORK_DIR=$(mktemp -d) || { show_error "mktemp failed"; exit 1; }
+        SOURCE_COPY="$WORK_DIR/source.$FILE_EXT"
+        if ! cp -- "$SELECTED_ICON_PATH" "$SOURCE_COPY"; then
+            show_error "Failed to copy source icon."
             exit 1
-            ;;
-    esac
+        fi
+        RASTER_SRC="$SOURCE_COPY"
 
-    safe_cleanup "$WORK_DIR"
-    ICON_VALUE="$PNG_OUTPUT"
+        case "$FILE_EXT" in
+            icns)
+                if ! command -v icns2png &>/dev/null; then
+                    show_error "icns2png is not installed (package: libicns / icnsutils)."
+                    exit 1
+                fi
+                (cd "$WORK_DIR" && icns2png -x "source.$FILE_EXT") > /dev/null 2>&1
+                EXTRACTED_FILE=$(find "$WORK_DIR" -maxdepth 1 \( -name '*1024x1024*.png' -o -name '*512x512*.png' \) 2>/dev/null | head -n 1)
+                if [ -z "$EXTRACTED_FILE" ]; then
+                    EXTRACTED_FILE=$(find "$WORK_DIR" -maxdepth 1 -name '*.png' -printf '%s\t%p\n' 2>/dev/null | sort -nr | head -n 1 | cut -f2-)
+                fi
+                if [ ! -f "$EXTRACTED_FILE" ]; then
+                    show_error "Could not extract a valid PNG from this .icns file."
+                    exit 1
+                fi
+                RASTER_SRC="$EXTRACTED_FILE"
+                ;;
+            png|jpg|jpeg|webp|bmp|gif|xpm|svg|svgz)
+                RASTER_SRC="$SOURCE_COPY"
+                ;;
+            *)
+                show_error "Unsupported file type: .$FILE_EXT\nUse PNG, JPG, WEBP, SVG, or ICNS."
+                exit 1
+                ;;
+        esac
+
+        if ! render_icon_png "$RASTER_SRC" "$PNG_OUTPUT" "$ICON_SHAPE"; then
+            show_error "Could not process this image (shape: $ICON_SHAPE)."
+            exit 1
+        fi
+
+        safe_cleanup "$WORK_DIR"
+        WORK_DIR=""
+        ICON_VALUE="$PNG_OUTPUT"
+    fi
 fi
 
 # 3. Overwrite user local app config
 USER_APP_DIR="$HOME/.local/share/applications"
 mkdir -p "$USER_APP_DIR"
-APP_PATH=""
-
-if [ -f "$USER_APP_DIR/$SELECTED_APP" ]; then
-    APP_PATH="$USER_APP_DIR/$SELECTED_APP"
-else
-    for d in $(get_desktop_dirs); do
-        if [ -f "$d/$SELECTED_APP" ]; then
-            APP_PATH="$d/$SELECTED_APP"
-            break
-        fi
-    done
-fi
+APP_PATH=$(find_desktop_path "$SELECTED_APP" || true)
 
 if [ -z "$APP_PATH" ] || [ ! -f "$APP_PATH" ]; then
     show_error "Could not find desktop entry: $SELECTED_APP"
     exit 1
 fi
 
-# Backup if enabled
+# Backup if enabled — fail closed so changes stay recoverable
 if [ "$BACKUP_ENABLED" = "1" ]; then
-    BACKUP_DIR="$HOME/.local/share/kappicon/backups"
-    mkdir -p "$BACKUP_DIR"
-    cp "$APP_PATH" "$BACKUP_DIR/$(basename "$SELECTED_APP").backup.$(date +%Y%m%d%H%M%S)"
+    if ! backup_desktop_file "$APP_PATH" "$BACKUP_DIR_DEFAULT" >/dev/null; then
+        show_error "Backup failed; aborting to avoid an unrecoverable change."
+        exit 1
+    fi
 fi
 
 if [ "$APP_PATH" != "$USER_APP_DIR/$SELECTED_APP" ]; then
-    cp "$APP_PATH" "$USER_APP_DIR/$SELECTED_APP"
+    tmp=$(mktemp "$USER_APP_DIR/.kappicon-desktop-XXXXXX") || exit 1
+    if ! cp -a -- "$APP_PATH" "$tmp"; then
+        rm -f -- "$tmp"
+        show_error "Failed to copy desktop entry to user applications."
+        exit 1
+    fi
+    chmod 644 "$tmp" 2>/dev/null || true
+    if ! atomic_replace "$tmp" "$USER_APP_DIR/$SELECTED_APP"; then
+        rm -f -- "$tmp"
+        show_error "Failed to install user desktop entry."
+        exit 1
+    fi
+fi
+# Standard desktop file perms (avoids odd launcher edge cases)
+chmod 644 "$USER_APP_DIR/$SELECTED_APP" 2>/dev/null || true
+
+# For custom image files, also install into the user hicolor theme and use an
+# icon *name* in Icon=. Plasma menus refresh theme icons more reliably than
+# absolute paths under ~/Pictures, and only one desktop id is used (no dupes).
+if [[ "$SELECTED_ICON" != theme:* && -f "$ICON_VALUE" ]]; then
+    ICON_THEME_NAME="kappicon-${APP_CLEAN_NAME}"
+    HICOLOR="$HOME/.local/share/icons/hicolor"
+    # scalable / large sizes for menus and panels
+    if [[ "${ICON_VALUE##*.}" =~ ^(svg|svgz)$ ]]; then
+        mkdir -p "$HICOLOR/scalable/apps"
+        ext="${ICON_VALUE##*.}"
+        staged=$(mktemp "$HICOLOR/scalable/apps/.kappicon-XXXXXX") || exit 1
+        if ! cp -- "$ICON_VALUE" "$staged"; then
+            rm -f -- "$staged"
+            show_error "Failed to install scalable icon."
+            exit 1
+        fi
+        if ! atomic_replace "$staged" "$HICOLOR/scalable/apps/${ICON_THEME_NAME}.${ext}"; then
+            rm -f -- "$staged"
+            show_error "Failed to install scalable icon."
+            exit 1
+        fi
+    else
+        for sz in 512 256 128 64 48; do
+            mkdir -p "$HICOLOR/${sz}x${sz}/apps"
+            dest="$HICOLOR/${sz}x${sz}/apps/${ICON_THEME_NAME}.png"
+            staged=$(mktemp "$HICOLOR/${sz}x${sz}/apps/.kappicon-XXXXXX") || continue
+            if [ "$sz" -eq 512 ]; then
+                if ! cp -- "$ICON_VALUE" "$staged"; then
+                    rm -f -- "$staged"
+                    continue
+                fi
+            else
+                if ! "$MAGICK_CMD" "$ICON_VALUE" -background none -resize "${sz}x${sz}" \
+                    "$staged" 2>/dev/null; then
+                    rm -f -- "$staged"
+                    continue
+                fi
+            fi
+            atomic_replace "$staged" "$dest" || rm -f -- "$staged"
+        done
+        # Ensure at least the 512px asset landed
+        if [ ! -f "$HICOLOR/512x512/apps/${ICON_THEME_NAME}.png" ]; then
+            show_error "Failed to install icon into the hicolor theme."
+            exit 1
+        fi
+    fi
+    ICON_VALUE="$ICON_THEME_NAME"
 fi
 
-# Update Icon= line, or append one under [Desktop Entry] if missing
-# Escape & \ for sed replacement safety (theme names are usually plain)
-ICON_SED=$(printf '%s\n' "$ICON_VALUE" | sed -e 's/[&|\\]/\\&/g')
-if grep -qE '^Icon=' "$USER_APP_DIR/$SELECTED_APP"; then
-    sed -i "s|^Icon=.*|Icon=$ICON_SED|" "$USER_APP_DIR/$SELECTED_APP"
-else
-    if grep -qE '^\[Desktop Entry\]' "$USER_APP_DIR/$SELECTED_APP"; then
-        sed -i "/^\[Desktop Entry\]/a Icon=$ICON_SED" "$USER_APP_DIR/$SELECTED_APP"
-    else
-        printf '%s\n' "[Desktop Entry]" "Icon=$ICON_VALUE" >> "$USER_APP_DIR/$SELECTED_APP"
-    fi
+# Update Icon= only inside [Desktop Entry], atomically
+if ! set_desktop_icon "$USER_APP_DIR/$SELECTED_APP" "$ICON_VALUE"; then
+    show_error "Failed to update Icon= in $SELECTED_APP"
+    exit 1
 fi
 
 # Notify user of success using fallback notification functions
@@ -2320,16 +3299,4 @@ else
     show_info "Custom icon successfully mapped to $SELECTED_APP"
 fi
 
-# Force refresh everything instantly
-kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
-update-desktop-database "$HOME/.local/share/applications" 2>/dev/null
-gtk-update-icon-cache -f -t ~/.icons 2>/dev/null
-gtk-update-icon-cache -f -t ~/.local/share/icons 2>/dev/null
-
-qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
-    var desktops = desktops();
-    for (var i = 0; i < desktops.length; i++) {
-        desktops[i].currentConfigGroup = new Array('General');
-        desktops[i].reloadConfig();
-    }
-" 2>/dev/null
+refresh_icon_caches
