@@ -1,10 +1,33 @@
 # kAppIcon
 
-**Version 3.0** — customize Linux application launcher icons without root.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
+[![Desktop](https://img.shields.io/badge/desktop-KDE%20Plasma%20%7C%20freedesktop-informational.svg)](#features)
+[![UI](https://img.shields.io/badge/UI-PyQt6-41cd52.svg)](#requirements)
+[![Release](https://img.shields.io/github/v/release/rayman1972/kappicon?include_prereleases&label=release)](https://github.com/rayman1972/kappicon/releases)
 
-kAppIcon updates your user-level [freedesktop](https://specifications.freedesktop.org/desktop-entry-spec/) `.desktop` files, installs icons into your personal icon theme when needed, and refreshes Plasma / GTK icon caches so menus and panels pick up the change.
+**Version 3.0** — change **Linux app launcher icons** without root.
 
-**Source:** [github.com/rayman1972/kappicon](https://github.com/rayman1972/kappicon)
+**kAppIcon** is a small **icon manager** for **KDE Plasma** and other **freedesktop** desktops. Map a custom image, copy another app’s icon, or pick one icon from any installed **icon theme** (WhiteSur, Tela, Breeze, Papirus, …) and apply it to a single application — without switching your whole system theme.
+
+It only edits **user-level** [desktop entries](https://specifications.freedesktop.org/desktop-entry-spec/) (`.desktop` files), installs icons into your personal icon theme when needed, and refreshes Plasma / GTK icon caches so menus and panels pick up the change.
+
+| | |
+|---|---|
+| **GUI** | `kappicon` — Map · Create · Settings |
+| **CLI** | `kappicon-cli` — interactive terminal mapper (`fzf`) |
+| **Install** | `./install.sh` → `~/.local/bin` (honors XDG paths) |
+| **Source** | [github.com/rayman1972/kappicon](https://github.com/rayman1972/kappicon) |
+
+### Quick install
+
+```bash
+git clone https://github.com/rayman1972/kappicon.git
+cd kappicon
+./install.sh
+kappicon          # GUI
+# kappicon-cli    # terminal
+```
 
 ## Screenshots
 
