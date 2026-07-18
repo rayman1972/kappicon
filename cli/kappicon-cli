@@ -1,13 +1,51 @@
 #!/bin/bash
 
+# ── XDG Base Directory + user dirs ───────────────────────────────────────
+# Honor XDG_* so non-default layouts and localized Pictures/Downloads work.
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+: "${XDG_DATA_HOME:=$HOME/.local/share}"
+: "${XDG_BIN_HOME:=$HOME/.local/bin}"
+
+# Resolve XDG user dir (DOWNLOAD, PICTURES, …). Prefers `xdg-user-dir`, then
+# $XDG_CONFIG_HOME/user-dirs.dirs, then $HOME/<EnglishDefault>.
+xdg_user_dir() {
+    local key="$1" fallback="$2" val="" udf line varname
+    if command -v xdg-user-dir >/dev/null 2>&1; then
+        val=$(xdg-user-dir "$key" 2>/dev/null || true)
+    fi
+    if [ -z "$val" ] || [ "$val" = "$HOME" ]; then
+        udf="$XDG_CONFIG_HOME/user-dirs.dirs"
+        varname="XDG_${key}_DIR"
+        if [ -f "$udf" ]; then
+            line=$(grep -E "^${varname}=" "$udf" 2>/dev/null | head -n1 || true)
+            if [ -n "$line" ]; then
+                val=${line#*=}
+                val=${val#\"}
+                val=${val%\"}
+                val=${val//\$HOME/$HOME}
+            fi
+        fi
+    fi
+    if [ -n "$val" ] && [ "$val" != "$HOME" ]; then
+        printf '%s\n' "$val"
+    else
+        printf '%s\n' "$fallback"
+    fi
+}
+
+XDG_DOWNLOAD_DIR=$(xdg_user_dir DOWNLOAD "$HOME/Downloads")
+XDG_PICTURES_DIR=$(xdg_user_dir PICTURES "$HOME/Pictures")
+
 # ── Config ───────────────────────────────────────────────────────────────
-CONFIG_DIR="$HOME/.config/KAppIcon"
+CONFIG_DIR="${CONFIG_DIR:-$XDG_CONFIG_HOME/KAppIcon}"
 CONFIG_FILE="$CONFIG_DIR/KAppIcon.conf"
-DATA_DIR="$HOME/.local/share/kappicon"
+DATA_DIR="${DATA_DIR:-$XDG_DATA_HOME/kappicon}"
 BACKUP_DIR="$DATA_DIR/backups"
-TARGET_DIR="$HOME/Pictures/KAppIcon"
+USER_APPS_DIR="${USER_APPS_DIR:-$XDG_DATA_HOME/applications}"
+USER_ICONS_DIR="${USER_ICONS_DIR:-$XDG_DATA_HOME/icons}"
+TARGET_DIR="${TARGET_DIR:-$XDG_PICTURES_DIR/KAppIcon}"
 LOCK_FILE="$DATA_DIR/apply.lock"
-mkdir -p "$TARGET_DIR" "$CONFIG_DIR" "$BACKUP_DIR"
+mkdir -p "$TARGET_DIR" "$CONFIG_DIR" "$BACKUP_DIR" "$USER_APPS_DIR"
 
 # Track temp workdirs for EXIT/INT/TERM cleanup (avoids leaks on interrupt)
 WORK_DIR=""
@@ -222,7 +260,7 @@ PY
 # Resolve desktop id → full path (user override wins).
 find_desktop_path() {
     local id="$1" d
-    local user_dir="$HOME/.local/share/applications"
+    local user_dir="$USER_APPS_DIR"
     if [ -f "$user_dir/$id" ]; then
         printf '%s\n' "$user_dir/$id"
         return 0
@@ -333,7 +371,7 @@ except Exception:
 PY
 }
 
-DOWNLOADS_DIR=$(cfg_get "source/folder" "$HOME/Downloads")
+DOWNLOADS_DIR=$(cfg_get "source/folder" "$XDG_DOWNLOAD_DIR")
 BACKUP_ENABLED=$(cfg_get "backups/enabled" "false")
 
 if ! command -v fzf &>/dev/null; then
@@ -358,13 +396,19 @@ get_desktop_dirs() {
     local d
     local -a split_dirs=()
     IFS=':' read -r -a split_dirs <<< "$xdg_dirs"
-    for d in "${split_dirs[@]}" "$HOME/.local/share"; do
+    # User data home first (overrides), then XDG_DATA_DIRS system roots
+    for d in "$XDG_DATA_HOME" "${split_dirs[@]}"; do
         [ -n "$d" ] || continue
         [ -d "$d/applications" ] && dirs+=("$d/applications")
     done
-    # Flatpak exports
+    # Flatpak exports (system + user; user may live under XDG_DATA_HOME)
     [ -d "/var/lib/flatpak/exports/share/applications" ] && dirs+=("/var/lib/flatpak/exports/share/applications")
-    [ -d "$HOME/.local/share/flatpak/exports/share/applications" ] && dirs+=("$HOME/.local/share/flatpak/exports/share/applications")
+    [ -d "$XDG_DATA_HOME/flatpak/exports/share/applications" ] && dirs+=("$XDG_DATA_HOME/flatpak/exports/share/applications")
+    if [ "$XDG_DATA_HOME" != "$HOME/.local/share" ]; then
+        [ -d "$HOME/.local/share/flatpak/exports/share/applications" ] && \
+            dirs+=("$HOME/.local/share/flatpak/exports/share/applications")
+        [ -d "$HOME/.local/share/applications" ] && dirs+=("$HOME/.local/share/applications")
+    fi
     # Snap
     [ -d "/var/lib/snapd/desktop/applications" ] && dirs+=("/var/lib/snapd/desktop/applications")
 
@@ -400,8 +444,11 @@ list_apps_for_picker() {
 do_refresh() {
     echo "🔄 Refreshing icon caches..."
     kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
-    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null
-    for p in "$HOME/.icons" "$HOME/.local/share/icons"; do
+    update-desktop-database "$USER_APPS_DIR" 2>/dev/null
+    if [ -d "$USER_ICONS_DIR/hicolor" ]; then
+        gtk-update-icon-cache -f -t "$USER_ICONS_DIR/hicolor" 2>/dev/null || true
+    fi
+    for p in "$HOME/.icons" "$USER_ICONS_DIR"; do
         [ -d "$p" ] && gtk-update-icon-cache -f -t "$p" 2>/dev/null
     done
     echo "✅ Icon caches refreshed."
@@ -434,7 +481,7 @@ do_restore() {
         exit 1
     fi
     src="$BACKUP_DIR/$selected"
-    dest="$HOME/.local/share/applications/$desktop_name"
+    dest="$USER_APPS_DIR/$desktop_name"
     if [ ! -f "$src" ]; then
         echo "❌ Backup file missing: $src"
         exit 1
@@ -450,8 +497,8 @@ do_restore() {
     if ! acquire_apply_lock; then
         exit 1
     fi
-    mkdir -p "$HOME/.local/share/applications"
-    tmp=$(mktemp "$HOME/.local/share/applications/.kappicon-restore-XXXXXX") || exit 1
+    mkdir -p "$USER_APPS_DIR"
+    tmp=$(mktemp "$USER_APPS_DIR/.kappicon-restore-XXXXXX") || exit 1
     if ! cp -a -- "$src" "$tmp"; then
         rm -f -- "$tmp"
         echo "❌ Failed to copy backup."
@@ -685,7 +732,7 @@ case "$FILE_EXT" in
 esac
 
 # Overwrite user local app config — prefer an existing user override if present
-USER_APP_DIR="$HOME/.local/share/applications"
+USER_APP_DIR="$USER_APPS_DIR"
 mkdir -p "$USER_APP_DIR"
 APP_PATH=$(find_desktop_path "$SELECTED_APP" || true)
 

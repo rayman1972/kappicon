@@ -1,10 +1,29 @@
 #!/usr/bin/env bash
 set -e
 
-INSTALL_DIR="$HOME/.local/bin"
+# Honor XDG Base Directory (defaults match the freestanding Linux layout).
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+: "${XDG_DATA_HOME:=$HOME/.local/share}"
+: "${XDG_BIN_HOME:=$HOME/.local/bin}"
+
+INSTALL_DIR="${INSTALL_DIR:-$XDG_BIN_HOME}"
+APPS_DIR="${APPS_DIR:-$XDG_DATA_HOME/applications}"
+ICONS_DIR="${ICONS_DIR:-$XDG_DATA_HOME/icons}"
+DATA_DIR="${DATA_DIR:-$XDG_DATA_HOME/kappicon}"
+CONFIG_DIR="${CONFIG_DIR:-$XDG_CONFIG_HOME/KAppIcon}"
+
 REPO_URL="https://raw.githubusercontent.com/rayman1972/kappicon/main"
-LOCAL_VERSION_FILE="$HOME/.config/KAppIcon/VERSION"
+LOCAL_VERSION_FILE="$CONFIG_DIR/VERSION"
 REMOTE_VERSION=$(curl -sf "$REPO_URL/VERSION" 2>/dev/null | tr -d '[:space:]')
+
+# Prefer hard link (same inode as repo checkout); fall back to copy across filesystems.
+install_bin() {
+    local src="$1" dest="$2"
+    if ln -f -- "$src" "$dest" 2>/dev/null; then
+        return 0
+    fi
+    cp -f -- "$src" "$dest"
+}
 
 # ── Check for updates ────────────────────────────────────────────────────
 check_update() {
@@ -35,28 +54,33 @@ if [ "${1:-}" = "--update" ]; then
         curl -sfL "$REPO_URL/VERSION" -o VERSION
     fi
     echo "📦 Installing updated files..."
-    mkdir -p "$INSTALL_DIR" ~/.local/share/applications ~/.local/share/icons ~/.local/share/kappicon/icons
+    mkdir -p "$INSTALL_DIR" "$APPS_DIR" "$ICONS_DIR" "$DATA_DIR/icons" "$CONFIG_DIR"
     # GUI: kappicon · CLI: kappicon-cli
-    ln -f gui/kappicon "$INSTALL_DIR/kappicon"
-    ln -f cli/kappicon-cli "$INSTALL_DIR/kappicon-cli"
+    install_bin gui/kappicon "$INSTALL_DIR/kappicon"
+    install_bin cli/kappicon-cli "$INSTALL_DIR/kappicon-cli"
     chmod +x "$INSTALL_DIR/kappicon" "$INSTALL_DIR/kappicon-cli"
     # Drop leftover names from older installs / rebrand
     # CLI is terminal-only — never ship a menu entry for it.
     rm -f "$INSTALL_DIR/kappicon-gui" \
         "$INSTALL_DIR/apply-mac-icon" "$INSTALL_DIR/apply-mac-icon-gui" \
-        ~/.local/share/icons/macosicons.png ~/.local/share/icons/macosicons-gui.png \
-        ~/.local/share/applications/macosicons.desktop \
-        ~/.local/share/applications/macosicons-gui.desktop \
-        ~/.local/share/applications/kappicon-cli.desktop 2>/dev/null || true
-    [ -f assets/kappicon.png ] && cp assets/kappicon.png ~/.local/share/icons/kappicon.png
-    [ -f assets/kappicon-gui.png ] && cp assets/kappicon-gui.png ~/.local/share/icons/kappicon-gui.png
-    # GUI is the only application menu entry.
-    cp gui/kappicon.desktop ~/.local/share/applications/kappicon.desktop
-    # Clean accidental overwrite from older installs
-    if grep -q 'KAppIcon (CLI)' ~/.local/share/applications/kappicon.desktop 2>/dev/null; then
-        cp gui/kappicon.desktop ~/.local/share/applications/kappicon.desktop
+        "$ICONS_DIR/macosicons.png" "$ICONS_DIR/macosicons-gui.png" \
+        "$APPS_DIR/macosicons.desktop" \
+        "$APPS_DIR/macosicons-gui.desktop" \
+        "$APPS_DIR/kappicon-cli.desktop" 2>/dev/null || true
+    # Also clean default ~/.local paths if XDG_* differs (legacy installs)
+    if [ "$XDG_DATA_HOME" != "$HOME/.local/share" ]; then
+        rm -f "$HOME/.local/share/applications/kappicon-cli.desktop" \
+            "$HOME/.local/share/applications/macosicons.desktop" \
+            "$HOME/.local/share/applications/macosicons-gui.desktop" 2>/dev/null || true
     fi
-    mkdir -p "$(dirname "$LOCAL_VERSION_FILE")"
+    [ -f assets/kappicon.png ] && cp assets/kappicon.png "$ICONS_DIR/kappicon.png"
+    [ -f assets/kappicon-gui.png ] && cp assets/kappicon-gui.png "$ICONS_DIR/kappicon-gui.png"
+    # GUI is the only application menu entry.
+    cp gui/kappicon.desktop "$APPS_DIR/kappicon.desktop"
+    # Clean accidental overwrite from older installs
+    if grep -q 'KAppIcon (CLI)' "$APPS_DIR/kappicon.desktop" 2>/dev/null; then
+        cp gui/kappicon.desktop "$APPS_DIR/kappicon.desktop"
+    fi
     [ -f VERSION ] && cp VERSION "$LOCAL_VERSION_FILE"
     echo "✅ Updated to $REMOTE_VERSION"
     exit 0
@@ -209,30 +233,35 @@ install_deps() {
 
 install_deps
 
-mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/icons ~/.local/share/kappicon/icons
+mkdir -p "$INSTALL_DIR" "$APPS_DIR" "$ICONS_DIR" "$DATA_DIR/icons" "$CONFIG_DIR"
 
 # GUI: kappicon · CLI: kappicon-cli
-ln -f gui/kappicon ~/.local/bin/kappicon
-ln -f cli/kappicon-cli ~/.local/bin/kappicon-cli
-chmod +x ~/.local/bin/kappicon ~/.local/bin/kappicon-cli
+install_bin gui/kappicon "$INSTALL_DIR/kappicon"
+install_bin cli/kappicon-cli "$INSTALL_DIR/kappicon-cli"
+chmod +x "$INSTALL_DIR/kappicon" "$INSTALL_DIR/kappicon-cli"
 # Drop leftover names from older installs / rebrand
 # CLI is terminal-only — never ship a menu entry for it.
-rm -f ~/.local/bin/kappicon-gui \
-    ~/.local/bin/apply-mac-icon ~/.local/bin/apply-mac-icon-gui \
-    ~/.local/share/icons/macosicons.png ~/.local/share/icons/macosicons-gui.png \
-    ~/.local/share/applications/macosicons.desktop \
-    ~/.local/share/applications/macosicons-gui.desktop \
-    ~/.local/share/applications/kappicon-cli.desktop 2>/dev/null || true
+rm -f "$INSTALL_DIR/kappicon-gui" \
+    "$INSTALL_DIR/apply-mac-icon" "$INSTALL_DIR/apply-mac-icon-gui" \
+    "$ICONS_DIR/macosicons.png" "$ICONS_DIR/macosicons-gui.png" \
+    "$APPS_DIR/macosicons.desktop" \
+    "$APPS_DIR/macosicons-gui.desktop" \
+    "$APPS_DIR/kappicon-cli.desktop" 2>/dev/null || true
+if [ "$XDG_DATA_HOME" != "$HOME/.local/share" ]; then
+    rm -f "$HOME/.local/share/applications/kappicon-cli.desktop" \
+        "$HOME/.local/share/applications/macosicons.desktop" \
+        "$HOME/.local/share/applications/macosicons-gui.desktop" 2>/dev/null || true
+fi
 
 if [ -f assets/kappicon.png ]; then
-    cp assets/kappicon.png ~/.local/share/icons/kappicon.png
+    cp assets/kappicon.png "$ICONS_DIR/kappicon.png"
 fi
 if [ -f assets/kappicon-gui.png ]; then
-    cp assets/kappicon-gui.png ~/.local/share/icons/kappicon-gui.png
+    cp assets/kappicon-gui.png "$ICONS_DIR/kappicon-gui.png"
 fi
 
 # Desktop launcher — GUI only (CLI is run from the terminal)
-cp gui/kappicon.desktop ~/.local/share/applications/kappicon.desktop
+cp gui/kappicon.desktop "$APPS_DIR/kappicon.desktop"
 
 if command -v kbuildsycoca6 &> /dev/null; then
     kbuildsycoca6 --noincremental
@@ -240,8 +269,8 @@ elif command -v kbuildsycoca5 &> /dev/null; then
     kbuildsycoca5 --noincremental
 fi
 
-mkdir -p "$(dirname "$LOCAL_VERSION_FILE")"
 [ -f VERSION ] && cp VERSION "$LOCAL_VERSION_FILE"
 
 echo "✅ Done! Run:  kappicon   or search for “kAppIcon” in the app menu."
 echo "   CLI:        kappicon-cli --help"
+echo "   Paths honor XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_BIN_HOME and xdg-user-dir."

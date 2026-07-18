@@ -1,11 +1,51 @@
 #!/bin/bash
-DOWNLOADS_DIR="$HOME/Downloads"
-TARGET_DIR="$HOME/Pictures/KAppIcon"
-DATA_DIR="$HOME/.local/share/kappicon"
+# ── XDG Base Directory + user dirs ───────────────────────────────────────
+# Honor XDG_* so non-default layouts and localized Pictures/Downloads work.
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+: "${XDG_DATA_HOME:=$HOME/.local/share}"
+# Informal but widely used for user binaries (not in the base spec)
+: "${XDG_BIN_HOME:=$HOME/.local/bin}"
+
+# Resolve XDG user dir (DOWNLOAD, PICTURES, …). Prefers `xdg-user-dir`, then
+# $XDG_CONFIG_HOME/user-dirs.dirs, then $HOME/<EnglishDefault>.
+xdg_user_dir() {
+    local key="$1" fallback="$2" val="" udf line varname
+    if command -v xdg-user-dir >/dev/null 2>&1; then
+        val=$(xdg-user-dir "$key" 2>/dev/null || true)
+    fi
+    if [ -z "$val" ] || [ "$val" = "$HOME" ]; then
+        udf="$XDG_CONFIG_HOME/user-dirs.dirs"
+        varname="XDG_${key}_DIR"
+        if [ -f "$udf" ]; then
+            line=$(grep -E "^${varname}=" "$udf" 2>/dev/null | head -n1 || true)
+            if [ -n "$line" ]; then
+                val=${line#*=}
+                val=${val#\"}
+                val=${val%\"}
+                val=${val//\$HOME/$HOME}
+            fi
+        fi
+    fi
+    if [ -n "$val" ] && [ "$val" != "$HOME" ]; then
+        printf '%s\n' "$val"
+    else
+        printf '%s\n' "$fallback"
+    fi
+}
+
+XDG_DOWNLOAD_DIR=$(xdg_user_dir DOWNLOAD "$HOME/Downloads")
+XDG_PICTURES_DIR=$(xdg_user_dir PICTURES "$HOME/Pictures")
+
+CONFIG_DIR="${CONFIG_DIR:-$XDG_CONFIG_HOME/KAppIcon}"
+DATA_DIR="${DATA_DIR:-$XDG_DATA_HOME/kappicon}"
+USER_APPS_DIR="${USER_APPS_DIR:-$XDG_DATA_HOME/applications}"
+USER_ICONS_DIR="${USER_ICONS_DIR:-$XDG_DATA_HOME/icons}"
+TARGET_DIR="${TARGET_DIR:-$XDG_PICTURES_DIR/KAppIcon}"
+DOWNLOADS_DIR="${DOWNLOADS_DIR:-$XDG_DOWNLOAD_DIR}"
 LIBRARY_DIR="$DATA_DIR/icons"
 BACKUP_DIR_DEFAULT="$DATA_DIR/backups"
 LOCK_FILE="$DATA_DIR/apply.lock"
-mkdir -p "$TARGET_DIR" "$LIBRARY_DIR" "$BACKUP_DIR_DEFAULT"
+mkdir -p "$TARGET_DIR" "$LIBRARY_DIR" "$BACKUP_DIR_DEFAULT" "$USER_APPS_DIR"
 
 # Track temp workdirs for EXIT/INT/TERM cleanup
 WORK_DIR=""
@@ -204,13 +244,19 @@ get_desktop_dirs() {
     local d
     local -a split_dirs=()
     IFS=':' read -r -a split_dirs <<< "$xdg_dirs"
-    for d in "${split_dirs[@]}" "$HOME/.local/share"; do
+    # User data home first (overrides), then XDG_DATA_DIRS system roots
+    for d in "$XDG_DATA_HOME" "${split_dirs[@]}"; do
         [ -n "$d" ] || continue
         [ -d "$d/applications" ] && dirs+=("$d/applications")
     done
-    # Flatpak exports
+    # Flatpak exports (system + user; user may live under XDG_DATA_HOME)
     [ -d "/var/lib/flatpak/exports/share/applications" ] && dirs+=("/var/lib/flatpak/exports/share/applications")
-    [ -d "$HOME/.local/share/flatpak/exports/share/applications" ] && dirs+=("$HOME/.local/share/flatpak/exports/share/applications")
+    [ -d "$XDG_DATA_HOME/flatpak/exports/share/applications" ] && dirs+=("$XDG_DATA_HOME/flatpak/exports/share/applications")
+    if [ "$XDG_DATA_HOME" != "$HOME/.local/share" ]; then
+        [ -d "$HOME/.local/share/flatpak/exports/share/applications" ] && \
+            dirs+=("$HOME/.local/share/flatpak/exports/share/applications")
+        [ -d "$HOME/.local/share/applications" ] && dirs+=("$HOME/.local/share/applications")
+    fi
     # Snap
     [ -d "/var/lib/snapd/desktop/applications" ] && dirs+=("/var/lib/snapd/desktop/applications")
 
@@ -228,7 +274,7 @@ find_desktop_files() {
 
 find_desktop_path() {
     local id="$1" d
-    local user_dir="$HOME/.local/share/applications"
+    local user_dir="$USER_APPS_DIR"
     if [ -f "$user_dir/$id" ]; then
         printf '%s\n' "$user_dir/$id"
         return 0
@@ -281,8 +327,10 @@ fi
 
 # 1. UNIFIED PyQt6 WINDOW — Map icons, edit/create icons, settings
 DESKTOP_LIST=$(find_desktop_files | sort -u)
-export DOWNLOADS_DIR
-export LIBRARY_DIR
+export XDG_CONFIG_HOME XDG_DATA_HOME XDG_BIN_HOME
+export XDG_DOWNLOAD_DIR XDG_PICTURES_DIR
+export CONFIG_DIR DATA_DIR USER_APPS_DIR USER_ICONS_DIR TARGET_DIR
+export DOWNLOADS_DIR LIBRARY_DIR BACKUP_DIR_DEFAULT
 export DESKTOP_LIST
 
 RESULT=$(python3 - <<'PYEOF'
@@ -306,8 +354,42 @@ ICON_EXTENSIONS = {".icns", ".png", ".jpg", ".jpeg", ".webp"}
 IMAGE_IMPORT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 # Single size for library icons (imports + saves) so Map/apply always sees equal assets
 STANDARD_ICON_SIZE = 512
-LIBRARY_DIR = os.environ.get(
-    "LIBRARY_DIR", os.path.expanduser("~/.local/share/kappicon/icons")
+
+
+def _env_path(key, *fallback_parts):
+    """Prefer an exported path env var; otherwise join fallback parts."""
+    v = (os.environ.get(key) or "").strip()
+    if v:
+        return v
+    return os.path.join(*fallback_parts)
+
+
+def xdg_config_home():
+    return _env_path("XDG_CONFIG_HOME", os.path.expanduser("~"), ".config")
+
+
+def xdg_data_home():
+    return _env_path("XDG_DATA_HOME", os.path.expanduser("~"), ".local/share")
+
+
+def xdg_user_dir_default(name, english_name):
+    """DOWNLOAD/PICTURES from env (set by bash) or ~/english_name."""
+    env_key = f"XDG_{name}_DIR"
+    v = (os.environ.get(env_key) or "").strip()
+    if v and v != os.path.expanduser("~"):
+        return v
+    return os.path.join(os.path.expanduser("~"), english_name)
+
+
+XDG_CONFIG_HOME = xdg_config_home()
+XDG_DATA_HOME = xdg_data_home()
+DATA_DIR = _env_path("DATA_DIR", XDG_DATA_HOME, "kappicon")
+LIBRARY_DIR = _env_path("LIBRARY_DIR", DATA_DIR, "icons")
+USER_APPS_DIR = _env_path("USER_APPS_DIR", XDG_DATA_HOME, "applications")
+USER_ICONS_DIR = _env_path("USER_ICONS_DIR", XDG_DATA_HOME, "icons")
+BACKUP_DIR = _env_path("BACKUP_DIR_DEFAULT", DATA_DIR, "backups")
+DOWNLOADS_DIR_DEFAULT = _env_path(
+    "DOWNLOADS_DIR", xdg_user_dir_default("DOWNLOAD", "Downloads")
 )
 os.makedirs(LIBRARY_DIR, exist_ok=True)
 # Sentinel stored on the empty-state list row so a click can open a file browser
@@ -391,11 +473,24 @@ def discover_icon_themes():
     Returns list of dicts: {id, name, path, is_user}
     """
     roots = [
-        (os.path.expanduser("~/.local/share/icons"), True),
-        (os.path.expanduser("~/.icons"), True),
-        ("/usr/local/share/icons", False),
-        ("/usr/share/icons", False),
+        (USER_ICONS_DIR, True),
+        (os.path.expanduser("~/.icons"), True),  # legacy user location
     ]
+    # System + extra data roots from XDG_DATA_DIRS
+    for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
+        d = d.strip()
+        if d:
+            roots.append((os.path.join(d, "icons"), False))
+    # Deduplicate while preserving order
+    _seen_roots = set()
+    _uniq_roots = []
+    for root, is_user in roots:
+        real = os.path.realpath(root) if os.path.isdir(root) else root
+        if real in _seen_roots:
+            continue
+        _seen_roots.add(real)
+        _uniq_roots.append((root, is_user))
+    roots = _uniq_roots
     seen_paths = set()
     themes = []
     for root, is_user in roots:
@@ -696,8 +791,14 @@ def resolve_icon(icon_name):
         pix = theme_icon.pixmap(28, 28)
         if not pix.isNull():
             return pix
-    home_icons = os.path.expanduser("~/.local/share/icons")
-    for base in (home_icons, "/usr/share/icons", "/usr/share/pixmaps"):
+    bases = [USER_ICONS_DIR]
+    for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
+        d = d.strip()
+        if d:
+            bases.append(os.path.join(d, "icons"))
+            bases.append(os.path.join(d, "pixmaps"))
+    bases.append("/usr/share/pixmaps")
+    for base in bases:
         for theme in ("hicolor", "breeze", "Papirus", "Numix", "Adwaita"):
             for size in ("48x48", "64x64", "256x256", "scalable"):
                 for ext in (".png", ".svg", ".xpm"):
@@ -1041,7 +1142,7 @@ def apply_breeze_style(app: QApplication):
     # Desktop file / Wayland app id
     app.setDesktopFileName("kappicon")
     app.setApplicationName("kAppIcon")
-    app.setOrganizationName("KAppIcon")  # keep config path ~/.config/KAppIcon
+    app.setOrganizationName("KAppIcon")  # QSettings → $XDG_CONFIG_HOME/KAppIcon/
     app.setApplicationDisplayName("kAppIcon")
 
 
@@ -1186,8 +1287,8 @@ class CombinedWindow(QMainWindow):
         # Window icon (Breeze / hicolor / installed asset)
         wicon = theme_icon("preferences-desktop-icons", "applications-graphics", "kappicon")
         for path in (
-            os.path.expanduser("~/.local/share/icons/kappicon.png"),
-            os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps/kappicon.png"),
+            os.path.join(USER_ICONS_DIR, "kappicon.png"),
+            os.path.join(USER_ICONS_DIR, "hicolor", "256x256", "apps", "kappicon.png"),
         ):
             if os.path.isfile(path):
                 wicon = QIcon(path)
@@ -1879,7 +1980,7 @@ class CombinedWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Import image for icon",
-            os.path.expanduser("~/Downloads"),
+            DOWNLOADS_DIR_DEFAULT,
             "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.PNG *.JPG *.WEBP);;All files (*)",
         )
         if not path:
@@ -2290,13 +2391,13 @@ class CombinedWindow(QMainWindow):
         self.backup_check.toggled.connect(lambda v: self.settings.setValue("backups/enabled", v))
         bl.addWidget(self.backup_check)
         bl.addWidget(make_hint_label(
-            "Backups are stored in ~/.local/share/kappicon/backups/"
+            f"Backups are stored in {BACKUP_DIR}/"
         ))
         layout.addWidget(backups)
 
         source = QGroupBox("Icon files")
         sf = QVBoxLayout(source)
-        default_src = os.environ.get("DOWNLOADS_DIR", os.path.expanduser("~/Downloads"))
+        default_src = DOWNLOADS_DIR_DEFAULT
         sf.addWidget(QLabel("Source folder"))
         self.source_input = QLineEdit(self.settings.value("source/folder", default_src, type=str))
         self.source_input.setClearButtonEnabled(True)
@@ -2388,7 +2489,7 @@ class CombinedWindow(QMainWindow):
                 return folder
         folder = self.settings.value(
             "source/folder",
-            os.environ.get("DOWNLOADS_DIR", os.path.expanduser("~/Downloads")),
+            DOWNLOADS_DIR_DEFAULT,
             type=str,
         )
         if folder and os.path.isdir(folder):
@@ -2729,7 +2830,7 @@ class CombinedWindow(QMainWindow):
             self._show_empty_icon_state()
 
     def _restore_backup(self):
-        backup_dir = os.path.expanduser("~/.local/share/kappicon/backups")
+        backup_dir = BACKUP_DIR
         if not os.path.isdir(backup_dir):
             self._restore_status.setText("No backups found")
             QTimer.singleShot(2000, lambda: self._restore_status.setText(""))
@@ -2769,7 +2870,7 @@ class CombinedWindow(QMainWindow):
             self._restore_status.setText("Invalid desktop id in backup name")
             QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
             return
-        dest_dir = os.path.expanduser("~/.local/share/applications")
+        dest_dir = USER_APPS_DIR
         dest = os.path.join(dest_dir, desktop_name)
         try:
             if not os.path.isfile(src) or not path_is_under(src, backup_dir):
@@ -2818,13 +2919,23 @@ class CombinedWindow(QMainWindow):
                 break
             except Exception:
                 continue
-        for p in ("~/.icons", "~/.local/share/icons"):
-            ep = os.path.expanduser(p)
+        icon_roots = [USER_ICONS_DIR, os.path.expanduser("~/.icons")]
+        hicolor = os.path.join(USER_ICONS_DIR, "hicolor")
+        if hicolor not in icon_roots:
+            icon_roots.append(hicolor)
+        for ep in icon_roots:
             if os.path.isdir(ep):
                 try:
                     subprocess.run(["gtk-update-icon-cache", "-f", "-t", ep], capture_output=True, timeout=10)
                 except Exception:
                     pass
+        try:
+            subprocess.run(
+                ["update-desktop-database", USER_APPS_DIR],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
         self._refresh_status.setText("Refreshed!")
         QTimer.singleShot(2000, lambda: self._refresh_status.setText(""))
 
@@ -3058,8 +3169,7 @@ _settings_early = QSettings("KAppIcon", "KAppIcon")
 apply_appearance_mode(_settings_early.value("appearance/theme", "system", type=str))
 
 settings = QSettings("KAppIcon", "KAppIcon")
-source_folder = settings.value("source/folder",
-    os.environ.get("DOWNLOADS_DIR", os.path.expanduser("~/Downloads")), type=str)
+source_folder = settings.value("source/folder", DOWNLOADS_DIR_DEFAULT, type=str)
 
 def scan_icons(folder):
     files = []
@@ -3083,14 +3193,22 @@ for p in scan_icons(LIBRARY_DIR):
 def desktop_path_priority(path):
     """Higher = preferred when the same .desktop id exists in multiple places.
 
-    User overrides (~/.local/share/applications) must win over /usr/share so we
+    User overrides ($XDG_DATA_HOME/applications) must win over /usr/share so we
     don't list Ark twice (system + customized copy).
     """
     path = os.path.normpath(path).replace("\\", "/")
-    home_apps = os.path.normpath(os.path.expanduser("~/.local/share/applications")).replace("\\", "/")
+    home_apps = os.path.normpath(USER_APPS_DIR).replace("\\", "/")
     if path.startswith(home_apps + "/") or path == home_apps:
         return 100
-    if "/.local/share/flatpak/" in path:
+    # Also prefer legacy ~/.local/share/applications if XDG_DATA_HOME differs
+    legacy_apps = os.path.normpath(
+        os.path.join(os.path.expanduser("~"), ".local", "share", "applications")
+    ).replace("\\", "/")
+    if legacy_apps != home_apps and (
+        path.startswith(legacy_apps + "/") or path == legacy_apps
+    ):
+        return 90
+    if "/flatpak/" in path and "/exports/share/applications" in path:
         return 50
     if "/flatpak/" in path:
         return 40
@@ -3135,6 +3253,7 @@ elif not icon_files:
         "theme icons already used by installed apps, or set a different "
         "folder under Settings → Source Folder.",
     )
+
 app.exec()
 
 if win.selected_file and win.selected_app:
@@ -3180,11 +3299,11 @@ esac
 
 refresh_icon_caches() {
     kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
-    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null
-    if [ -d "$HOME/.local/share/icons/hicolor" ]; then
-        gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+    update-desktop-database "$USER_APPS_DIR" 2>/dev/null
+    if [ -d "$USER_ICONS_DIR/hicolor" ]; then
+        gtk-update-icon-cache -f -t "$USER_ICONS_DIR/hicolor" 2>/dev/null || true
     fi
-    for p in "$HOME/.icons" "$HOME/.local/share/icons"; do
+    for p in "$HOME/.icons" "$USER_ICONS_DIR"; do
         [ -d "$p" ] && gtk-update-icon-cache -f -t "$p" 2>/dev/null
     done
     qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
@@ -3200,12 +3319,12 @@ if [ "$SELECTED_ICON" = "RESET" ]; then
     if ! acquire_apply_lock; then
         exit 1
     fi
-    USER_PATH="$HOME/.local/share/applications/$SELECTED_APP"
+    USER_PATH="$USER_APPS_DIR/$SELECTED_APP"
     if [ -f "$USER_PATH" ]; then
         SYS_PATH=""
         while IFS= read -r d; do
             [ -n "$d" ] || continue
-            if [ "$d" != "$HOME/.local/share/applications" ] && [ -f "$d/$SELECTED_APP" ]; then
+            if [ "$d" != "$USER_APPS_DIR" ] && [ -f "$d/$SELECTED_APP" ]; then
                 SYS_PATH="$d/$SELECTED_APP"
                 break
             fi
@@ -3431,8 +3550,8 @@ else
     fi
 fi
 
-# 3. Overwrite user local app config
-USER_APP_DIR="$HOME/.local/share/applications"
+# 3. Overwrite user local app config ($XDG_DATA_HOME/applications)
+USER_APP_DIR="$USER_APPS_DIR"
 mkdir -p "$USER_APP_DIR"
 APP_PATH=$(find_desktop_path "$SELECTED_APP" || true)
 
@@ -3468,10 +3587,10 @@ chmod 644 "$USER_APP_DIR/$SELECTED_APP" 2>/dev/null || true
 
 # For custom image files, also install into the user hicolor theme and use an
 # icon *name* in Icon=. Plasma menus refresh theme icons more reliably than
-# absolute paths under ~/Pictures, and only one desktop id is used (no dupes).
+# absolute paths under $XDG_PICTURES_DIR, and only one desktop id is used (no dupes).
 if [[ "$SELECTED_ICON" != theme:* && -f "$ICON_VALUE" ]]; then
     ICON_THEME_NAME="kappicon-${APP_CLEAN_NAME}"
-    HICOLOR="$HOME/.local/share/icons/hicolor"
+    HICOLOR="$USER_ICONS_DIR/hicolor"
     # scalable / large sizes for menus and panels
     if [[ "${ICON_VALUE##*.}" =~ ^(svg|svgz)$ ]]; then
         mkdir -p "$HICOLOR/scalable/apps"

@@ -71,7 +71,7 @@ To update later (from a git clone):
 ./install.sh --update
 ```
 
-`install.sh` installs into `~/.local/bin` and adds desktop entries. Dependencies are installed via your package manager when possible:
+`install.sh` installs into `$XDG_BIN_HOME` (default `~/.local/bin`) and adds a desktop entry under `$XDG_DATA_HOME/applications`. Dependencies are installed via your package manager when possible:
 
 | Distro | Packages |
 |--------|----------|
@@ -82,7 +82,7 @@ To update later (from a git clone):
 
 On openSUSE, `install.sh` picks the PyQt6 RPM that matches your default `python3` (e.g. `python312-PyQt6`) when the generic name is not available, and falls back to `pip install PyQt6` if needed.
 
-Ensure `~/.local/bin` is on your `PATH`.
+Ensure your user bin dir (`$XDG_BIN_HOME`, default `~/.local/bin`) is on your `PATH`.
 
 ## Usage
 
@@ -115,15 +115,19 @@ kappicon-cli --refresh
 
 ## Paths
 
-| What | Where |
-|------|--------|
-| Config (Qt settings) | `~/.config/KAppIcon/KAppIcon.conf` |
-| Created icons (library) | `~/.local/share/kappicon/icons/` |
-| Rendered apply PNGs | `~/Pictures/KAppIcon/` |
-| Desktop backups | `~/.local/share/kappicon/backups/` |
-| User launcher overrides | `~/.local/share/applications/` |
-| User hicolor theme icons | `~/.local/share/icons/hicolor/` |
-| Theme packs (read-only browse) | `~/.local/share/icons/`, `~/.icons/`, `/usr/share/icons/`, … |
+Paths follow the [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) spec and [xdg-user-dirs](https://www.freedesktop.org/wiki/Software/xdg-user-dirs/) (localized Downloads/Pictures). Defaults match a typical Linux home layout.
+
+| What | Where (default) | Env / override |
+|------|-----------------|----------------|
+| Config (Qt + CLI) | `$XDG_CONFIG_HOME/KAppIcon/` → `~/.config/KAppIcon/` | `XDG_CONFIG_HOME` |
+| Created icons (library) | `$XDG_DATA_HOME/kappicon/icons/` | `XDG_DATA_HOME` |
+| Desktop backups | `$XDG_DATA_HOME/kappicon/backups/` | `XDG_DATA_HOME` |
+| User launcher overrides | `$XDG_DATA_HOME/applications/` | `XDG_DATA_HOME` |
+| User hicolor theme icons | `$XDG_DATA_HOME/icons/hicolor/` | `XDG_DATA_HOME` |
+| Installed binaries | `$XDG_BIN_HOME/` → `~/.local/bin/` | `XDG_BIN_HOME` |
+| Source folder default | `xdg-user-dir DOWNLOAD` → `~/Downloads` | Settings / `source/folder` |
+| Rendered apply PNGs | `xdg-user-dir PICTURES/KAppIcon` → `~/Pictures/KAppIcon/` | `XDG_PICTURES_DIR` (via user-dirs) |
+| Theme packs (read-only) | `$XDG_DATA_HOME/icons/`, `~/.icons/`, `$XDG_DATA_DIRS/*/icons` | — |
 
 ## How it works
 
