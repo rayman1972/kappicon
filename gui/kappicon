@@ -359,13 +359,13 @@ from PyQt6.QtWidgets import (
     QFrame, QTabWidget, QCheckBox, QComboBox, QFileDialog,
     QButtonGroup, QColorDialog, QMessageBox, QToolButton, QSizePolicy,
     QMainWindow, QGroupBox, QFormLayout, QDialogButtonBox, QStatusBar,
-    QStyle, QStyleFactory, QRadioButton, QDialog,
+    QStyle, QStyleFactory, QRadioButton, QDialog, QSlider,
 )
 from PyQt6.QtGui import (
     QPixmap, QIcon, QColor, QPainter, QPainterPath, QPalette,
     QCursor, QImage, QPen, QKeySequence, QShortcut, QAction,
 )
-from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, pyqtSignal, QPointF, QRectF
 
 ICON_EXTENSIONS = {".icns", ".png", ".jpg", ".jpeg", ".webp"}
 IMAGE_IMPORT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -1156,6 +1156,290 @@ class PixelCanvas(QFrame):
             event.accept()
             return
         super().keyPressEvent(event)
+
+
+class ImportPositionView(QWidget):
+    """Pan/zoom a source image under a fixed square crop (the icon canvas)."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, source: QImage, canvas_size=STANDARD_ICON_SIZE, parent=None):
+        super().__init__(parent)
+        self._src = source.convertToFormat(QImage.Format.Format_ARGB32)
+        self._canvas = max(8, int(canvas_size))
+        self._scale = 1.0  # source pixels → canvas pixels
+        self._dx = 0.0     # image top-left X in canvas space
+        self._dy = 0.0
+        self._drag_origin = None
+        self._drag_dx0 = 0.0
+        self._drag_dy0 = 0.0
+        self.setMinimumSize(360, 360)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.fit()
+
+    def scale(self):
+        return self._scale
+
+    def set_scale_factor(self, factor, anchor_canvas=None):
+        """Set absolute scale; optional anchor in canvas coords (default center)."""
+        factor = max(0.02, min(32.0, float(factor)))
+        if abs(factor - self._scale) < 1e-9:
+            return
+        if anchor_canvas is None:
+            ax = ay = self._canvas / 2.0
+        else:
+            ax, ay = anchor_canvas
+        # Keep the image point under the anchor fixed
+        # canvas = dx + sx * scale  →  sx = (canvas - dx) / scale
+        sx = (ax - self._dx) / self._scale
+        sy = (ay - self._dy) / self._scale
+        self._scale = factor
+        self._dx = ax - sx * self._scale
+        self._dy = ay - sy * self._scale
+        self.update()
+        self.changed.emit()
+
+    def zoom_by(self, mult, anchor_canvas=None):
+        self.set_scale_factor(self._scale * mult, anchor_canvas)
+
+    def fit(self):
+        """Whole image visible (letterbox), centered."""
+        w, h = self._src.width(), self._src.height()
+        if w < 1 or h < 1:
+            return
+        self._scale = min(self._canvas / w, self._canvas / h)
+        self._dx = (self._canvas - w * self._scale) / 2.0
+        self._dy = (self._canvas - h * self._scale) / 2.0
+        self.update()
+        self.changed.emit()
+
+    def fill(self):
+        """Cover the whole square (may crop edges), centered."""
+        w, h = self._src.width(), self._src.height()
+        if w < 1 or h < 1:
+            return
+        self._scale = max(self._canvas / w, self._canvas / h)
+        self._dx = (self._canvas - w * self._scale) / 2.0
+        self._dy = (self._canvas - h * self._scale) / 2.0
+        self.update()
+        self.changed.emit()
+
+    def render_canvas(self) -> QImage:
+        """Rasterize current view into a canvas_size² icon."""
+        out = QImage(self._canvas, self._canvas, QImage.Format.Format_ARGB32)
+        out.fill(Qt.GlobalColor.transparent)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        target = QRectF(
+            self._dx, self._dy,
+            self._src.width() * self._scale,
+            self._src.height() * self._scale,
+        )
+        p.drawImage(target, self._src)
+        p.end()
+        return out
+
+    def _view_metrics(self):
+        side = min(self.width(), self.height()) - 24
+        side = max(64, side)
+        ox = (self.width() - side) / 2
+        oy = (self.height() - side) / 2
+        return ox, oy, side
+
+    def _widget_to_canvas(self, pos):
+        ox, oy, side = self._view_metrics()
+        x = (pos.x() - ox) / side * self._canvas
+        y = (pos.y() - oy) / side * self._canvas
+        return x, y
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Base))
+
+        ox, oy, side = self._view_metrics()
+        # Dim area outside crop
+        p.fillRect(self.rect(), QColor(0, 0, 0, 40))
+
+        # Clip to square crop frame
+        p.save()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(ox, oy, side, side), 6, 6)
+        p.setClipPath(path)
+        p.fillRect(QRectF(ox, oy, side, side), QColor(30, 30, 30))
+
+        # Checkerboard for transparency
+        chk = 12
+        c1, c2 = QColor(50, 50, 50), QColor(40, 40, 40)
+        for row in range(int(side // chk) + 1):
+            for col in range(int(side // chk) + 1):
+                p.fillRect(
+                    int(ox + col * chk), int(oy + row * chk), chk, chk,
+                    c1 if (row + col) % 2 == 0 else c2,
+                )
+
+        # Map canvas coords → widget
+        def c2w(cx, cy):
+            return ox + cx / self._canvas * side, oy + cy / self._canvas * side
+
+        x0, y0 = c2w(self._dx, self._dy)
+        x1, y1 = c2w(
+            self._dx + self._src.width() * self._scale,
+            self._dy + self._src.height() * self._scale,
+        )
+        p.drawImage(QRectF(x0, y0, x1 - x0, y1 - y0), self._src)
+        p.restore()
+
+        # Crop border
+        pen = QPen(QColor(70, 150, 255), 2)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(ox, oy, side, side), 6, 6)
+
+        # Corner labels
+        p.setPen(QColor(180, 190, 200))
+        p.drawText(
+            int(ox), int(oy + side + 16),
+            f"Drag to move · scroll to zoom · {self._canvas}×{self._canvas} crop",
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = event.position()
+            self._drag_dx0 = self._dx
+            self._drag_dy0 = self._dy
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_origin is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            ox, oy, side = self._view_metrics()
+            # widget delta → canvas delta
+            ddx = (event.position().x() - self._drag_origin.x()) / side * self._canvas
+            ddy = (event.position().y() - self._drag_origin.y()) / side * self._canvas
+            self._dx = self._drag_dx0 + ddx
+            self._dy = self._drag_dy0 + ddy
+            self.update()
+            self.changed.emit()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        mult = 1.1 if delta > 0 else 1 / 1.1
+        anchor = self._widget_to_canvas(event.position())
+        self.zoom_by(mult, anchor)
+        event.accept()
+
+
+class ImportPositionDialog(QDialog):
+    """Position a (possibly large) image into the icon square before placing it on the canvas."""
+
+    def __init__(self, source: QImage, canvas_size=STANDARD_ICON_SIZE, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Position import")
+        self.resize(560, 640)
+        self.setMinimumSize(420, 480)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(make_hint_label(
+            "Drag the picture to move it. Zoom so the part you want fills the square — "
+            "that square becomes your icon."
+        ))
+
+        self.view = ImportPositionView(source, canvas_size=canvas_size, parent=self)
+        layout.addWidget(self.view, stretch=1)
+
+        zoom_row = QHBoxLayout()
+        self.zoom_out_btn = QPushButton("−")
+        self.zoom_out_btn.setFixedWidth(36)
+        self.zoom_out_btn.setToolTip("Zoom out")
+        self.zoom_out_btn.clicked.connect(lambda: self.view.zoom_by(1 / 1.15))
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.setFixedWidth(36)
+        self.zoom_in_btn.setToolTip("Zoom in")
+        self.zoom_in_btn.clicked.connect(lambda: self.view.zoom_by(1.15))
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(5, 800)  # percent of “fit” scale, relative stored below
+        self.zoom_slider.setToolTip("Zoom")
+        self._fit_scale = max(self.view.scale(), 1e-6)
+        self._updating_slider = False
+        self.zoom_slider.valueChanged.connect(self._on_slider)
+        self.view.changed.connect(self._sync_slider)
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setMinimumWidth(48)
+        zoom_row.addWidget(self.zoom_out_btn)
+        zoom_row.addWidget(self.zoom_slider, stretch=1)
+        zoom_row.addWidget(self.zoom_in_btn)
+        zoom_row.addWidget(self.zoom_label)
+        layout.addLayout(zoom_row)
+
+        preset_row = QHBoxLayout()
+        fit_btn = QPushButton("Fit")
+        fit_btn.setToolTip("Show the whole image inside the square")
+        fit_btn.clicked.connect(self._do_fit)
+        fill_btn = QPushButton("Fill")
+        fill_btn.setToolTip("Cover the whole square (crop edges if needed)")
+        fill_btn.clicked.connect(self._do_fill)
+        preset_row.addWidget(fit_btn)
+        preset_row.addWidget(fill_btn)
+        preset_row.addStretch(1)
+        layout.addLayout(preset_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Use this crop")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._sync_slider()
+
+    def _do_fit(self):
+        self.view.fit()
+        self._fit_scale = max(self.view.scale(), 1e-6)
+        self._sync_slider()
+
+    def _do_fill(self):
+        self.view.fill()
+        self._sync_slider()
+
+    def _on_slider(self, value):
+        if self._updating_slider:
+            return
+        # Slider 100 = current fit scale
+        factor = (value / 100.0) * self._fit_scale
+        self.view.set_scale_factor(factor)
+        self.zoom_label.setText(f"{value}%")
+
+    def _sync_slider(self):
+        self._updating_slider = True
+        pct = int(round((self.view.scale() / self._fit_scale) * 100))
+        pct = max(5, min(800, pct))
+        self.zoom_slider.setValue(pct)
+        self.zoom_label.setText(f"{pct}%")
+        self._updating_slider = False
+
+    def result_image(self) -> QImage:
+        return self.view.render_canvas()
 
 
 # ── KDE / Breeze helpers ─────────────────────────────────────────────────
@@ -2014,18 +2298,26 @@ class CombinedWindow(QMainWindow):
         )
         if not path:
             return
-        # Always import onto the standard library size so every saved icon matches
-        if not self.pixel_canvas.load_from_file(
-            path, fit=True, size=STANDARD_ICON_SIZE
-        ):
+        src = QImage(path)
+        if src.isNull():
             QMessageBox.warning(self, "Import failed", f"Could not load:\n{path}")
             return
+        src = src.convertToFormat(QImage.Format.Format_ARGB32)
+        # Position / zoom so a region of a larger image can become the icon
+        dlg = ImportPositionDialog(src, canvas_size=STANDARD_ICON_SIZE, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cropped = dlg.result_image()
+        if cropped.isNull():
+            QMessageBox.warning(self, "Import failed", "Could not create crop.")
+            return
+        self.pixel_canvas.set_image(cropped, record_undo=True)
         self._editor_sync_size_combo(STANDARD_ICON_SIZE)
         base = os.path.splitext(os.path.basename(path))[0]
         if not self.editor_name.text().strip():
             self.editor_name.setText(base)
         self.editor_status.setText(
-            f"Imported {os.path.basename(path)} → {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}"
+            f"Imported {os.path.basename(path)} → {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE} (positioned)"
         )
         QTimer.singleShot(2500, lambda: self.editor_status.setText(""))
 
