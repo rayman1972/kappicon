@@ -12,9 +12,15 @@ KAppIcon updates your user-level [freedesktop](https://specifications.freedeskto
 
 ![Map tab](screenshots/gui-map.png)
 
-### Map — reuse another app’s theme icon
+### Map — reuse another app’s icon
 
 ![Map from another app](screenshots/gui-map-from-app.png)
+
+### Map — pick an icon from any installed theme pack
+
+Browse packs such as **WhiteSur**, **Tela**, **Breeze**, or any theme under `~/.local/share/icons` / `/usr/share/icons`, then apply a single icon from that pack to any app — without switching your whole system theme.
+
+![Map from icon theme](screenshots/gui-map-icon-theme.png)
 
 ### Create — pixel editor and icon library
 
@@ -28,7 +34,9 @@ KAppIcon updates your user-level [freedesktop](https://specifications.freedeskto
 
 | Area | What you get |
 |------|----------------|
-| **Map** | Assign icons from files, from another installed app, or from an installed icon theme pack (Tela, WhiteSur, Breeze, …) |
+| **Map · From file** | Assign downloaded or library images (PNG, ICNS, SVG, …) to a launcher |
+| **Map · From another app** | Copy the theme icon another installed app already uses (e.g. give Shelly Discover’s icon) |
+| **Map · From icon theme** | Cross-use icons from **any installed icon theme pack** (WhiteSur, Tela, Breeze, Papirus, …) — pick a theme set, browse its app icons, apply one to a different program |
 | **Create** | Pixel canvas (pen / eraser / fill / picker); imports and saves are always **512×512** PNGs in your library |
 | **Shapes** | When applying custom images: keep as designed, or mask to square / rounded / circle |
 | **Reset** | Restore an app’s system icon from Map |
@@ -87,9 +95,9 @@ Or open **KAppIcon** from the application menu.
 **Tabs**
 
 1. **Map** — choose the icon source, then the app to change, then **Apply**  
-   - *From file* — downloads / library / browsed images  
-   - *From another app* — copy a theme icon another launcher already uses  
-   - *From icon theme* — browse an installed pack  
+   - *From file* — downloads, your library, or any browsed image  
+   - *From another app* — reuse the freedesktop theme icon another launcher already points at  
+   - *From icon theme* — pick an **installed theme pack** (user or system), filter its app icons, and assign one of those icons to a different application. Your global icon theme stays as-is; only that app’s launcher is overridden  
 2. **Create** — draw or import → **Save icon** or **Save and use in Map**  
 3. **Settings** — light/dark/system colors, applied icon shape, backups, source folder, restore, cache refresh  
 
@@ -113,11 +121,13 @@ kappicon --refresh
 | Desktop backups | `~/.local/share/kappicon/backups/` |
 | User launcher overrides | `~/.local/share/applications/` |
 | User hicolor theme icons | `~/.local/share/icons/hicolor/` |
+| Theme packs (read-only browse) | `~/.local/share/icons/`, `~/.icons/`, `/usr/share/icons/`, … |
 
 ## How it works
 
 - Edits only your **user** `.desktop` overrides — system packages are left alone.
-- Theme icons set `Icon=` to a freedesktop **name** so they follow the active icon theme.
+- *From another app* and many theme sources set `Icon=` to a freedesktop **name** so they follow theme resolution.
+- *From icon theme* can also apply a concrete file from the pack (then installed under your user **hicolor** theme like other custom images).
 - Custom image files are installed under the user **hicolor** theme (and often referenced by name) so Plasma menus refresh reliably.
 - SVG sources can be used as-is when shape is *As designed*; other shapes re-export a masked 512×512 PNG.
 
