@@ -91,8 +91,10 @@ Draw or import, **Undo** / **Redo** mistakes (Ctrl+Z), then save a standard 512�
 | **Map · From another app** | Copy the theme icon another installed app already uses (e.g. give Shelly Discover’s icon) |
 | **Map · From icon theme** | Cross-use icons from **any installed icon theme pack** (WhiteSur, Tela, Breeze, Papirus, …) — pick a theme set, browse its app icons, apply one to a different program |
 | **Create** | Pixel canvas (pen / eraser / fill / picker) with **undo/redo**; **import with pan/zoom** so you can frame a subject in a larger photo; saves are always **512×512** PNGs in your library |
+| **Overrides** | List user launcher overrides; open in Map or reset to the system icon |
+| **Missing** | Find apps with empty or unresolved `Icon=`; jump to Map to fix them |
 | **Shapes** | When applying custom images: keep as designed, or mask to square / rounded / circle |
-| **Reset** | Restore an app’s system icon from Map |
+| **Reset** | Restore an app’s system icon from Map or Overrides |
 | **Backups** | Optional auto-backup of `.desktop` files before changes + restore UI |
 | **CLI** | Terminal mapper with `fzf` (`kappicon-cli`) |
 | **Safe by design** | User overrides only (`~/.local/share/applications/`), atomic writes, apply lock, validated desktop ids |
@@ -152,8 +154,10 @@ Or open **kAppIcon** from the application menu.
    - *From file* — downloads, your library, or any browsed image  
    - *From another app* — reuse the freedesktop theme icon another launcher already points at  
    - *From icon theme* — pick an **installed theme pack** (user or system), filter its app icons, and assign one of those icons to a different application. Your global icon theme stays as-is; only that app’s launcher is overridden  
-2. **Create** — draw or import → **Save icon** or **Save and use in Map**  
+2. **Create** — draw or import (pan/zoom) → **Save icon** or **Save and use in Map**  
 3. **Settings** — light/dark/system colors, applied icon shape, backups, source folder, restore, cache refresh  
+4. **Overrides** — review user-customized launchers; open in Map or reset to system  
+5. **Missing** — apps with no usable icon; open in Map to assign one  
 
 ### CLI
 

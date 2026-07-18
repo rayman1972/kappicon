@@ -840,6 +840,129 @@ def resolve_icon(icon_name):
     return None
 
 
+def icon_resolves(icon_name):
+    """True if Icon= looks usable (file exists or theme name resolves)."""
+    if not icon_name or not str(icon_name).strip():
+        return False
+    icon_name = str(icon_name).strip()
+    if os.path.isabs(icon_name) or icon_name.startswith("file:"):
+        path = icon_name[5:] if icon_name.startswith("file:") else icon_name
+        return os.path.isfile(path)
+    if any(c in icon_name for c in "/?#<>:\"|*"):
+        return False
+    from PyQt6.QtGui import QIcon
+    ic = QIcon.fromTheme(icon_name)
+    if not ic.isNull():
+        sizes = ic.availableSizes()
+        if sizes:
+            return True
+        # Some themes report empty sizes but still paint
+        pix = ic.pixmap(32, 32)
+        if not pix.isNull() and not pix.toImage().isNull():
+            # fully transparent 32x32 still "resolves" — check alpha roughly
+            img = pix.toImage()
+            if img.width() > 0:
+                return True
+    return resolve_icon(icon_name) is not None
+
+
+def _system_desktop_roots():
+    """Directories that may hold system (non-user) .desktop files."""
+    roots = []
+    user_dir = os.path.normpath(USER_APPS_DIR)
+    for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
+        d = d.strip()
+        if not d:
+            continue
+        apps = os.path.join(d, "applications")
+        if os.path.isdir(apps) and os.path.normpath(apps) != user_dir:
+            roots.append(apps)
+    for apps in (
+        "/usr/share/applications",
+        "/usr/local/share/applications",
+        "/run/host/usr/share/applications",
+        "/run/host/usr/local/share/applications",
+        "/var/lib/flatpak/exports/share/applications",
+    ):
+        if os.path.isdir(apps) and os.path.normpath(apps) != user_dir:
+            roots.append(apps)
+    # DESKTOP_LIST entries: full file paths
+    for fp in os.environ.get("DESKTOP_LIST", "").split("\n"):
+        fp = fp.strip()
+        if not fp or not os.path.isfile(fp):
+            continue
+        d = os.path.dirname(fp)
+        if os.path.normpath(d) != user_dir and d not in roots:
+            roots.append(d)
+    # unique preserve order
+    seen = set()
+    out = []
+    for r in roots:
+        nr = os.path.normpath(r)
+        if nr not in seen:
+            seen.add(nr)
+            out.append(r)
+    return out
+
+
+def scan_user_launcher_overrides():
+    """User .desktop files under XDG applications (launcher overrides)."""
+    rows = []
+    user_dir = USER_APPS_DIR
+    if not os.path.isdir(user_dir):
+        return rows
+    try:
+        names = sorted(os.listdir(user_dir))
+    except OSError:
+        return rows
+    sys_roots = _system_desktop_roots()
+    for name in names:
+        if not is_valid_desktop_id(name):
+            continue
+        path = os.path.join(user_dir, name)
+        if not os.path.isfile(path):
+            continue
+        display, icon = parse_desktop_fields(path)
+        system_path = None
+        system_icon = None
+        for root in sys_roots:
+            cand = os.path.join(root, name)
+            if os.path.isfile(cand):
+                system_path = cand
+                _, system_icon = parse_desktop_fields(cand)
+                break
+        rows.append({
+            "desktop_id": name,
+            "path": path,
+            "display": display or name,
+            "icon": icon or "",
+            "system_icon": system_icon or "",
+            "system_path": system_path,
+            "icon_ok": icon_resolves(icon) if icon else False,
+        })
+    return rows
+
+
+def scan_apps_missing_icons(app_data):
+    """Apps whose Icon= is empty or does not resolve."""
+    rows = []
+    for desktop_id, icon_name, display_name, path in app_data:
+        if not is_valid_desktop_id(desktop_id):
+            continue
+        missing = not icon_resolves(icon_name)
+        if not missing:
+            continue
+        rows.append({
+            "desktop_id": desktop_id,
+            "path": path,
+            "display": display_name or desktop_id,
+            "icon": icon_name or "",
+            "reason": "No Icon=" if not (icon_name or "").strip() else "Icon not found",
+        })
+    rows.sort(key=lambda r: (r["display"] or "").lower())
+    return rows
+
+
 # ── Icon editor (pixel canvas + image import) ────────────────────────────
 class PixelCanvas(QFrame):
     """Simple pixel grid editor for designing icons."""
@@ -1633,6 +1756,23 @@ class CombinedWindow(QMainWindow):
         self._build_settings_tab(settings_w)
         tabs.addTab(settings_w, theme_icon("configure", "settings-configure", "preferences-system"), "Settings")
 
+        # 4) Overrides · 5) Missing icons
+        overrides_w = QWidget()
+        self._build_overrides_tab(overrides_w)
+        tabs.addTab(
+            overrides_w,
+            theme_icon("document-edit", "edit-entry", "preferences-desktop-default-applications"),
+            "Overrides",
+        )
+
+        missing_w = QWidget()
+        self._build_missing_tab(missing_w)
+        tabs.addTab(
+            missing_w,
+            theme_icon("dialog-warning", "emblem-important", "image-missing"),
+            "Missing",
+        )
+
         root.addWidget(tabs)
 
         sb = QStatusBar()
@@ -1732,13 +1872,14 @@ class CombinedWindow(QMainWindow):
         about_qt_action.triggered.connect(QApplication.aboutQt)
 
     def _on_tab_changed(self, index):
-        """Map-only status hints must not linger on Create/Settings."""
+        """Refresh management tabs when shown; clear stale status tips."""
         if self.statusBar():
             self.statusBar().clearMessage()
-        # Ephemeral, tab-local tip only
-        if index == 0 and self.icon_source == "system":
-            # User is back on Map with "from another app" — brief reminder is OK
-            pass
+        # Tab order: 0 Map, 1 Create, 2 Settings, 3 Overrides, 4 Missing
+        if index == 3 and hasattr(self, "_refresh_overrides_list"):
+            self._refresh_overrides_list()
+        elif index == 4 and hasattr(self, "_refresh_missing_list"):
+            self._refresh_missing_list()
 
     def _show_about_dialog(self):
         from PyQt6.QtWidgets import QMessageBox
@@ -1748,7 +1889,7 @@ class CombinedWindow(QMainWindow):
             "<h3>kAppIcon</h3>"
             "<p>Version 3.0.0</p>"
             "<p>A Linux utility to change application icons, reuse theme icons from other apps, "
-            "and design your own custom icons.</p>"
+            "and design your own custom icons. Review overrides and find apps missing icons.</p>"
             "<p>Designed for Plasma / Breeze, following freedesktop.org desktop entry specifications.</p>"
             "<p>License: MIT</p>"
         )
@@ -2764,6 +2905,311 @@ class CombinedWindow(QMainWindow):
         layout.addWidget(about)
 
         layout.addStretch(1)
+
+    # ── Overrides tab (user launcher overrides) ──────────────────────────
+    def _build_overrides_tab(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(0, layout_spacing(), 0, 0)
+        layout.setSpacing(layout_spacing())
+
+        layout.addWidget(make_hint_label(
+            "Launchers you (or kAppIcon) have customized under your user applications folder. "
+            "Reset restores the system icon when a system .desktop exists."
+        ))
+
+        filt_row = QHBoxLayout()
+        self.overrides_search = QLineEdit()
+        self.overrides_search.setClearButtonEnabled(True)
+        self.overrides_search.setPlaceholderText("Filter overrides…")
+        self.overrides_search.textChanged.connect(self._filter_overrides_list)
+        filt_row.addWidget(self.overrides_search, stretch=1)
+        refresh = QPushButton("Refresh")
+        refresh.setIcon(theme_icon("view-refresh", "system-reboot"))
+        refresh.clicked.connect(self._refresh_overrides_list)
+        filt_row.addWidget(refresh)
+        layout.addLayout(filt_row)
+
+        self.overrides_list = QListWidget()
+        self.overrides_list.setIconSize(QSize(32, 32))
+        self.overrides_list.setAlternatingRowColors(True)
+        self.overrides_list.itemDoubleClicked.connect(
+            lambda _i: self._overrides_open_in_map()
+        )
+        layout.addWidget(self.overrides_list, stretch=1)
+
+        self.overrides_detail = QLabel("")
+        self.overrides_detail.setWordWrap(True)
+        self.overrides_detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.overrides_detail)
+        self.overrides_list.currentItemChanged.connect(
+            lambda cur, _prev: self._overrides_show_detail(cur)
+        )
+
+        btn_row = QHBoxLayout()
+        open_map = QPushButton("Open in Map")
+        open_map.setIcon(theme_icon("preferences-desktop-icons", "go-next"))
+        open_map.setToolTip("Select this app on the Map tab to change its icon")
+        open_map.clicked.connect(self._overrides_open_in_map)
+        reset_btn = QPushButton("Reset to system icon")
+        reset_btn.setIcon(theme_icon("edit-clear-all", "edit-undo", "document-revert"))
+        reset_btn.setToolTip("Remove your custom icon and restore the system default")
+        reset_btn.clicked.connect(self._overrides_reset_selected)
+        btn_row.addWidget(open_map)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch(1)
+        equalize_widths([open_map, reset_btn])
+        layout.addLayout(btn_row)
+
+        self.overrides_status = QLabel("")
+        layout.addWidget(self.overrides_status)
+        self._refresh_overrides_list()
+
+    def _refresh_overrides_list(self):
+        if not hasattr(self, "overrides_list"):
+            return
+        self.overrides_list.clear()
+        rows = scan_user_launcher_overrides()
+        for row in rows:
+            label = row["display"]
+            icon_val = row["icon"] or "(no Icon=)"
+            item = QListWidgetItem(f"{label}")
+            item.setData(Qt.ItemDataRole.UserRole, row)
+            item.setToolTip(
+                f"{row['desktop_id']}\nIcon={icon_val}\n{row['path']}"
+            )
+            pix = resolve_icon(row["icon"]) if row["icon"] else None
+            if pix:
+                item.setIcon(QIcon(pix))
+            elif not row["icon_ok"]:
+                item.setIcon(theme_icon("image-missing", "dialog-warning"))
+            self.overrides_list.addItem(item)
+        n = self.overrides_list.count()
+        self.overrides_status.setText(
+            f"{n} user launcher override(s) in {USER_APPS_DIR}"
+            if n else f"No user overrides in {USER_APPS_DIR}"
+        )
+        self._filter_overrides_list(self.overrides_search.text() if hasattr(self, "overrides_search") else "")
+
+    def _filter_overrides_list(self, text=""):
+        if not hasattr(self, "overrides_list"):
+            return
+        q = (text or "").lower().strip()
+        for i in range(self.overrides_list.count()):
+            item = self.overrides_list.item(i)
+            row = item.data(Qt.ItemDataRole.UserRole) or {}
+            hay = " ".join([
+                row.get("display", ""),
+                row.get("desktop_id", ""),
+                row.get("icon", ""),
+                row.get("path", ""),
+            ]).lower()
+            item.setHidden(bool(q) and q not in hay)
+
+    def _overrides_show_detail(self, item):
+        if not item:
+            self.overrides_detail.setText("")
+            return
+        row = item.data(Qt.ItemDataRole.UserRole) or {}
+        lines = [
+            f"<b>{row.get('display', '')}</b> — <code>{row.get('desktop_id', '')}</code>",
+            f"User file: <code>{row.get('path', '')}</code>",
+            f"Icon=: <code>{row.get('icon') or '(empty)'}</code>"
+            + (" ✓" if row.get("icon_ok") else " (missing/unresolved)"),
+        ]
+        if row.get("system_path"):
+            lines.append(
+                f"System: <code>{row['system_path']}</code> · "
+                f"Icon=<code>{row.get('system_icon') or '(empty)'}</code>"
+            )
+        else:
+            lines.append("No matching system .desktop found (user-only launcher).")
+        self.overrides_detail.setText("<br/>".join(lines))
+
+    def _overrides_selected_row(self):
+        item = self.overrides_list.currentItem() if hasattr(self, "overrides_list") else None
+        if not item or item.isHidden():
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _overrides_open_in_map(self):
+        row = self._overrides_selected_row()
+        if not row:
+            QMessageBox.information(self, "Overrides", "Select an override first.")
+            return
+        self._jump_to_map_app(row["desktop_id"])
+
+    def _overrides_reset_selected(self):
+        row = self._overrides_selected_row()
+        if not row:
+            QMessageBox.information(self, "Overrides", "Select an override first.")
+            return
+        if not row.get("system_path"):
+            QMessageBox.warning(
+                self,
+                "Cannot reset",
+                "No system .desktop was found for this launcher.\n"
+                "You can delete the user file manually if you no longer need it.",
+            )
+            return
+        display = row.get("display") or row["desktop_id"]
+        confirm = QMessageBox.question(
+            self,
+            "Reset Icon?",
+            f"Reset “{display}” to the system icon?\n\n"
+            f"System Icon={row.get('system_icon') or '(empty)'}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.selected_file = "RESET"
+        self.selected_app = row["desktop_id"]
+        self.close()
+
+    # ── Missing icons tab ────────────────────────────────────────────────
+    def _build_missing_tab(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(0, layout_spacing(), 0, 0)
+        layout.setSpacing(layout_spacing())
+
+        layout.addWidget(make_hint_label(
+            "Installed apps whose Icon= is empty or does not resolve in your themes. "
+            "Use Open in Map to assign a working icon."
+        ))
+
+        filt_row = QHBoxLayout()
+        self.missing_search = QLineEdit()
+        self.missing_search.setClearButtonEnabled(True)
+        self.missing_search.setPlaceholderText("Filter apps…")
+        self.missing_search.textChanged.connect(self._filter_missing_list)
+        filt_row.addWidget(self.missing_search, stretch=1)
+        refresh = QPushButton("Refresh")
+        refresh.setIcon(theme_icon("view-refresh", "system-reboot"))
+        refresh.clicked.connect(self._refresh_missing_list)
+        filt_row.addWidget(refresh)
+        layout.addLayout(filt_row)
+
+        self.missing_list = QListWidget()
+        self.missing_list.setIconSize(QSize(32, 32))
+        self.missing_list.setAlternatingRowColors(True)
+        self.missing_list.itemDoubleClicked.connect(
+            lambda _i: self._missing_open_in_map()
+        )
+        layout.addWidget(self.missing_list, stretch=1)
+
+        self.missing_detail = QLabel("")
+        self.missing_detail.setWordWrap(True)
+        self.missing_detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.missing_detail)
+        self.missing_list.currentItemChanged.connect(
+            lambda cur, _prev: self._missing_show_detail(cur)
+        )
+
+        btn_row = QHBoxLayout()
+        open_map = QPushButton("Open in Map")
+        open_map.setIcon(theme_icon("preferences-desktop-icons", "go-next"))
+        open_map.clicked.connect(self._missing_open_in_map)
+        btn_row.addWidget(open_map)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        self.missing_status = QLabel("")
+        layout.addWidget(self.missing_status)
+        self._refresh_missing_list()
+
+    def _refresh_missing_list(self):
+        if not hasattr(self, "missing_list"):
+            return
+        self.missing_list.clear()
+        rows = scan_apps_missing_icons(self.app_data)
+        warn_icon = theme_icon("image-missing", "dialog-warning", "emblem-important")
+        for row in rows:
+            item = QListWidgetItem(row["display"])
+            item.setData(Qt.ItemDataRole.UserRole, row)
+            item.setToolTip(
+                f"{row['desktop_id']}\n{row['reason']}\nIcon={row['icon'] or '(empty)'}\n{row['path']}"
+            )
+            item.setIcon(warn_icon)
+            self.missing_list.addItem(item)
+        n = self.missing_list.count()
+        self.missing_status.setText(
+            f"{n} app(s) with missing or unresolved icons"
+            if n else "All scanned apps have a resolvable Icon="
+        )
+        self._filter_missing_list(
+            self.missing_search.text() if hasattr(self, "missing_search") else ""
+        )
+
+    def _filter_missing_list(self, text=""):
+        if not hasattr(self, "missing_list"):
+            return
+        q = (text or "").lower().strip()
+        for i in range(self.missing_list.count()):
+            item = self.missing_list.item(i)
+            row = item.data(Qt.ItemDataRole.UserRole) or {}
+            hay = " ".join([
+                row.get("display", ""),
+                row.get("desktop_id", ""),
+                row.get("icon", ""),
+                row.get("reason", ""),
+            ]).lower()
+            item.setHidden(bool(q) and q not in hay)
+
+    def _missing_show_detail(self, item):
+        if not item:
+            self.missing_detail.setText("")
+            return
+        row = item.data(Qt.ItemDataRole.UserRole) or {}
+        self.missing_detail.setText(
+            f"<b>{row.get('display', '')}</b> — <code>{row.get('desktop_id', '')}</code><br/>"
+            f"{row.get('reason', '')}<br/>"
+            f"Icon=: <code>{row.get('icon') or '(empty)'}</code><br/>"
+            f"<code>{row.get('path', '')}</code>"
+        )
+
+    def _missing_open_in_map(self):
+        item = self.missing_list.currentItem() if hasattr(self, "missing_list") else None
+        if not item or item.isHidden():
+            QMessageBox.information(self, "Missing icons", "Select an app first.")
+            return
+        row = item.data(Qt.ItemDataRole.UserRole) or {}
+        self._jump_to_map_app(row.get("desktop_id"))
+
+    def _jump_to_map_app(self, desktop_id):
+        """Switch to Map and select the given application id."""
+        if not desktop_id or not hasattr(self, "app_list"):
+            return
+        self.main_tabs.setCurrentIndex(0)
+        if hasattr(self, "app_search"):
+            self.app_search.clear()
+        # Ensure all rows visible then select
+        for i in range(self.app_list.count()):
+            self.app_list.item(i).setHidden(False)
+        found = None
+        for i in range(self.app_list.count()):
+            item = self.app_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == desktop_id:
+                found = item
+                break
+        if found:
+            self.app_list.setCurrentItem(found)
+            self.app_list.scrollToItem(found)
+            if self.statusBar():
+                self.statusBar().showMessage(
+                    f"Selected {found.text()} — pick an icon and Apply",
+                    8000,
+                )
+        else:
+            QMessageBox.information(
+                self,
+                "App not in Map list",
+                f"Could not find {desktop_id} in the Map application list.\n"
+                "It may be hidden or not loaded at startup.",
+            )
 
     # ── Settings callbacks ───────────────────────────────────────────────
     def _on_theme(self, theme):
