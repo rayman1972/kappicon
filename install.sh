@@ -2,7 +2,7 @@
 set -e
 
 INSTALL_DIR="$HOME/.local/bin"
-REPO_URL="https://raw.githubusercontent.com/system-rw/macosicons-linux/main"
+REPO_URL="https://raw.githubusercontent.com/rayman1972/kappicon/main"
 LOCAL_VERSION_FILE="$HOME/.config/KAppIcon/VERSION"
 REMOTE_VERSION=$(curl -sf "$REPO_URL/VERSION" 2>/dev/null | tr -d '[:space:]')
 
