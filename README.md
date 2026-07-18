@@ -31,8 +31,6 @@ kappicon          # GUI
 
 ### Arch Linux (AUR)
 
-PKGBUILDs are maintained in-tree under [`packaging/aur/`](packaging/aur/). Once published on the AUR:
-
 ```bash
 # stable release
 yay -S kappicon
@@ -40,14 +38,10 @@ yay -S kappicon
 yay -S kappicon-git
 ```
 
-Until the packages are on [aur.archlinux.org](https://aur.archlinux.org/), build locally:
+- [kappicon](https://aur.archlinux.org/packages/kappicon) — tagged release  
+- [kappicon-git](https://aur.archlinux.org/packages/kappicon-git) — latest `main`  
 
-```bash
-cd packaging/aur/kappicon   # or packaging/aur/kappicon-git
-makepkg -si
-```
-
-See [packaging/aur/README.md](packaging/aur/README.md) for publish steps.
+PKGBUILDs are also kept in-tree under [`packaging/aur/`](packaging/aur/) (see [packaging/aur/README.md](packaging/aur/README.md) for updates).
 
 ## Screenshots
 
