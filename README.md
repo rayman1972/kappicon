@@ -68,6 +68,9 @@ To update later (from a git clone):
 | **Arch / CachyOS** | `python python-pyqt6 libicns imagemagick kdialog fzf` |
 | **Debian / Ubuntu** | `python3 python3-pyqt6 icnsutils imagemagick kdialog fzf` |
 | **Fedora** | `python3 python3-pyqt6 libicns-utils ImageMagick kdialog fzf` |
+| **openSUSE Leap / Tumbleweed** | `python3` `python3-PyQt6` (or `python3XY-PyQt6` for your Python) `libicns` `ImageMagick` `kdialog` `fzf` |
+
+On openSUSE, `install.sh` picks the PyQt6 RPM that matches your default `python3` (e.g. `python312-PyQt6`) when the generic name is not available, and falls back to `pip install PyQt6` if needed.
 
 Ensure `~/.local/bin` is on your `PATH`.
 

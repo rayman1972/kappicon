@@ -62,6 +62,33 @@ echo "🎨 Installing KAppIcon (CLI, GUI & Icon Editor) for Linux..."
 
 check_update
 
+# openSUSE ships versioned PyQt6 RPMs (python312-PyQt6, python313-PyQt6, …)
+# Prefer the package matching the default python3, then generic names.
+opensuse_pyqt6_pkg() {
+    local ver cand
+    ver=$(python3 -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || true)
+    for cand in "python${ver}-PyQt6" "python3-PyQt6" "python-PyQt6"; do
+        [ -n "$cand" ] || continue
+        # Exact package name present in repos?
+        if zypper --non-interactive search --match-exact -t package "$cand" 2>/dev/null \
+            | grep -qE "[[:space:]]${cand}[[:space:]]"; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    # Last resort: first *PyQt6 package from search (skip source/src lines)
+    cand=$(zypper --non-interactive search -t package PyQt6 2>/dev/null \
+        | awk -F'|' '/PyQt6/ && $0 !~ /srcpackage|source/ {
+            gsub(/^ +| +$/, "", $2);
+            if ($2 ~ /PyQt6$/) { print $2; exit }
+        }')
+    if [ -n "$cand" ]; then
+        printf '%s\n' "$cand"
+        return 0
+    fi
+    return 1
+}
+
 # Check and install dependencies
 install_deps() {
     if command -v pacman &>/dev/null; then
@@ -98,19 +125,23 @@ install_deps() {
             [fzf]=fzf
         )
     elif command -v zypper &>/dev/null; then
+        # openSUSE Leap / Tumbleweed
         PKG="zypper"
-        SUDO="sudo zypper install -y"
+        SUDO="sudo zypper --non-interactive install -y"
+        PYQT6_PKG=$(opensuse_pyqt6_pkg || true)
         declare -A PKGS=(
             [python]=python3
-            [pyqt6]=python3-qt6
-            [icns]=libicns-utils
+            [pyqt6]="${PYQT6_PKG:-}"
+            # Tools (icns2png) ship in the main package on openSUSE
+            [icns]=libicns
             [imagemagick]=ImageMagick
             [kdialog]=kdialog
             [fzf]=fzf
         )
     else
         echo "⚠️  Could not detect package manager. Install manually:"
-        echo "   python3, PyQt6, libicns/icnsutils (icns2png), imagemagick, kdialog, fzf"
+        echo "   python3, PyQt6, libicns/icnsutils (icns2png), ImageMagick, kdialog, fzf"
+        echo "   openSUSE: python3 python3-PyQt6 (or python3XY-PyQt6) libicns ImageMagick kdialog fzf"
         read -rp "Continue anyway? [y/N] " yn
         [[ "$yn" =~ ^[Yy]$ ]] || exit 1
         return
@@ -142,11 +173,32 @@ install_deps() {
     echo "📦 Installing missing dependencies..."
     if [ ${#NEED_SYS[@]} -gt 0 ]; then
         echo "   $PKG: ${NEED_SYS[*]}"
-        $SUDO "${NEED_SYS[@]}"
+        if ! $SUDO "${NEED_SYS[@]}"; then
+            echo "⚠️  Package install had errors; will try pip for PyQt6 if needed."
+        fi
+    fi
+    # If distro PyQt6 package failed / missing, fall back to pip
+    if ! python3 -c "import PyQt6" 2>/dev/null; then
+        if [[ " ${NEED_PIP[*]} " != *" PyQt6 "* ]]; then
+            NEED_PIP+=("PyQt6")
+        fi
     fi
     if [ ${#NEED_PIP[@]} -gt 0 ]; then
         echo "   pip: ${NEED_PIP[*]}"
-        pip install "${NEED_PIP[@]}"
+        python3 -m pip install --user "${NEED_PIP[@]}" 2>/dev/null \
+            || pip3 install --user "${NEED_PIP[@]}" 2>/dev/null \
+            || pip install "${NEED_PIP[@]}"
+    fi
+    # Final sanity checks (non-fatal for optional tools)
+    if ! python3 -c "import PyQt6" 2>/dev/null; then
+        echo "❌ PyQt6 is still missing. Install it with your package manager or: pip install PyQt6"
+        exit 1
+    fi
+    if ! command -v magick &>/dev/null && ! command -v convert &>/dev/null; then
+        echo "⚠️  ImageMagick not found (magick/convert). Custom image apply may fail."
+    fi
+    if ! command -v icns2png &>/dev/null; then
+        echo "⚠️  icns2png not found (openSUSE: libicns, Debian: icnsutils, Fedora: libicns-utils)."
     fi
     echo "✅ Dependencies installed."
 }
