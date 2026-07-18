@@ -1663,14 +1663,7 @@ class CombinedWindow(QMainWindow):
         center.addWidget(self.pixel_canvas, stretch=1)
         layout.addWidget(canvas_box, stretch=1)
 
-        # App-wide shortcuts so Undo works even when a list has focus on Create tab
-        self._undo_sc = QShortcut(QKeySequence.StandardKey.Undo, self)
-        self._undo_sc.setContext(Qt.ShortcutContext.WindowShortcut)
-        self._undo_sc.activated.connect(self._editor_undo)
-        self._redo_sc = QShortcut(QKeySequence.StandardKey.Redo, self)
-        self._redo_sc.setContext(Qt.ShortcutContext.WindowShortcut)
-        self._redo_sc.activated.connect(self._editor_redo)
-        # Extra Redo for Ctrl+Y (common on some desktops)
+        # Extra Redo for Ctrl+Y (menu already has Ctrl+Shift+Z via StandardKey.Redo)
         self._redo_sc_y = QShortcut(QKeySequence("Ctrl+Y"), self)
         self._redo_sc_y.setContext(Qt.ShortcutContext.WindowShortcut)
         self._redo_sc_y.activated.connect(self._editor_redo)
