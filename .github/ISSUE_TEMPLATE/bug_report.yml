@@ -1,0 +1,66 @@
+name: Bug report
+description: Something does not work as expected
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. For **security** issues, use the [security policy](https://github.com/rayman1972/kappicon/blob/main/SECURITY.md) instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `kappicon` About dialog, or `pacman -Q kappicon`, or git commit
+      placeholder: e.g. 3.0.1-1 / kappicon-git / commit abc1234
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distro and desktop
+      description: e.g. CachyOS / Arch, Plasma 6
+      placeholder: Distro + Plasma/GNOME/…
+    validations:
+      required: true
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Install method
+      options:
+        - AUR kappicon
+        - AUR kappicon-git
+        - ./install.sh
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did
+      placeholder: |
+        1. Open Map
+        2. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include error text from the GUI or terminal if any
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Extra context
+      description: Screenshots, related apps, icon theme name, etc.
+    validations:
+      required: false
