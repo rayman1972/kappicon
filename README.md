@@ -100,8 +100,6 @@ kappicon --restore
 kappicon --refresh
 ```
 
-Legacy command names `apply-mac-icon` and `apply-mac-icon-gui` remain as shims after install.
-
 ## Paths
 
 | What | Where |

@@ -38,13 +38,13 @@ if [ "${1:-}" = "--update" ]; then
     ln -f cli/kappicon "$INSTALL_DIR/kappicon"
     ln -f gui/kappicon "$INSTALL_DIR/kappicon-gui"
     chmod +x "$INSTALL_DIR/kappicon" "$INSTALL_DIR/kappicon-gui"
-    # Compatibility shims for old names
-    ln -sf kappicon "$INSTALL_DIR/apply-mac-icon" 2>/dev/null || true
-    ln -sf kappicon-gui "$INSTALL_DIR/apply-mac-icon-gui" 2>/dev/null || true
+    # Drop leftover names from the old rebrand attempt (if still present)
+    rm -f "$INSTALL_DIR/apply-mac-icon" "$INSTALL_DIR/apply-mac-icon-gui" \
+        ~/.local/share/icons/macosicons.png ~/.local/share/icons/macosicons-gui.png \
+        ~/.local/share/applications/macosicons.desktop \
+        ~/.local/share/applications/macosicons-gui.desktop 2>/dev/null || true
     [ -f assets/kappicon.png ] && cp assets/kappicon.png ~/.local/share/icons/kappicon.png
     [ -f assets/kappicon-gui.png ] && cp assets/kappicon-gui.png ~/.local/share/icons/kappicon-gui.png
-    # Also register under legacy icon names if present
-    [ -f assets/kappicon.png ] && cp assets/kappicon.png ~/.local/share/icons/macosicons.png 2>/dev/null || true
     # GUI is the main menu entry; CLI uses a distinct filename so it does not overwrite.
     cp gui/kappicon.desktop ~/.local/share/applications/kappicon.desktop
     [ -f cli/kappicon-cli.desktop ] && cp cli/kappicon-cli.desktop ~/.local/share/applications/kappicon-cli.desktop
@@ -158,9 +158,11 @@ mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/icons ~/.local/
 ln -f cli/kappicon ~/.local/bin/kappicon
 ln -f gui/kappicon ~/.local/bin/kappicon-gui
 chmod +x ~/.local/bin/kappicon ~/.local/bin/kappicon-gui
-# Old command names still work
-ln -sf kappicon ~/.local/bin/apply-mac-icon
-ln -sf kappicon-gui ~/.local/bin/apply-mac-icon-gui
+# Drop leftover names from the old rebrand attempt (if still present)
+rm -f ~/.local/bin/apply-mac-icon ~/.local/bin/apply-mac-icon-gui \
+    ~/.local/share/icons/macosicons.png ~/.local/share/icons/macosicons-gui.png \
+    ~/.local/share/applications/macosicons.desktop \
+    ~/.local/share/applications/macosicons-gui.desktop 2>/dev/null || true
 
 if [ -f assets/kappicon.png ]; then
     cp assets/kappicon.png ~/.local/share/icons/kappicon.png
@@ -169,13 +171,9 @@ if [ -f assets/kappicon-gui.png ]; then
     cp assets/kappicon-gui.png ~/.local/share/icons/kappicon-gui.png
 fi
 
-# Desktop launchers — distinct filenames (both used to be kappicon.desktop and the CLI won)
+# Desktop launchers — distinct filenames for GUI and CLI
 cp gui/kappicon.desktop ~/.local/share/applications/kappicon.desktop
 [ -f cli/kappicon-cli.desktop ] && cp cli/kappicon-cli.desktop ~/.local/share/applications/kappicon-cli.desktop
-
-# Remove legacy desktop entries if present
-rm -f ~/.local/share/applications/macosicons.desktop \
-      ~/.local/share/applications/macosicons-gui.desktop 2>/dev/null || true
 
 if command -v kbuildsycoca6 &> /dev/null; then
     kbuildsycoca6 --noincremental

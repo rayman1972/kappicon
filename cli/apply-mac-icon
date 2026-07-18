@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-# Legacy entry point — use `kappicon` instead.
-exec "$(cd "$(dirname "$0")" && pwd)/kappicon" "$@"
