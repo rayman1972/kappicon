@@ -1,0 +1,7 @@
+
+# AUR / makepkg artifacts
+packaging/aur/*/*.pkg.tar.*
+packaging/aur/*/src/
+packaging/aur/*/pkg/
+packaging/aur/*/*.tar.gz
+packaging/aur/kappicon-git/kappicon/
