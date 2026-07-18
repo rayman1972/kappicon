@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
+[![Arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-blue.svg)](#requirements)
 [![Desktop](https://img.shields.io/badge/desktop-KDE%20Plasma%20%7C%20freedesktop-informational.svg)](#features)
 [![UI](https://img.shields.io/badge/UI-PyQt6-41cd52.svg)](#requirements)
 [![Release](https://img.shields.io/github/v/release/rayman1972/kappicon?include_prereleases&label=release)](https://github.com/rayman1972/kappicon/releases)
@@ -101,6 +102,7 @@ Supported image types include **PNG, JPG, WEBP, SVG, ICNS, BMP, GIF, XPM**.
 ## Requirements
 
 - Linux desktop (Plasma / Breeze-friendly; works elsewhere with freedesktop menus)
+- **x86_64 and arm64** compatible (architecture-independent; needs deps for your arch)
 - Python 3 + **PyQt6**
 - **ImageMagick** (`magick` or `convert`) for rasterizing custom icons
 - **icns2png** (`libicns` / `icnsutils`) for Apple `.icns` files
