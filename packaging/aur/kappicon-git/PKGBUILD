@@ -41,6 +41,9 @@ package() {
   install -Dm644 gui/kappicon.desktop \
     "${pkgdir}/usr/share/applications/kappicon.desktop"
 
+  install -Dm644 data/io.github.rayman1972.kappicon.metainfo.xml \
+    "${pkgdir}/usr/share/metainfo/io.github.rayman1972.kappicon.metainfo.xml"
+
   install -Dm644 assets/kappicon.png \
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/kappicon.png"
   install -Dm644 assets/kappicon.png \

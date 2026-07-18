@@ -1,12 +1,16 @@
 [Desktop Entry]
 Type=Application
+Version=1.5
 Name=kAppIcon
 GenericName=App Icon Manager
-Comment=Change, create, and map application icons
+Comment=Change Linux app launcher icons without root
+# Match AppStream component (software centers)
+# See data/io.github.rayman1972.kappicon.metainfo.xml
 Exec=kappicon
 Icon=kappicon
 Terminal=false
-Categories=Utility;Qt;KDE;Graphics;
-Keywords=icon;desktop;theme;customize;app;
+Categories=Utility;Qt;KDE;Graphics;DesktopSettings;
+Keywords=icon;desktop;theme;customize;app;launcher;plasma;kde;
 StartupNotify=true
 StartupWMClass=kappicon
+X-GNOME-UsesNotifications=false

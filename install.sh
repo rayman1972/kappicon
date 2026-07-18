@@ -81,6 +81,12 @@ if [ "${1:-}" = "--update" ]; then
     if grep -q 'KAppIcon (CLI)' "$APPS_DIR/kappicon.desktop" 2>/dev/null; then
         cp gui/kappicon.desktop "$APPS_DIR/kappicon.desktop"
     fi
+    METAINFO_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/metainfo"
+    if [ -f data/io.github.rayman1972.kappicon.metainfo.xml ]; then
+        mkdir -p "$METAINFO_DIR"
+        cp data/io.github.rayman1972.kappicon.metainfo.xml \
+            "$METAINFO_DIR/io.github.rayman1972.kappicon.metainfo.xml"
+    fi
     [ -f VERSION ] && cp VERSION "$LOCAL_VERSION_FILE"
     echo "✅ Updated to $REMOTE_VERSION"
     exit 0
@@ -262,6 +268,14 @@ fi
 
 # Desktop launcher — GUI only (CLI is run from the terminal)
 cp gui/kappicon.desktop "$APPS_DIR/kappicon.desktop"
+
+# AppStream metainfo for software centers (Pamac / GNOME Software / Discover)
+METAINFO_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/metainfo"
+if [ -f data/io.github.rayman1972.kappicon.metainfo.xml ]; then
+    mkdir -p "$METAINFO_DIR"
+    cp data/io.github.rayman1972.kappicon.metainfo.xml \
+        "$METAINFO_DIR/io.github.rayman1972.kappicon.metainfo.xml"
+fi
 
 if command -v kbuildsycoca6 &> /dev/null; then
     kbuildsycoca6 --noincremental

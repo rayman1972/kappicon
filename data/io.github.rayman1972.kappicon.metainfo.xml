@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata for software centers (GNOME Software, Pamac, Discover, …).
+  https://www.freedesktop.org/software/appstream/docs/
+-->
+<component type="desktop-application">
+  <id>io.github.rayman1972.kappicon</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>kAppIcon</name>
+  <summary>Change Linux app launcher icons without root</summary>
+  <description>
+    <p>
+      kAppIcon is a small icon manager for KDE Plasma and other freedesktop desktops.
+      Map a custom image, copy another app’s icon, or pick one icon from any installed
+      icon theme (WhiteSur, Tela, Breeze, Papirus, and more) and apply it to a single
+      application — without switching your whole system theme.
+    </p>
+    <p>
+      Changes are user-level only: your system packages stay intact. Optional backups,
+      icon shape masks, a simple Create editor, and a terminal CLI are included.
+    </p>
+    <ul>
+      <li>Map from file (PNG, SVG, ICNS, and more)</li>
+      <li>Map from another app’s theme icon</li>
+      <li>Map from installed icon theme packs</li>
+      <li>Create tab with undo/redo and icon library</li>
+      <li>CLI: kappicon-cli</li>
+    </ul>
+  </description>
+
+  <url type="homepage">https://github.com/rayman1972/kappicon</url>
+  <url type="bugtracker">https://github.com/rayman1972/kappicon/issues</url>
+  <url type="vcs-browser">https://github.com/rayman1972/kappicon</url>
+
+  <launchable type="desktop-id">kappicon.desktop</launchable>
+  <provides>
+    <binary>kappicon</binary>
+    <binary>kappicon-cli</binary>
+  </provides>
+  <icon type="stock">kappicon</icon>
+
+  <categories>
+    <category>Utility</category>
+    <category>DesktopSettings</category>
+    <category>Graphics</category>
+  </categories>
+  <keywords>
+    <keyword>icon</keyword>
+    <keyword>theme</keyword>
+    <keyword>desktop</keyword>
+    <keyword>launcher</keyword>
+    <keyword>plasma</keyword>
+    <keyword>kde</keyword>
+    <keyword>customize</keyword>
+  </keywords>
+
+  <developer id="io.github.rayman1972">
+    <name>rayman1972</name>
+  </developer>
+
+  <content_rating type="oars-1.1" />
+
+  <recommends>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </recommends>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-map-icon-theme.png</image>
+      <caption>Map — apply an icon from an installed theme pack</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-map.png</image>
+      <caption>Map — pick an icon file and an application</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-map-from-app.png</image>
+      <caption>Map — reuse another app’s icon</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-create.png</image>
+      <caption>Create — pixel editor and icon library</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-settings.png</image>
+      <caption>Settings — appearance, shape, backups</caption>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="3.0.1" date="2026-07-18">
+      <description>
+        <p>AppStream metainfo for software centers; packaging polish.</p>
+      </description>
+      <url>https://github.com/rayman1972/kappicon/releases/tag/v3.0.1</url>
+    </release>
+    <release version="3.0.0" date="2026-07-18">
+      <description>
+        <p>kAppIcon 3.0 — multi-source map, Create tab, CLI, XDG-aware paths.</p>
+      </description>
+      <url>https://github.com/rayman1972/kappicon/releases/tag/v3.0.0</url>
+    </release>
+  </releases>
+
+  <update_contact>https://github.com/rayman1972/kappicon/issues</update_contact>
+</component>
