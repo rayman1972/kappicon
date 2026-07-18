@@ -38,7 +38,9 @@
     <binary>kappicon</binary>
     <binary>kappicon-cli</binary>
   </provides>
+  <!-- stock name matches Icon= in kappicon.desktop / hicolor install -->
   <icon type="stock">kappicon</icon>
+  <icon type="remote" height="256" width="256">https://raw.githubusercontent.com/rayman1972/kappicon/main/assets/kappicon.png</icon>
 
   <categories>
     <category>Utility</category>
