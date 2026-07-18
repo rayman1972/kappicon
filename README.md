@@ -22,7 +22,9 @@ Browse packs such as **WhiteSur**, **Tela**, **Breeze**, or any theme under `~/.
 
 ![Map from icon theme](screenshots/gui-map-icon-theme.png)
 
-### Create — pixel editor and icon library
+### Create — pixel editor, undo/redo, and icon library
+
+Draw or import, **Undo** / **Redo** mistakes (Ctrl+Z), then save a standard 512×512 icon.
 
 ![Create tab](screenshots/gui-create.png)
 
