@@ -412,6 +412,10 @@ LIBRARY_DIR = _env_path("LIBRARY_DIR", DATA_DIR, "icons")
 USER_APPS_DIR = _env_path("USER_APPS_DIR", XDG_DATA_HOME, "applications")
 USER_ICONS_DIR = _env_path("USER_ICONS_DIR", XDG_DATA_HOME, "icons")
 BACKUP_DIR = _env_path("BACKUP_DIR_DEFAULT", DATA_DIR, "backups")
+TARGET_DIR = _env_path(
+    "TARGET_DIR",
+    os.path.join(xdg_user_dir_default("PICTURES", "Pictures"), "KAppIcon"),
+)
 DOWNLOADS_DIR_DEFAULT = _env_path(
     "DOWNLOADS_DIR", xdg_user_dir_default("DOWNLOAD", "Downloads")
 )
