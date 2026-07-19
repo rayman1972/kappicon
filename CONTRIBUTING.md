@@ -31,7 +31,6 @@ Requirements are listed in the [README](README.md#requirements).
 | `install.sh` | User install (XDG-aware) |
 | `data/*.metainfo.xml` | AppStream metadata |
 | `packaging/aur/` | AUR PKGBUILDs |
-| `packaging/flatpak/` | Optional local Flatpak manifest |
 
 ## Pull requests
 
@@ -42,7 +41,7 @@ Requirements are listed in the [README](README.md#requirements).
    - GUI: Map (file / other app / icon theme), Create save, Settings
    - CLI: `kappicon-cli --help` and a simple apply if you touch apply logic
 5. Update README or packaging notes if install paths or features change
-6. Do **not** commit build artifacts (`packaging/aur/*/pkg`, Flatpak `build-dir`, etc.)
+6. Do **not** commit build artifacts (`packaging/aur/*/pkg`, etc.)
 
 ### Safety-sensitive areas
 

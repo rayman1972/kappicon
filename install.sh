@@ -39,8 +39,25 @@ check_update() {
     fi
 }
 
+# Flags: --update · --install-deps (privileged package installs are opt-in)
+INSTALL_DEPS=0
+DO_UPDATE=0
+for arg in "$@"; do
+    case "$arg" in
+        --update) DO_UPDATE=1 ;;
+        --install-deps) INSTALL_DEPS=1 ;;
+        -h|--help)
+            echo "Usage: ./install.sh [--update] [--install-deps]"
+            echo "  Default: user-level install only (~/.local) — no sudo."
+            echo "  --install-deps  Install missing system packages (may prompt for sudo)."
+            echo "  --update        Pull latest sources then reinstall."
+            exit 0
+            ;;
+    esac
+done
+
 # ── Update mode ──────────────────────────────────────────────────────────
-if [ "${1:-}" = "--update" ]; then
+if [ "$DO_UPDATE" = "1" ]; then
     echo "🔄 Updating kAppIcon..."
     if [ -d .git ]; then
         git pull --rebase 2>/dev/null || { echo "❌ git pull failed — are you in the repo directory?"; exit 1; }
@@ -204,28 +221,56 @@ install_deps() {
         return
     fi
 
-    echo "📦 Installing missing dependencies..."
+    echo "📦 Missing dependencies:"
+    [ ${#NEED_SYS[@]} -gt 0 ] && echo "   system ($PKG): ${NEED_SYS[*]}"
+    [ ${#NEED_PIP[@]} -gt 0 ] && echo "   pip: ${NEED_PIP[*]}"
+
+    # Default stays user-scoped: never invoke sudo unless explicitly requested.
+    if [ "${INSTALL_DEPS:-0}" != "1" ]; then
+        echo ""
+        echo "   Install is user-level only by default (no root)."
+        echo "   Re-run with:  ./install.sh --install-deps"
+        echo "   Or install packages yourself, then re-run ./install.sh"
+        echo ""
+        if ! python3 -c "import PyQt6" 2>/dev/null; then
+            echo "❌ PyQt6 is required for the GUI. Install it, then re-run ./install.sh"
+            echo "   Arch:   pacman -S python-pyqt6"
+            echo "   Debian: apt install python3-pyqt6"
+            echo "   pip:    pip install --user PyQt6"
+            echo "   Or:     ./install.sh --install-deps"
+            exit 1
+        fi
+        if ! command -v magick &>/dev/null && ! command -v convert &>/dev/null; then
+            echo "⚠️  ImageMagick not found (magick/convert). Custom image apply may fail."
+        fi
+        if ! command -v icns2png &>/dev/null; then
+            echo "⚠️  icns2png not found (libicns / icnsutils)."
+        fi
+        return
+    fi
+
+    echo "📦 Installing missing dependencies (--install-deps)..."
     if [ ${#NEED_SYS[@]} -gt 0 ]; then
         echo "   $PKG: ${NEED_SYS[*]}"
         if ! $SUDO "${NEED_SYS[@]}"; then
             echo "⚠️  Package install had errors; will try pip for PyQt6 if needed."
         fi
     fi
-    # If distro PyQt6 package failed / missing, fall back to pip
+    # If distro PyQt6 package failed / missing, fall back to pip (user install)
     if ! python3 -c "import PyQt6" 2>/dev/null; then
         if [[ " ${NEED_PIP[*]} " != *" PyQt6 "* ]]; then
             NEED_PIP+=("PyQt6")
         fi
     fi
     if [ ${#NEED_PIP[@]} -gt 0 ]; then
-        echo "   pip: ${NEED_PIP[*]}"
+        echo "   pip --user: ${NEED_PIP[*]}"
         python3 -m pip install --user "${NEED_PIP[@]}" 2>/dev/null \
             || pip3 install --user "${NEED_PIP[@]}" 2>/dev/null \
-            || pip install "${NEED_PIP[@]}"
+            || pip install --user "${NEED_PIP[@]}"
     fi
     # Final sanity checks (non-fatal for optional tools)
     if ! python3 -c "import PyQt6" 2>/dev/null; then
-        echo "❌ PyQt6 is still missing. Install it with your package manager or: pip install PyQt6"
+        echo "❌ PyQt6 is still missing. Install it with your package manager or: pip install --user PyQt6"
         exit 1
     fi
     if ! command -v magick &>/dev/null && ! command -v convert &>/dev/null; then

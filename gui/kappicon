@@ -351,7 +351,8 @@ export DOWNLOADS_DIR LIBRARY_DIR BACKUP_DIR_DEFAULT
 export DESKTOP_LIST
 
 RESULT=$(python3 - <<'PYEOF'
-import sys, os, subprocess, tempfile, shutil
+import sys, os, subprocess, tempfile, shutil, fcntl, time, json, hashlib, re
+from contextlib import contextmanager
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
@@ -360,17 +361,22 @@ from PyQt6.QtWidgets import (
     QButtonGroup, QColorDialog, QMessageBox, QToolButton, QSizePolicy,
     QMainWindow, QGroupBox, QFormLayout, QDialogButtonBox, QStatusBar,
     QStyle, QStyleFactory, QRadioButton, QDialog, QSlider,
+    QAbstractItemView, QMenu, QAbstractSpinBox, QTextEdit, QPlainTextEdit,
 )
 from PyQt6.QtGui import (
     QPixmap, QIcon, QColor, QPainter, QPainterPath, QPalette,
     QCursor, QImage, QPen, QKeySequence, QShortcut, QAction,
+    QDragEnterEvent, QDropEvent,
 )
-from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, pyqtSignal, QPointF, QRectF
+from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, pyqtSignal, QPointF, QRectF, QUrl
 
-ICON_EXTENSIONS = {".icns", ".png", ".jpg", ".jpeg", ".webp"}
-IMAGE_IMPORT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+ICON_EXTENSIONS = {".icns", ".png", ".jpg", ".jpeg", ".webp", ".svg", ".svgz", ".bmp", ".gif", ".xpm"}
+IMAGE_IMPORT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".svg", ".svgz"}
 # Single size for library icons (imports + saves) so Map/apply always sees equal assets
 STANDARD_ICON_SIZE = 512
+APPLY_UNDO_MAX = 15
+RECENT_MAX = 12
+MAP_ICON_SIZES = (32, 48, 64)
 
 
 def _env_path(key, *fallback_parts):
@@ -420,11 +426,775 @@ DOWNLOADS_DIR_DEFAULT = _env_path(
     "DOWNLOADS_DIR", xdg_user_dir_default("DOWNLOAD", "Downloads")
 )
 os.makedirs(LIBRARY_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
+os.makedirs(USER_APPS_DIR, exist_ok=True)
+os.makedirs(TARGET_DIR, exist_ok=True)
+LOCK_FILE = os.path.join(DATA_DIR, "apply.lock")
 # Sentinel stored on the empty-state list row so a click can open a file browser
 BROWSE_FOR_ICON = "__browse_for_icon__"
 # UserRole payload prefix for freedesktop/theme icon names (Icon=fooname)
 THEME_ICON_PREFIX = "theme:"
 DESKTOP_LIST_RAW = [d for d in os.environ.get("DESKTOP_LIST", "").strip().split("\n") if d]
+
+
+# ── In-process apply engine (GUI stays open; exclusive lock; atomic writes) ──
+class ApplyError(Exception):
+    """User-visible apply failure (safe to show in a message box)."""
+
+
+def find_magick_cmd():
+    for name in ("magick", "convert"):
+        if shutil.which(name):
+            return name
+    return None
+
+
+@contextmanager
+def apply_lock(timeout=45.0):
+    """Exclusive flock for desktop + hicolor mutations (pairs with CLI/shell)."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    fd = open(LOCK_FILE, "a+", encoding="utf-8")
+    deadline = time.monotonic() + float(timeout)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ApplyError(
+                        "Another kAppIcon operation is in progress (lock timeout)."
+                    )
+                time.sleep(0.08)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            fd.close()
+        except OSError:
+            pass
+
+
+def _atomic_write_text(path, text):
+    dirn = os.path.dirname(path) or "."
+    os.makedirs(dirn, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".tmp", dir=dirn)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_copy_file(src, dest):
+    dirn = os.path.dirname(dest) or "."
+    os.makedirs(dirn, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".tmp", dir=dirn)
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_desktop_icon_value(path):
+    """Icon= from [Desktop Entry], or None."""
+    if not path or not os.path.isfile(path):
+        return None
+    in_entry = False
+    try:
+        with open(path, "r", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    in_entry = line == "[Desktop Entry]"
+                    continue
+                if in_entry and line.startswith("Icon="):
+                    return line.split("=", 1)[1]
+    except OSError:
+        return None
+    return None
+
+
+def set_desktop_icon_py(desktop_file, icon_value):
+    """Set Icon= only inside [Desktop Entry], atomically."""
+    if not desktop_file or not icon_value:
+        raise ApplyError("Empty path or icon value.")
+    try:
+        with open(desktop_file, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        raise ApplyError(str(e)) from e
+    out = []
+    in_entry = False
+    icon_set = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_entry and not icon_set:
+                out.append(f"Icon={icon_value}\n")
+                icon_set = True
+            in_entry = stripped == "[Desktop Entry]"
+            out.append(line if line.endswith("\n") else line + "\n")
+            continue
+        if in_entry and stripped.startswith("Icon="):
+            if not icon_set:
+                out.append(f"Icon={icon_value}\n")
+                icon_set = True
+            continue
+        out.append(line if line.endswith("\n") or line == "" else line + "\n")
+    if in_entry and not icon_set:
+        out.append(f"Icon={icon_value}\n")
+    elif not icon_set:
+        out.insert(0, "[Desktop Entry]\n")
+        out.insert(1, f"Icon={icon_value}\n")
+    _atomic_write_text(desktop_file, "".join(out))
+
+
+def clear_desktop_icon_py(desktop_file):
+    try:
+        with open(desktop_file, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        raise ApplyError(str(e)) from e
+    out = []
+    in_entry = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_entry = stripped == "[Desktop Entry]"
+            out.append(line if line.endswith("\n") else line + "\n")
+            continue
+        if in_entry and stripped.startswith("Icon="):
+            continue
+        out.append(line if line.endswith("\n") or line == "" else line + "\n")
+    _atomic_write_text(desktop_file, "".join(out))
+
+
+def find_system_desktop_path(desktop_id):
+    """First non-user applications path containing desktop_id."""
+    user = os.path.normpath(USER_APPS_DIR)
+    candidates = []
+    for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
+        d = d.strip()
+        if d:
+            candidates.append(os.path.join(d, "applications"))
+    for extra in (
+        "/usr/local/share/applications",
+        "/usr/share/applications",
+    ):
+        if extra not in candidates:
+            candidates.append(extra)
+    for apps in candidates:
+        if os.path.normpath(apps) == user:
+            continue
+        cand = os.path.join(apps, desktop_id)
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def find_any_desktop_path(desktop_id):
+    user = os.path.join(USER_APPS_DIR, desktop_id)
+    if os.path.isfile(user):
+        return user
+    return find_system_desktop_path(desktop_id)
+
+
+def _backup_desktop_if_enabled(path, enabled):
+    if not enabled:
+        return
+    if not path or not os.path.isfile(path):
+        raise ApplyError("Backup failed; aborting to avoid an unrecoverable change.")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    base = os.path.basename(path)
+    if not is_valid_desktop_id(base):
+        raise ApplyError("Backup failed; invalid desktop id.")
+    dest = os.path.join(
+        BACKUP_DIR,
+        f"{base}.backup.{datetime.now().strftime('%Y%m%d%H%M%S')}.{os.getpid()}.{os.urandom(2).hex()}",
+    )
+    try:
+        shutil.copy2(path, dest)
+    except OSError as e:
+        raise ApplyError(f"Backup failed; aborting.\n{e}") from e
+
+
+def _render_icon_png(src, out_path, shape, magick):
+    size = 512
+    radius = 96
+    half = size // 2
+    work = tempfile.mkdtemp(prefix="kappicon-render-")
+    try:
+        tmp = os.path.join(work, "base.png")
+        staged = os.path.join(work, "out.png")
+        r = subprocess.run(
+            [
+                magick, src, "-background", "none", "-alpha", "set",
+                "-resize", f"{size}x{size}", "-gravity", "center",
+                "-extent", f"{size}x{size}", tmp,
+            ],
+            capture_output=True,
+        )
+        if r.returncode != 0 or not os.path.isfile(tmp):
+            raise ApplyError("Could not process this image.")
+        shape = (shape or "as-is").lower().strip()
+        if shape == "circle":
+            r = subprocess.run(
+                [
+                    magick, tmp,
+                    "(", "+clone", "-threshold", "-1", "-negate", "-fill", "white",
+                    "-draw", f"circle {half},{half} {half},0", ")",
+                    "-alpha", "off", "-compose", "copy_opacity", "-composite", staged,
+                ],
+                capture_output=True,
+            )
+        elif shape == "rounded":
+            r = subprocess.run(
+                [
+                    magick, tmp,
+                    "(", "-size", f"{size}x{size}", "xc:none", "-fill", "white",
+                    "-draw",
+                    f"roundrectangle 0,0 {size - 1},{size - 1} {radius},{radius}",
+                    ")",
+                    "-compose", "DstIn", "-composite", staged,
+                ],
+                capture_output=True,
+            )
+        else:
+            shutil.copy2(tmp, staged)
+            r = type("R", (), {"returncode": 0})()
+        if getattr(r, "returncode", 1) != 0 or not os.path.isfile(staged) or os.path.getsize(staged) == 0:
+            raise ApplyError(f"Could not process this image (shape: {shape}).")
+        _atomic_copy_file(staged, out_path)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _safe_label_from_desktop_id(desktop_id):
+    """Human-readable fragment only (not unique — pair with id hash)."""
+    base = desktop_id[:-8] if desktop_id.endswith(".desktop") else desktop_id
+    cleaned = "".join(c if c.isalnum() or c in "._+-" else "_" for c in base)
+    cleaned = cleaned.strip("_") or "app"
+    return cleaned[:48]
+
+
+def _file_sha256(path, extra=b""):
+    h = hashlib.sha256()
+    if extra:
+        h.update(extra)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 256), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def kappicon_theme_name(desktop_id, source_path, shape="as-is"):
+    """Collision-resistant, content-addressed Icon= name for custom assets.
+
+    - desktop-id hash prevents foo_bar vs foo bar collisions
+    - content+shape hash means re-applying a new image never overwrites the
+      previous asset, so Undo of Icon= still resolves the old pixmap
+    """
+    if not is_valid_desktop_id(desktop_id):
+        raise ApplyError(f"Invalid application id:\n{desktop_id}")
+    label = _safe_label_from_desktop_id(desktop_id)
+    id_hash = hashlib.sha256(desktop_id.encode("utf-8")).hexdigest()[:10]
+    shape = (shape or "as-is").lower().strip()
+    content = _file_sha256(
+        source_path,
+        extra=f"{shape}\0{desktop_id}".encode("utf-8"),
+    )[:12]
+    return f"kappicon-{label}-{id_hash}-{content}"
+
+
+def is_kappicon_icon_name(name):
+    """True if Icon= looks like a kAppIcon-managed hicolor asset."""
+    if not name or not isinstance(name, str):
+        return False
+    return bool(re.match(r"^kappicon-[A-Za-z0-9._+-]+$", name.strip()))
+
+
+def _install_hicolor_icon(icon_path, theme_name, magick):
+    """Install custom file into user hicolor; return freedesktop icon name."""
+    if not theme_name or any(c in theme_name for c in "/\\\n\r"):
+        raise ApplyError("Invalid theme icon name for install.")
+    hicolor = os.path.join(USER_ICONS_DIR, "hicolor")
+    ext = os.path.splitext(icon_path)[1].lower().lstrip(".")
+    if ext in ("svg", "svgz"):
+        dest_dir = os.path.join(hicolor, "scalable", "apps")
+        dest = os.path.join(dest_dir, f"{theme_name}.{ext}")
+        _atomic_copy_file(icon_path, dest)
+        return theme_name
+    if not magick:
+        raise ApplyError("ImageMagick is not installed (need magick or convert).")
+    for sz in (512, 256, 128, 64, 48):
+        dest_dir = os.path.join(hicolor, f"{sz}x{sz}", "apps")
+        dest = os.path.join(dest_dir, f"{theme_name}.png")
+        if sz == 512:
+            _atomic_copy_file(icon_path, dest)
+        else:
+            os.makedirs(dest_dir, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".png", dir=dest_dir)
+            os.close(fd)
+            try:
+                r = subprocess.run(
+                    [magick, icon_path, "-background", "none", "-resize", f"{sz}x{sz}", tmp],
+                    capture_output=True,
+                )
+                if r.returncode != 0 or not os.path.isfile(tmp):
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    continue
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, dest)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    if not os.path.isfile(os.path.join(hicolor, "512x512", "apps", f"{theme_name}.png")):
+        raise ApplyError("Failed to install icon into the hicolor theme.")
+    return theme_name
+
+
+def prepare_icon_value(selected_icon, desktop_id, shape="as-is"):
+    """Resolve selection to Icon= value (theme name or installed hicolor name)."""
+    if not selected_icon or selected_icon == "RESET":
+        raise ApplyError("No icon selected.")
+    shape = (shape or "as-is").lower().strip()
+    if shape not in ("as-is", "square", "rounded", "circle"):
+        shape = "as-is"
+    magick = find_magick_cmd()
+
+    if isinstance(selected_icon, str) and selected_icon.startswith(THEME_ICON_PREFIX):
+        name = selected_icon[len(THEME_ICON_PREFIX):]
+        if not name or any(c in name for c in "/\\\n\r"):
+            raise ApplyError("Invalid theme icon name.")
+        return name  # pure theme name — fidelity preserved
+
+    path = selected_icon
+    if not os.path.isfile(path):
+        raise ApplyError(f"Icon file not found:\n{path}")
+    path = os.path.realpath(path)
+    if not os.path.isfile(path):
+        raise ApplyError(f"Icon file not found after resolving symlink:\n{path}")
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    # Content-addressed name so Undo never points at an overwritten asset
+    theme_name = kappicon_theme_name(desktop_id, path, shape=shape)
+    # Staging render under TARGET_DIR (unique per theme_name)
+    png_out = os.path.join(TARGET_DIR, f"{theme_name}.png")
+
+    # As designed + SVG: keep vector (install scalable under theme_name)
+    if shape == "as-is" and ext in ("svg", "svgz"):
+        icon_file = path
+    else:
+        if not magick and ext not in ("png",):
+            if ext != "png" or shape not in ("as-is", "square"):
+                raise ApplyError("ImageMagick is not installed (need magick or convert).")
+        work = tempfile.mkdtemp(prefix="kappicon-src-")
+        try:
+            src_copy = os.path.join(work, f"source.{ext}")
+            shutil.copy2(path, src_copy)
+            raster_src = src_copy
+            if ext == "icns":
+                if not shutil.which("icns2png"):
+                    raise ApplyError(
+                        "icns2png is not installed (package: libicns / icnsutils)."
+                    )
+                subprocess.run(
+                    ["icns2png", "-x", src_copy],
+                    cwd=work, capture_output=True,
+                )
+                pngs = []
+                for name in os.listdir(work):
+                    if name.endswith(".png"):
+                        pngs.append(os.path.join(work, name))
+                if not pngs:
+                    raise ApplyError("Could not extract a valid PNG from this .icns file.")
+                pngs.sort(key=lambda p: os.path.getsize(p), reverse=True)
+                raster_src = pngs[0]
+            elif ext not in (
+                "png", "jpg", "jpeg", "webp", "bmp", "gif", "xpm", "svg", "svgz"
+            ):
+                raise ApplyError(
+                    f"Unsupported file type: .{ext}\nUse PNG, JPG, WEBP, SVG, or ICNS."
+                )
+            if shape == "as-is" and ext == "png" and not magick:
+                shutil.copy2(raster_src, png_out)
+            else:
+                if not magick:
+                    raise ApplyError("ImageMagick is not installed (need magick or convert).")
+                _render_icon_png(raster_src, png_out, shape, magick)
+            icon_file = png_out
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    return _install_hicolor_icon(icon_file, theme_name, magick)
+
+
+def _normalized_desktop_without_main_icon(path):
+    """Full .desktop text for comparison, stripping only Icon= in [Desktop Entry].
+
+    Keeps every other section (Desktop Action …, etc.) so Reset never treats
+    action customizations as “icon-only” and deletes them.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    out = []
+    in_entry = False
+    try:
+        with open(path, "r", errors="replace") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                stripped = line.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    in_entry = stripped == "[Desktop Entry]"
+                    out.append(stripped)
+                    continue
+                if in_entry and stripped.startswith("Icon="):
+                    continue
+                if stripped.startswith("#"):
+                    continue
+                # Preserve blank lines as empty markers for structure
+                out.append(stripped)
+    except OSError:
+        return None
+    # Drop trailing empties for stable compare
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+def user_override_only_differs_by_icon(user_path, system_path):
+    """True if user .desktop matches system except Icon= in [Desktop Entry].
+
+    Compares the entire file (all groups). Safe to delete override on Reset only
+    when no Desktop Actions or other sections were customized.
+    """
+    u = _normalized_desktop_without_main_icon(user_path)
+    s = _normalized_desktop_without_main_icon(system_path)
+    if u is None or s is None:
+        return False
+    return u == s
+
+
+def collect_referenced_kappicon_names():
+    """Icon= names starting with kappicon- still referenced by launchers or backups."""
+    refs = set()
+
+    def _add_from_desktop_file(path):
+        icon = read_desktop_icon_value(path)
+        if icon and is_kappicon_icon_name(icon):
+            refs.add(icon.strip())
+
+    if os.path.isdir(USER_APPS_DIR):
+        try:
+            names = os.listdir(USER_APPS_DIR)
+        except OSError:
+            names = []
+        for name in names:
+            if not is_valid_desktop_id(name):
+                continue
+            _add_from_desktop_file(os.path.join(USER_APPS_DIR, name))
+
+    # Backups must keep their assets: restore can revive an old Icon= after Undo ages out
+    if os.path.isdir(BACKUP_DIR):
+        try:
+            bnames = os.listdir(BACKUP_DIR)
+        except OSError:
+            bnames = []
+        for name in bnames:
+            if ".backup." not in name or os.path.sep in name or ".." in name:
+                continue
+            path = os.path.join(BACKUP_DIR, name)
+            if os.path.isfile(path):
+                _add_from_desktop_file(path)
+    return refs
+
+
+# Backup basenames: <desktop_id>.backup.<YYYYMMDDHHMMSS>.<pid>.<suffix>
+_BACKUP_NAME_RE = re.compile(
+    r"^(.+)\.backup\.(\d{14})\.(\d+)\.([A-Za-z0-9]+)$"
+)
+
+
+def parse_backup_desktop_id(backup_basename):
+    """Extract desktop id from a backup basename (handles ids containing '.backup.')."""
+    if not backup_basename or os.path.sep in backup_basename or ".." in backup_basename:
+        return None
+    m = _BACKUP_NAME_RE.match(backup_basename)
+    if not m:
+        return None
+    desktop_id = m.group(1)
+    if not is_valid_desktop_id(desktop_id):
+        return None
+    return desktop_id
+
+
+def prune_unreferenced_kappicon_assets(extra_keep=None):
+    """Remove kappicon-* assets not referenced by launchers, backups, or extra_keep.
+
+    Caller must hold apply_lock() so a concurrent apply cannot install an asset
+    that is not yet written to a launcher while we delete it.
+    """
+    keep = set(collect_referenced_kappicon_names())
+    if extra_keep:
+        for n in extra_keep:
+            if n and is_kappicon_icon_name(n):
+                keep.add(n.strip())
+    hicolor = os.path.join(USER_ICONS_DIR, "hicolor")
+    removed = 0
+    search_dirs = []
+    if os.path.isdir(hicolor):
+        try:
+            for entry in os.listdir(hicolor):
+                apps = os.path.join(hicolor, entry, "apps")
+                if os.path.isdir(apps):
+                    search_dirs.append(apps)
+        except OSError:
+            pass
+    if os.path.isdir(TARGET_DIR):
+        search_dirs.append(TARGET_DIR)
+    for apps in search_dirs:
+        try:
+            files = os.listdir(apps)
+        except OSError:
+            continue
+        for fn in files:
+            base, ext = os.path.splitext(fn)
+            if not is_kappicon_icon_name(base):
+                continue
+            if base in keep:
+                continue
+            path = os.path.join(apps, fn)
+            if not os.path.isfile(path):
+                continue
+            try:
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def snapshot_user_desktop(desktop_id):
+    """Bytes of user override or None if absent — for undo."""
+    path = os.path.join(USER_APPS_DIR, desktop_id)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def restore_user_desktop_snapshot(desktop_id, previous_bytes):
+    """Undo helper: restore prior file bytes or remove override."""
+    path = os.path.join(USER_APPS_DIR, desktop_id)
+    if previous_bytes is None:
+        if os.path.isfile(path):
+            try:
+                os.unlink(path)
+            except OSError as e:
+                raise ApplyError(f"Could not remove override:\n{e}") from e
+        return
+    _atomic_write_text(path, previous_bytes.decode("utf-8", errors="replace"))
+    try:
+        os.chmod(path, 0o644)
+    except OSError:
+        pass
+
+
+def apply_icon_to_desktop(desktop_id, selected_icon, *, shape="as-is", backup=False):
+    """
+    Apply icon or RESET to one app. Caller must hold apply_lock.
+    Returns dict with desktop_id, icon_value, previous_bytes, display path info.
+    """
+    if not is_valid_desktop_id(desktop_id):
+        raise ApplyError(f"Invalid application id:\n{desktop_id}")
+    if isinstance(selected_icon, str) and ("\n" in selected_icon or "\r" in selected_icon):
+        raise ApplyError("Invalid icon selection (control characters).")
+
+    previous_bytes = snapshot_user_desktop(desktop_id)
+    user_path = os.path.join(USER_APPS_DIR, desktop_id)
+    app_path = find_any_desktop_path(desktop_id)
+    if not app_path or not os.path.isfile(app_path):
+        raise ApplyError(f"Could not find desktop entry: {desktop_id}")
+
+    if selected_icon == "RESET":
+        _backup_desktop_if_enabled(user_path if os.path.isfile(user_path) else app_path, backup)
+        if not os.path.isfile(user_path):
+            return {
+                "desktop_id": desktop_id,
+                "icon_value": read_desktop_icon_value(app_path) or "",
+                "previous_bytes": previous_bytes,
+                "reset": True,
+                "noop": True,
+            }
+        sys_path = find_system_desktop_path(desktop_id)
+        if not sys_path:
+            # User-only launcher: no package default to restore (same as Overrides)
+            raise ApplyError(
+                "No system .desktop was found for this launcher.\n"
+                "Reset cannot invent an original icon for a user-only app.\n"
+                "Use a backup restore if you saved one, or set an icon on Map."
+            )
+        # Prefer removing a kAppIcon-only override so the launcher follows packages again
+        if user_override_only_differs_by_icon(user_path, sys_path):
+            try:
+                os.unlink(user_path)
+            except OSError as e:
+                raise ApplyError(f"Could not remove user override:\n{e}") from e
+            icon_value = read_desktop_icon_value(sys_path) or ""
+            return {
+                "desktop_id": desktop_id,
+                "icon_value": icon_value,
+                "previous_bytes": previous_bytes,
+                "reset": True,
+                "noop": False,
+                "removed_override": True,
+            }
+        # Preserve other customizations (actions, etc.): only restore Icon=
+        orig = read_desktop_icon_value(sys_path)
+        if orig:
+            set_desktop_icon_py(user_path, orig)
+            icon_value = orig
+        else:
+            clear_desktop_icon_py(user_path)
+            icon_value = ""
+        return {
+            "desktop_id": desktop_id,
+            "icon_value": icon_value,
+            "previous_bytes": previous_bytes,
+            "reset": True,
+            "noop": False,
+            "removed_override": False,
+        }
+
+    _backup_desktop_if_enabled(app_path, backup)
+    icon_value = prepare_icon_value(selected_icon, desktop_id, shape=shape)
+
+    # Ensure user copy exists
+    if app_path != user_path:
+        _atomic_copy_file(app_path, user_path)
+    try:
+        os.chmod(user_path, 0o644)
+    except OSError:
+        pass
+    set_desktop_icon_py(user_path, icon_value)
+    return {
+        "desktop_id": desktop_id,
+        "icon_value": icon_value,
+        "previous_bytes": previous_bytes,
+        "reset": False,
+        "noop": False,
+    }
+
+
+def undo_keep_icon_names(undo_stack):
+    """Parse Icon= from undo snapshots so prune does not delete still-revertable assets."""
+    keep = set()
+    for entry in undo_stack or []:
+        raw = entry.get("previous_bytes")
+        if not raw:
+            continue
+        try:
+            text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        except Exception:
+            continue
+        in_entry = False
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                in_entry = s == "[Desktop Entry]"
+                continue
+            if in_entry and s.startswith("Icon="):
+                name = s.split("=", 1)[1].strip()
+                if is_kappicon_icon_name(name):
+                    keep.add(name)
+                break
+    return keep
+
+
+_cache_refresh_timer = None
+
+
+def schedule_icon_cache_refresh(parent_widget=None):
+    """Debounce expensive cache tools; always runs after lock is released."""
+    global _cache_refresh_timer
+    app = QApplication.instance()
+
+    def _run():
+        cmds = [
+            ["kbuildsycoca6", "--noincremental"],
+            ["kbuildsycoca6"],
+            ["kbuildsycoca5", "--noincremental"],
+            ["kbuildsycoca5"],
+        ]
+        for cmd in cmds:
+            if not shutil.which(cmd[0]):
+                continue
+            try:
+                _run_host(cmd, capture_output=True, timeout=60)
+                break
+            except Exception:
+                continue
+        try:
+            _run_host(
+                ["update-desktop-database", USER_APPS_DIR],
+                capture_output=True, timeout=30,
+            )
+        except Exception:
+            pass
+        for p in (
+            os.path.join(USER_ICONS_DIR, "hicolor"),
+            os.path.expanduser("~/.icons"),
+            USER_ICONS_DIR,
+        ):
+            if os.path.isdir(p) and shutil.which("gtk-update-icon-cache"):
+                try:
+                    _run_host(
+                        ["gtk-update-icon-cache", "-f", "-t", p],
+                        capture_output=True, timeout=30,
+                    )
+                except Exception:
+                    pass
+
+    # Use QTimer when Qt is alive so we don't block the UI mid-click
+    if app is not None:
+        if _cache_refresh_timer is None:
+            _cache_refresh_timer = QTimer()
+            _cache_refresh_timer.setSingleShot(True)
+            _cache_refresh_timer.timeout.connect(_run)
+        _cache_refresh_timer.stop()
+        _cache_refresh_timer.start(350)
+    else:
+        _run()
 
 
 def collect_system_icons(app_data):
@@ -806,22 +1576,30 @@ def path_is_under(path, root):
     return real_path.startswith(prefix)
 
 
-def resolve_icon(icon_name):
+def resolve_icon(icon_name, size=28):
+    """Resolve Icon= to a QPixmap at roughly ``size`` pixels (theme name or file path)."""
     if not icon_name:
         return None
+    try:
+        size = max(16, int(size))
+    except (TypeError, ValueError):
+        size = 28
     if os.path.isabs(icon_name):
         if os.path.isfile(icon_name):
             pix = QPixmap(icon_name)
             if not pix.isNull():
-                return pix.scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio,
-                                  Qt.TransformationMode.SmoothTransformation)
+                return pix.scaled(
+                    size, size,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
         return None
     if any(c in icon_name for c in "/?#<>:\"|*"):
         return None
     from PyQt6.QtGui import QIcon
     theme_icon = QIcon.fromTheme(icon_name)
     if not theme_icon.isNull():
-        pix = theme_icon.pixmap(28, 28)
+        pix = theme_icon.pixmap(size, size)
         if not pix.isNull():
             return pix
     bases = [USER_ICONS_DIR]
@@ -833,14 +1611,17 @@ def resolve_icon(icon_name):
     bases.append("/usr/share/pixmaps")
     for base in bases:
         for theme in ("hicolor", "breeze", "Papirus", "Numix", "Adwaita"):
-            for size in ("48x48", "64x64", "256x256", "scalable"):
+            for sz in ("48x48", "64x64", "256x256", "scalable", "32x32", "22x22"):
                 for ext in (".png", ".svg", ".xpm"):
-                    candidate = os.path.join(base, theme, size, "apps", icon_name + ext)
+                    candidate = os.path.join(base, theme, sz, "apps", icon_name + ext)
                     if os.path.isfile(candidate):
                         pix = QPixmap(candidate)
                         if not pix.isNull():
-                            return pix.scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio,
-                                              Qt.TransformationMode.SmoothTransformation)
+                            return pix.scaled(
+                                size, size,
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation,
+                            )
     return None
 
 
@@ -1011,21 +1792,132 @@ def scan_user_launcher_overrides():
     return rows
 
 
+def _desktop_bool(value):
+    return (value or "").strip().lower() in ("1", "true", "yes")
+
+
+def _current_desktop_envs():
+    """Set of desktop ids from XDG_CURRENT_DESKTOP (colon-separated)."""
+    raw = os.environ.get("XDG_CURRENT_DESKTOP") or ""
+    return {e.strip() for e in raw.split(":") if e.strip()}
+
+
+def parse_desktop_launcher_meta(desktop_file):
+    """Fields needed to decide if a .desktop is a visible, user-runnable launcher.
+
+    Returns dict with keys: type, no_display, hidden, only_show_in, not_show_in,
+    exec, dbus_activatable, icon, name.
+    """
+    meta = {
+        "type": "Application",
+        "no_display": False,
+        "hidden": False,
+        "only_show_in": "",
+        "not_show_in": "",
+        "exec": "",
+        "dbus_activatable": False,
+        "icon": None,
+        "name": None,
+        "name_en": None,
+    }
+    in_entry = False
+    try:
+        with open(desktop_file, "r", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    in_entry = line == "[Desktop Entry]"
+                    continue
+                if not in_entry or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                val = val.strip()
+                if key == "Type" and not meta.get("_type_set"):
+                    meta["type"] = val or "Application"
+                    meta["_type_set"] = True
+                elif key == "NoDisplay":
+                    meta["no_display"] = _desktop_bool(val)
+                elif key == "Hidden":
+                    meta["hidden"] = _desktop_bool(val)
+                elif key == "OnlyShowIn" and not meta["only_show_in"]:
+                    meta["only_show_in"] = val
+                elif key == "NotShowIn" and not meta["not_show_in"]:
+                    meta["not_show_in"] = val
+                elif key == "Exec" and not meta["exec"]:
+                    meta["exec"] = val
+                elif key == "DBusActivatable":
+                    meta["dbus_activatable"] = _desktop_bool(val)
+                elif key == "Icon" and meta["icon"] is None:
+                    if val and not val.startswith(("http://", "https://", "ftp://", "data:")):
+                        if "?" not in val and "#" not in val:
+                            meta["icon"] = val
+                elif key == "Name" and meta["name"] is None:
+                    meta["name"] = val
+                elif key.startswith("Name[en") and meta["name_en"] is None:
+                    meta["name_en"] = val
+    except OSError:
+        pass
+    meta.pop("_type_set", None)
+    return meta
+
+
+def is_visible_user_launcher(desktop_file, meta=None):
+    """True if this .desktop should appear as a normal runnable app in menus.
+
+    Skips NoDisplay/Hidden helpers, non-Application types, entries with no
+    Exec/DBusActivatable, and apps excluded by OnlyShowIn/NotShowIn for the
+    current desktop environment.
+    """
+    if meta is None:
+        meta = parse_desktop_launcher_meta(desktop_file)
+    if (meta.get("type") or "Application") != "Application":
+        return False
+    if meta.get("no_display") or meta.get("hidden"):
+        return False
+    if not (meta.get("exec") or "").strip() and not meta.get("dbus_activatable"):
+        return False
+    envs = _current_desktop_envs()
+    not_show = meta.get("not_show_in") or ""
+    if not_show and envs:
+        banned = {e.strip() for e in not_show.split(";") if e.strip()}
+        if envs & banned:
+            return False
+    only = meta.get("only_show_in") or ""
+    if only and envs:
+        allowed = {e.strip() for e in only.split(";") if e.strip()}
+        if allowed and not (envs & allowed):
+            return False
+    return True
+
+
 def scan_apps_missing_icons(app_data):
-    """Apps whose Icon= is empty or does not resolve."""
+    """Visible, user-runnable apps whose Icon= is empty or does not resolve.
+
+    Hidden helpers (NoDisplay/Hidden), non-Application entries, and apps not
+    meant for this desktop are omitted — empty icons there are usually intentional.
+    """
     rows = []
     for desktop_id, icon_name, display_name, path in app_data:
         if not is_valid_desktop_id(desktop_id):
             continue
-        missing = not icon_resolves(icon_name)
-        if not missing:
+        if not path or not os.path.isfile(path):
             continue
+        meta = parse_desktop_launcher_meta(path)
+        if not is_visible_user_launcher(path, meta=meta):
+            continue
+        # Prefer Icon from the file we just read (same as app_data in practice)
+        icon = icon_name if icon_name is not None else meta.get("icon")
+        if icon_resolves(icon):
+            continue
+        display = display_name or meta.get("name") or meta.get("name_en") or desktop_id
         rows.append({
             "desktop_id": desktop_id,
             "path": path,
-            "display": display_name or desktop_id,
-            "icon": icon_name or "",
-            "reason": "No Icon=" if not (icon_name or "").strip() else "Icon not found",
+            "display": display,
+            "icon": icon or "",
+            "reason": "No Icon=" if not (icon or "").strip() else "Icon not found",
         })
     rows.sort(key=lambda r: (r["display"] or "").lower())
     return rows
@@ -1778,15 +2670,30 @@ class CombinedWindow(QMainWindow):
         self.installed_themes = discover_icon_themes()
         self._theme_icons_cache = {}  # theme path -> [(name, file_path), ...]
         self.icon_source = "files"  # "files" | "system" | "icontheme"
-        self.selected_file = None   # path or "theme:<name>"
+        self.selected_file = None   # path or "theme:<name>" (legacy exit protocol unused for Apply)
         self.selected_app = None
         self._preview_tmpdir = None
+        self._apply_busy = False
+        self._undo_stack = []  # list of {desktop_id, display, previous_bytes}
+        self._map_icon_size = int(self.settings.value("map/icon_size", 32) or 32)
+        if self._map_icon_size not in MAP_ICON_SIZES:
+            self._map_icon_size = 32
+        self._app_filter_mode = self.settings.value("map/app_filter_mode", "all", type=str) or "all"
+        if self._app_filter_mode not in ("all", "customized"):
+            self._app_filter_mode = "all"
+        self._missing_kind = self.settings.value("missing/kind", "all", type=str) or "all"
+        if self._missing_kind not in ("all", "empty", "unresolved"):
+            self._missing_kind = "all"
         self.initUI()
 
     def initUI(self):
         self.setWindowTitle("kAppIcon")
-        self.resize(920, 640)
+        # Restore window size when available (KDE: remember geometry lightly)
+        w = int(self.settings.value("window/width", 960) or 960)
+        h = int(self.settings.value("window/height", 680) or 680)
+        self.resize(max(720, w), max(520, h))
         self.setMinimumSize(720, 520)
+        self.setAcceptDrops(True)
 
         # Window icon (Breeze / hicolor / installed asset)
         wicon = theme_icon("preferences-desktop-icons", "applications-graphics", "kappicon")
@@ -1877,14 +2784,14 @@ class CombinedWindow(QMainWindow):
         exit_action.setStatusTip("Exit kAppIcon")
         exit_action.triggered.connect(self.close)
 
-        # Edit Menu (Create canvas history)
+        # Edit Menu — contextual Undo (Map apply stack vs Create canvas)
         edit_menu = menubar.addMenu("&Edit")
         self.undo_action = edit_menu.addAction("&Undo")
         self.undo_action.setIcon(theme_icon("edit-undo", "edit-undo"))
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
-        self.undo_action.setStatusTip("Undo the last Create-tab canvas change")
+        self.undo_action.setStatusTip("Undo the last icon apply (Map) or canvas edit (Create)")
         self.undo_action.setEnabled(False)
-        self.undo_action.triggered.connect(self._editor_undo)
+        self.undo_action.triggered.connect(self._contextual_undo)
 
         self.redo_action = edit_menu.addAction("&Redo")
         self.redo_action.setIcon(theme_icon("edit-redo", "edit-redo"))
@@ -1892,6 +2799,12 @@ class CombinedWindow(QMainWindow):
         self.redo_action.setStatusTip("Redo the last undone Create-tab change")
         self.redo_action.setEnabled(False)
         self.redo_action.triggered.connect(self._editor_redo)
+
+        self.undo_apply_action = edit_menu.addAction("Undo last &icon apply")
+        self.undo_apply_action.setIcon(theme_icon("edit-undo", "document-revert"))
+        self.undo_apply_action.setStatusTip("Restore the previous launcher icon from this session")
+        self.undo_apply_action.setEnabled(False)
+        self.undo_apply_action.triggered.connect(self._undo_last_apply)
 
         # Options Menu
         options_menu = menubar.addMenu("&Options")
@@ -1939,6 +2852,10 @@ class CombinedWindow(QMainWindow):
         about_qt_action.setIcon(theme_icon("qtlogo", "qt-logo"))
         about_qt_action.triggered.connect(QApplication.aboutQt)
 
+        # Session restore after widgets exist (source, filters, selection)
+        QTimer.singleShot(0, self._restore_map_session)
+        self._sync_undo_actions()
+
     def _on_tab_changed(self, index):
         """Refresh management tabs when shown; clear stale status tips."""
         if self.statusBar():
@@ -1948,6 +2865,7 @@ class CombinedWindow(QMainWindow):
             self._refresh_overrides_list()
         elif index == 4 and hasattr(self, "_refresh_missing_list"):
             self._refresh_missing_list()
+        self._sync_undo_actions()
 
     def _show_about_dialog(self):
         from PyQt6.QtWidgets import QMessageBox
@@ -1955,12 +2873,76 @@ class CombinedWindow(QMainWindow):
             self,
             "About kAppIcon",
             "<h3>kAppIcon</h3>"
-            "<p>Version 3.0.0</p>"
+            "<p>Version 3.1.0</p>"
             "<p>A Linux utility to change application icons, reuse theme icons from other apps, "
             "and design your own custom icons. Review overrides and find apps missing icons.</p>"
-            "<p>Designed for Plasma / Breeze, following freedesktop.org desktop entry specifications.</p>"
+            "<p>Designed for Plasma / Breeze, following freedesktop.org desktop entry specifications "
+            "and KDE Human Interface Guidelines for clear primary actions and safe bulk changes.</p>"
             "<p>License: MIT</p>"
         )
+
+    def _focus_is_text_editor(self):
+        """True when Ctrl+Z should edit text, not mutate launchers."""
+        w = QApplication.focusWidget()
+        while w is not None:
+            if isinstance(w, (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit)):
+                return True
+            if isinstance(w, QComboBox) and w.isEditable():
+                return True
+            w = w.parentWidget() if hasattr(w, "parentWidget") else None
+        return False
+
+    def _contextual_undo(self):
+        """Ctrl+Z: text field → Create canvas → Map apply only (never other tabs)."""
+        # Never steal text editing undos (Settings search, filters, names…)
+        if self._focus_is_text_editor():
+            w = QApplication.focusWidget()
+            if w is not None and hasattr(w, "undo"):
+                try:
+                    w.undo()
+                except Exception:
+                    pass
+            return
+        tab = self.main_tabs.currentIndex() if hasattr(self, "main_tabs") else -1
+        # Create: canvas history
+        if (
+            tab == 1
+            and hasattr(self, "pixel_canvas")
+            and self.pixel_canvas.can_undo()
+        ):
+            self._editor_undo()
+            return
+        # Map only: launcher apply undo (HIG: no surprise mutations on other tabs)
+        if tab == 0:
+            self._undo_last_apply()
+            return
+        # Settings / Overrides / Missing: do nothing
+
+    def _sync_undo_actions(self):
+        canvas_undo = (
+            hasattr(self, "pixel_canvas") and self.pixel_canvas.can_undo()
+        )
+        apply_undo = bool(self._undo_stack) and not self._apply_busy
+        tab = self.main_tabs.currentIndex() if hasattr(self, "main_tabs") else -1
+        on_create = tab == 1
+        on_map = tab == 0
+        if hasattr(self, "undo_action"):
+            if on_create:
+                self.undo_action.setEnabled(canvas_undo)
+                self.undo_action.setStatusTip("Undo the last Create-tab canvas change")
+            elif on_map:
+                self.undo_action.setEnabled(apply_undo)
+                self.undo_action.setStatusTip("Undo the last icon apply in this session")
+            else:
+                self.undo_action.setEnabled(False)
+                self.undo_action.setStatusTip("Undo is available on Map (icon apply) or Create (canvas)")
+        if hasattr(self, "undo_apply_action"):
+            # Explicit menu item always undoes apply when stack non-empty (user intent)
+            self.undo_apply_action.setEnabled(apply_undo)
+        if hasattr(self, "redo_action"):
+            self.redo_action.setEnabled(
+                on_create and hasattr(self, "pixel_canvas") and self.pixel_canvas.can_redo()
+            )
 
     # ── Map tab ──────────────────────────────────────────────────────────
     def _build_map_tab(self, parent):
@@ -1999,6 +2981,17 @@ class CombinedWindow(QMainWindow):
         )
         self.src_combo.currentIndexChanged.connect(self._on_src_combo)
         src_row.addWidget(self.src_combo, stretch=1)
+        # List density (KDE: comfortable viewing without a separate “mode”)
+        src_row.addWidget(QLabel("Size:"))
+        self.map_size_combo = QComboBox()
+        self.map_size_combo.addItem("Compact", 32)
+        self.map_size_combo.addItem("Comfortable", 48)
+        self.map_size_combo.addItem("Large", 64)
+        idx_sz = self.map_size_combo.findData(self._map_icon_size)
+        self.map_size_combo.setCurrentIndex(idx_sz if idx_sz >= 0 else 0)
+        self.map_size_combo.setToolTip("Icon size in the Map lists")
+        self.map_size_combo.currentIndexChanged.connect(self._on_map_icon_size_changed)
+        src_row.addWidget(self.map_size_combo)
         ib.addLayout(src_row)
 
         # Theme pack picker (only when source = From icon theme)
@@ -2039,13 +3032,15 @@ class CombinedWindow(QMainWindow):
         self.file_search.setClearButtonEnabled(True)
         self.file_search.setPlaceholderText("Filter icons…")
         self.file_search.setProperty("setClearButtonEnabled", True)
-        self.file_search.textChanged.connect(self._filter_files)
+        self.file_search.textChanged.connect(self._on_file_search_changed)
         ib.addWidget(self.file_search)
 
         self.file_list = QListWidget()
-        self.file_list.setIconSize(QSize(32, 32))
+        self.file_list.setIconSize(QSize(self._map_icon_size, self._map_icon_size))
         self.file_list.setAlternatingRowColors(True)
         self.file_list.setUniformItemSizes(True)
+        self.file_list.setAcceptDrops(True)
+        self.file_list.viewport().setAcceptDrops(True)
         self.file_list.currentItemChanged.connect(self._on_file_select)
         self.file_list.itemClicked.connect(self._on_file_item_clicked)
         self._fill_file_list(self.icon_files)
@@ -2054,26 +3049,44 @@ class CombinedWindow(QMainWindow):
 
         app_box = QGroupBox("2. Application to change")
         ab = QVBoxLayout(app_box)
-        ab.addWidget(make_hint_label("This application’s launcher icon will be replaced."))
+        ab.addWidget(make_hint_label(
+            "This application’s launcher icon will be replaced. "
+            "Ctrl/Shift-click to select several apps, then Apply once."
+        ))
 
+        app_filt_row = QHBoxLayout()
         self.app_search = QLineEdit()
         self.app_search.setClearButtonEnabled(True)
         self.app_search.setPlaceholderText("Filter applications…")
-        self.app_search.textChanged.connect(self._filter_apps)
-        ab.addWidget(self.app_search)
+        self.app_search.textChanged.connect(self._on_app_search_changed)
+        app_filt_row.addWidget(self.app_search, stretch=1)
+        self.app_scope_combo = QComboBox()
+        self.app_scope_combo.addItem("All apps", "all")
+        self.app_scope_combo.addItem("Customized only", "customized")
+        sc_idx = self.app_scope_combo.findData(self._app_filter_mode)
+        self.app_scope_combo.setCurrentIndex(sc_idx if sc_idx >= 0 else 0)
+        self.app_scope_combo.setToolTip(
+            "Customized only: apps that already have a user .desktop override"
+        )
+        self.app_scope_combo.currentIndexChanged.connect(self._on_app_scope_changed)
+        app_filt_row.addWidget(self.app_scope_combo)
+        ab.addLayout(app_filt_row)
 
         self.app_list = QListWidget()
-        self.app_list.setIconSize(QSize(32, 32))
+        self.app_list.setIconSize(QSize(self._map_icon_size, self._map_icon_size))
         self.app_list.setAlternatingRowColors(True)
         self.app_list.setUniformItemSizes(True)
+        # ExtendedSelection: single click still selects one; Ctrl/Shift for batch (HIG)
+        self.app_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.app_list.currentItemChanged.connect(lambda *_: self._update_mapping_summary())
+        self.app_list.itemSelectionChanged.connect(self._update_mapping_summary)
         for desktop_name, icon_name, display_name, _path in self.app_data:
             item = QListWidgetItem(display_name)
             item.setData(Qt.ItemDataRole.UserRole, desktop_name)
             item.setData(Qt.ItemDataRole.UserRole + 1, display_name)
             item.setData(Qt.ItemDataRole.UserRole + 2, icon_name)
             item.setToolTip(f"Will modify: {display_name}\nDesktop file: {desktop_name}")
-            pix = resolve_icon(icon_name)
+            pix = resolve_icon(icon_name, size=self._map_icon_size)
             if pix:
                 item.setIcon(QIcon(pix))
             self.app_list.addItem(item)
@@ -2152,12 +3165,17 @@ class CombinedWindow(QMainWindow):
         self.select_btn.setText("Apply")
         self.select_btn.setEnabled(False)
         self.select_btn.setIcon(theme_icon("dialog-ok-apply", "dialog-ok"))
-        self.select_btn.setToolTip("Apply the selected icon to the selected application")
+        self.select_btn.setToolTip(
+            "Apply the selected icon without closing the window"
+        )
 
-        self.reset_btn = self.button_box.addButton("Reset to default", QDialogButtonBox.ButtonRole.ActionRole)
+        self.reset_btn = self.button_box.addButton("Reset to system icon", QDialogButtonBox.ButtonRole.ActionRole)
         self.reset_btn.setIcon(theme_icon("edit-clear-all", "edit-undo", "document-revert"))
         self.reset_btn.setEnabled(False)
-        self.reset_btn.setToolTip("Restore this application’s original icon")
+        self.reset_btn.setToolTip(
+            "Restore the package/system icon when a system .desktop exists "
+            "(same as Overrides → Reset to system icon)"
+        )
         self.reset_btn.clicked.connect(self._reset_app_icon)
 
         close_btn = self.button_box.button(QDialogButtonBox.StandardButton.Close)
@@ -2187,6 +3205,50 @@ class CombinedWindow(QMainWindow):
         data = self.src_combo.currentData()
         if data:
             self._set_icon_source(data)
+            self.settings.setValue("map/icon_source", data)
+
+    def _on_map_icon_size_changed(self, _idx=None):
+        if not hasattr(self, "map_size_combo"):
+            return
+        size = self.map_size_combo.currentData()
+        if size is None:
+            return
+        self._map_icon_size = int(size)
+        self.settings.setValue("map/icon_size", self._map_icon_size)
+        if hasattr(self, "file_list"):
+            self.file_list.setIconSize(QSize(self._map_icon_size, self._map_icon_size))
+        if hasattr(self, "app_list"):
+            self.app_list.setIconSize(QSize(self._map_icon_size, self._map_icon_size))
+            # Refresh app row icons at new size
+            for i in range(self.app_list.count()):
+                item = self.app_list.item(i)
+                icon_name = item.data(Qt.ItemDataRole.UserRole + 2)
+                pix = resolve_icon(icon_name, size=self._map_icon_size) if icon_name else None
+                if pix:
+                    item.setIcon(QIcon(pix))
+        # Re-fill current icon source so file list icons match
+        if self.icon_source == "files":
+            self._fill_file_list(self.icon_files)
+        elif self.icon_source == "system":
+            self._fill_system_list()
+        else:
+            self._fill_icontheme_list()
+
+    def _on_app_scope_changed(self, _idx=None):
+        if not hasattr(self, "app_scope_combo"):
+            return
+        mode = self.app_scope_combo.currentData() or "all"
+        self._app_filter_mode = mode
+        self.settings.setValue("map/app_filter_mode", mode)
+        self._filter_apps(self.app_search.text() if hasattr(self, "app_search") else "")
+
+    def _on_file_search_changed(self, text):
+        self.settings.setValue("map/icon_filter", text)
+        self._filter_files(text)
+
+    def _on_app_search_changed(self, text):
+        self.settings.setValue("map/app_filter", text)
+        self._filter_apps(text)
 
     def _on_dialog_button(self, button):
         if self.button_box.buttonRole(button) == QDialogButtonBox.ButtonRole.ApplyRole:
@@ -2313,9 +3375,12 @@ class CombinedWindow(QMainWindow):
         )
         rl.addWidget(self.editor_name)
 
+        # Neither Save is setDefault — they are peer actions in a side panel.
+        # Accenting only the first made “Save and use in Map” look secondary by mistake.
         save_btn = QPushButton("Save icon")
         save_btn.setIcon(theme_icon("document-save", "document-save-as"))
-        save_btn.setDefault(True)
+        save_btn.setAutoDefault(False)
+        save_btn.setDefault(False)
         save_btn.setToolTip(
             "Save the canvas as a PNG in your icon library.\n"
             "Does not change any application."
@@ -2327,6 +3392,8 @@ class CombinedWindow(QMainWindow):
         use_row.setSpacing(4)
         use_btn = QPushButton("Save and use in Map")
         use_btn.setIcon(theme_icon("go-next", "dialog-ok-apply"))
+        use_btn.setAutoDefault(False)
+        use_btn.setDefault(False)
         use_btn.setToolTip(
             "Save the icon, switch to Map, and select it so you can assign it to an app."
         )
@@ -2415,10 +3482,8 @@ class CombinedWindow(QMainWindow):
             self.undo_btn.setEnabled(can_u)
         if hasattr(self, "redo_btn"):
             self.redo_btn.setEnabled(can_r)
-        if hasattr(self, "undo_action"):
-            self.undo_action.setEnabled(can_u)
-        if hasattr(self, "redo_action"):
-            self.redo_action.setEnabled(can_r)
+        # Menu Undo is contextual (Create canvas vs Map apply stack)
+        self._sync_undo_actions()
 
     def _editor_undo(self):
         # Only act when Create tab is visible (avoid surprising Map)
@@ -2503,7 +3568,8 @@ class CombinedWindow(QMainWindow):
             self,
             "Import image for icon",
             DOWNLOADS_DIR_DEFAULT,
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.PNG *.JPG *.WEBP);;All files (*)",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.svg *.svgz "
+            "*.PNG *.JPG *.JPEG *.WEBP *.SVG);;All files (*)",
         )
         if not path:
             return
@@ -2724,8 +3790,8 @@ class CombinedWindow(QMainWindow):
             
             "<h3>🛠️ Resetting & Library Maintenance</h3>"
             "<ul>"
-            "<li><b>Reset launcher icon</b>: Select any application in the Map tab and click <b>Reset to default</b>. "
-            "This will restore its original system-defined icon while preserving any other custom configuration.</li>"
+            "<li><b>Reset launcher icon</b>: Select any application in the Map tab and click <b>Reset to system icon</b>. "
+            "This restores the package icon when a system .desktop exists; other custom desktop sections are preserved.</li>"
             "<li><b>Delete custom designs</b>: In the Create tab under <i>Your Icons</i>, select any icon and click <b>Delete</b> "
             "to permanently delete the file from your local icon library.</li>"
             "<li><b>Backups</b>: In the Settings tab, you can enable auto-backups or revert overrides using the backup restorer.</li>"
@@ -2983,7 +4049,8 @@ class CombinedWindow(QMainWindow):
         layout.addWidget(make_hint_label(
             "System apps whose icons you changed (user .desktop with a different Icon=). "
             "Steam/game shortcuts and other user-only launchers are hidden. "
-            "Reset restores the system icon when possible."
+            "The right panel shows your current icon and the original system icon "
+            "that Reset will restore."
         ))
 
         filt_row = QHBoxLayout()
@@ -2998,20 +4065,85 @@ class CombinedWindow(QMainWindow):
         filt_row.addWidget(refresh)
         layout.addLayout(filt_row)
 
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.setChildrenCollapsible(False)
+
+        # Left: override list
+        left = QWidget()
+        left_l = QVBoxLayout(left)
+        left_l.setContentsMargins(0, 0, 0, 0)
+        left_l.setSpacing(layout_spacing())
         self.overrides_list = QListWidget()
         self.overrides_list.setIconSize(QSize(32, 32))
         self.overrides_list.setAlternatingRowColors(True)
         self.overrides_list.itemDoubleClicked.connect(
             lambda _i: self._overrides_open_in_map()
         )
-        layout.addWidget(self.overrides_list, stretch=1)
+        left_l.addWidget(self.overrides_list, stretch=1)
+        body.addWidget(left)
+
+        # Right: current vs original (system) icon preview
+        right = QWidget()
+        right.setMinimumWidth(220)
+        right_l = QVBoxLayout(right)
+        right_l.setContentsMargins(0, 0, 0, 0)
+        right_l.setSpacing(layout_spacing())
+
+        self.overrides_title = QLabel("Select an override")
+        title_font = self.overrides_title.font()
+        title_font.setBold(True)
+        self.overrides_title.setFont(title_font)
+        self.overrides_title.setWordWrap(True)
+        right_l.addWidget(self.overrides_title)
+
+        compare = QHBoxLayout()
+        compare.setSpacing(layout_spacing())
+
+        cur_box = QGroupBox("Current (yours)")
+        cur_l = QVBoxLayout(cur_box)
+        self.overrides_current_icon = QLabel("—")
+        self.overrides_current_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.overrides_current_icon.setMinimumSize(96, 96)
+        self.overrides_current_icon.setFrameShape(QFrame.Shape.StyledPanel)
+        self.overrides_current_icon.setFrameShadow(QFrame.Shadow.Sunken)
+        cur_l.addWidget(self.overrides_current_icon, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.overrides_current_meta = make_hint_label("")
+        self.overrides_current_meta.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.overrides_current_meta.setWordWrap(True)
+        cur_l.addWidget(self.overrides_current_meta)
+        compare.addWidget(cur_box, stretch=1)
+
+        orig_box = QGroupBox("Original (system)")
+        orig_l = QVBoxLayout(orig_box)
+        self.overrides_original_icon = QLabel("—")
+        self.overrides_original_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.overrides_original_icon.setMinimumSize(96, 96)
+        self.overrides_original_icon.setFrameShape(QFrame.Shape.StyledPanel)
+        self.overrides_original_icon.setFrameShadow(QFrame.Shadow.Sunken)
+        self.overrides_original_icon.setToolTip(
+            "This is the icon restored when you click Reset to system icon"
+        )
+        orig_l.addWidget(self.overrides_original_icon, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.overrides_original_meta = make_hint_label("")
+        self.overrides_original_meta.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.overrides_original_meta.setWordWrap(True)
+        orig_l.addWidget(self.overrides_original_meta)
+        compare.addWidget(orig_box, stretch=1)
+
+        right_l.addLayout(compare)
 
         self.overrides_detail = QLabel("")
         self.overrides_detail.setWordWrap(True)
         self.overrides_detail.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        layout.addWidget(self.overrides_detail)
+        right_l.addWidget(self.overrides_detail)
+        right_l.addStretch(1)
+        body.addWidget(right)
+        body.setStretchFactor(0, 3)
+        body.setStretchFactor(1, 2)
+        layout.addWidget(body, stretch=1)
+
         self.overrides_list.currentItemChanged.connect(
             lambda cur, _prev: self._overrides_show_detail(cur)
         )
@@ -3023,7 +4155,9 @@ class CombinedWindow(QMainWindow):
         open_map.clicked.connect(self._overrides_open_in_map)
         reset_btn = QPushButton("Reset to system icon")
         reset_btn.setIcon(theme_icon("edit-clear-all", "edit-undo", "document-revert"))
-        reset_btn.setToolTip("Remove your custom icon and restore the system default")
+        reset_btn.setToolTip(
+            "Remove your custom icon and restore the original system icon (shown on the right)"
+        )
         reset_btn.clicked.connect(self._overrides_reset_selected)
         btn_row.addWidget(open_map)
         btn_row.addWidget(reset_btn)
@@ -3035,6 +4169,20 @@ class CombinedWindow(QMainWindow):
         layout.addWidget(self.overrides_status)
         self._refresh_overrides_list()
 
+    def _set_override_preview_label(self, label, icon_name, empty_text="—"):
+        """Paint a resolved icon into a preview QLabel (or a placeholder)."""
+        label.clear()
+        label.setText("")
+        label.setPixmap(QPixmap())
+        if not icon_name:
+            label.setText(empty_text)
+            return
+        pix = resolve_icon(icon_name, size=96)
+        if pix and not pix.isNull():
+            label.setPixmap(pix)
+        else:
+            label.setText("?")
+
     def _refresh_overrides_list(self):
         if not hasattr(self, "overrides_list"):
             return
@@ -3043,11 +4191,16 @@ class CombinedWindow(QMainWindow):
         for row in rows:
             label = row["display"]
             icon_val = row["icon"] or "(no Icon=)"
+            sys_icon = row.get("system_icon") or "(empty)"
             item = QListWidgetItem(f"{label}")
             item.setData(Qt.ItemDataRole.UserRole, row)
             item.setToolTip(
-                f"{row['desktop_id']}\nIcon={icon_val}\n{row['path']}"
+                f"{row['desktop_id']}\n"
+                f"Current Icon={icon_val}\n"
+                f"Original Icon={sys_icon}\n"
+                f"{row['path']}"
             )
+            # List row shows the current (custom) icon
             pix = resolve_icon(row["icon"]) if row["icon"] else None
             if pix:
                 item.setIcon(QIcon(pix))
@@ -3059,7 +4212,11 @@ class CombinedWindow(QMainWindow):
             f"{n} icon override(s) (customized system apps)"
             if n else "No icon overrides yet — change an app on Map to see it here"
         )
-        self._filter_overrides_list(self.overrides_search.text() if hasattr(self, "overrides_search") else "")
+        self._filter_overrides_list(
+            self.overrides_search.text() if hasattr(self, "overrides_search") else ""
+        )
+        # Clear right panel when list is rebuilt
+        self._overrides_show_detail(self.overrides_list.currentItem())
 
     def _filter_overrides_list(self, text=""):
         if not hasattr(self, "overrides_list"):
@@ -3072,28 +4229,61 @@ class CombinedWindow(QMainWindow):
                 row.get("display", ""),
                 row.get("desktop_id", ""),
                 row.get("icon", ""),
+                row.get("system_icon", ""),
                 row.get("path", ""),
             ]).lower()
             item.setHidden(bool(q) and q not in hay)
 
     def _overrides_show_detail(self, item):
+        if not hasattr(self, "overrides_detail"):
+            return
         if not item:
+            if hasattr(self, "overrides_title"):
+                self.overrides_title.setText("Select an override")
+            self._set_override_preview_label(self.overrides_current_icon, None)
+            self._set_override_preview_label(self.overrides_original_icon, None)
+            if hasattr(self, "overrides_current_meta"):
+                self.overrides_current_meta.setText("")
+            if hasattr(self, "overrides_original_meta"):
+                self.overrides_original_meta.setText("")
             self.overrides_detail.setText("")
             return
+
         row = item.data(Qt.ItemDataRole.UserRole) or {}
-        lines = [
-            f"<b>{row.get('display', '')}</b> — <code>{row.get('desktop_id', '')}</code>",
-            f"User file: <code>{row.get('path', '')}</code>",
-            f"Icon=: <code>{row.get('icon') or '(empty)'}</code>"
-            + (" ✓" if row.get("icon_ok") else " (missing/unresolved)"),
-        ]
+        display = row.get("display", "") or row.get("desktop_id", "")
+        self.overrides_title.setText(display)
+
+        cur_icon = row.get("icon") or ""
+        sys_icon = row.get("system_icon") or ""
+        self._set_override_preview_label(
+            self.overrides_current_icon, cur_icon or None, empty_text="(none)"
+        )
+        self.overrides_current_meta.setText(
+            f"<code>{cur_icon or '(empty)'}</code>"
+            + ("" if row.get("icon_ok") else " · unresolved")
+        )
+
         if row.get("system_path"):
-            lines.append(
-                f"System: <code>{row['system_path']}</code> · "
-                f"Icon=<code>{row.get('system_icon') or '(empty)'}</code>"
+            self._set_override_preview_label(
+                self.overrides_original_icon, sys_icon or None, empty_text="(none)"
+            )
+            self.overrides_original_meta.setText(
+                f"<code>{sys_icon or '(empty)'}</code><br/>Restored on Reset"
             )
         else:
-            lines.append("No matching system .desktop found (user-only launcher).")
+            self._set_override_preview_label(
+                self.overrides_original_icon, None, empty_text="n/a"
+            )
+            self.overrides_original_meta.setText("No system .desktop")
+
+        lines = [
+            f"<code>{row.get('desktop_id', '')}</code>",
+            f"User: <code>{row.get('path', '')}</code>",
+        ]
+        if row.get("system_path"):
+            lines.append(f"System: <code>{row['system_path']}</code>")
+        else:
+            lines.append("No matching system .desktop (user-only launcher).")
         self.overrides_detail.setText("<br/>".join(lines))
 
     def _overrides_selected_row(self):
@@ -3133,9 +4323,32 @@ class CombinedWindow(QMainWindow):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        self.selected_file = "RESET"
-        self.selected_app = row["desktop_id"]
-        self.close()
+        # In-process reset — keep window open (same engine as Map)
+        desktop = row["desktop_id"]
+        display = row.get("display") or desktop
+        try:
+            self._set_apply_busy(True)
+            with apply_lock():
+                result = apply_icon_to_desktop(
+                    desktop, "RESET",
+                    shape=self._shape_pref(),
+                    backup=self._backup_pref(),
+                )
+            if not result.get("noop"):
+                self._push_undo(desktop, display, result.get("previous_bytes"))
+            self._update_app_list_icon(desktop, result.get("icon_value") or "")
+            schedule_icon_cache_refresh(self)
+            self._refresh_overrides_list()
+            if self.statusBar():
+                self.statusBar().showMessage(
+                    f"Reset {display} to the system icon", 6000
+                )
+        except ApplyError as e:
+            QMessageBox.warning(self, "Reset failed", str(e))
+        except Exception as e:
+            QMessageBox.warning(self, "Reset failed", str(e))
+        finally:
+            self._set_apply_busy(False)
 
     # ── Missing icons tab ────────────────────────────────────────────────
     def _build_missing_tab(self, parent):
@@ -3144,8 +4357,9 @@ class CombinedWindow(QMainWindow):
         layout.setSpacing(layout_spacing())
 
         layout.addWidget(make_hint_label(
-            "Installed apps whose Icon= is empty or does not resolve in your themes. "
-            "Use Open in Map to assign a working icon."
+            "Visible, runnable apps (shown in menus) whose Icon= is empty or does not "
+            "resolve. Hidden helpers and system services are omitted — empty icons there "
+            "are usually intentional. Use Open in Map to assign a working icon."
         ))
 
         filt_row = QHBoxLayout()
@@ -3154,6 +4368,17 @@ class CombinedWindow(QMainWindow):
         self.missing_search.setPlaceholderText("Filter apps…")
         self.missing_search.textChanged.connect(self._filter_missing_list)
         filt_row.addWidget(self.missing_search, stretch=1)
+        self.missing_kind_combo = QComboBox()
+        self.missing_kind_combo.addItem("All problems", "all")
+        self.missing_kind_combo.addItem("Empty Icon= only", "empty")
+        self.missing_kind_combo.addItem("Unresolved name only", "unresolved")
+        mk = self.missing_kind_combo.findData(self._missing_kind)
+        self.missing_kind_combo.setCurrentIndex(mk if mk >= 0 else 0)
+        self.missing_kind_combo.setToolTip(
+            "Empty: no Icon= line value. Unresolved: name set but not found in themes."
+        )
+        self.missing_kind_combo.currentIndexChanged.connect(self._on_missing_kind_changed)
+        filt_row.addWidget(self.missing_kind_combo)
         refresh = QPushButton("Refresh")
         refresh.setIcon(theme_icon("view-refresh", "system-reboot"))
         refresh.clicked.connect(self._refresh_missing_list)
@@ -3190,6 +4415,16 @@ class CombinedWindow(QMainWindow):
         layout.addWidget(self.missing_status)
         self._refresh_missing_list()
 
+    def _on_missing_kind_changed(self, _idx=None):
+        if not hasattr(self, "missing_kind_combo"):
+            return
+        kind = self.missing_kind_combo.currentData() or "all"
+        self._missing_kind = kind
+        self.settings.setValue("missing/kind", kind)
+        self._filter_missing_list(
+            self.missing_search.text() if hasattr(self, "missing_search") else ""
+        )
+
     def _refresh_missing_list(self):
         if not hasattr(self, "missing_list"):
             return
@@ -3204,11 +4439,6 @@ class CombinedWindow(QMainWindow):
             )
             item.setIcon(warn_icon)
             self.missing_list.addItem(item)
-        n = self.missing_list.count()
-        self.missing_status.setText(
-            f"{n} app(s) with missing or unresolved icons"
-            if n else "All scanned apps have a resolvable Icon="
-        )
         self._filter_missing_list(
             self.missing_search.text() if hasattr(self, "missing_search") else ""
         )
@@ -3217,6 +4447,8 @@ class CombinedWindow(QMainWindow):
         if not hasattr(self, "missing_list"):
             return
         q = (text or "").lower().strip()
+        kind = getattr(self, "_missing_kind", "all")
+        visible = 0
         for i in range(self.missing_list.count()):
             item = self.missing_list.item(i)
             row = item.data(Qt.ItemDataRole.UserRole) or {}
@@ -3226,7 +4458,23 @@ class CombinedWindow(QMainWindow):
                 row.get("icon", ""),
                 row.get("reason", ""),
             ]).lower()
-            item.setHidden(bool(q) and q not in hay)
+            reason = row.get("reason") or ""
+            kind_ok = True
+            if kind == "empty":
+                kind_ok = reason.startswith("No Icon")
+            elif kind == "unresolved":
+                kind_ok = "not found" in reason.lower() or reason == "Icon not found"
+            text_ok = (not q) or (q in hay)
+            hide = not (kind_ok and text_ok)
+            item.setHidden(hide)
+            if not hide:
+                visible += 1
+        if hasattr(self, "missing_status"):
+            self.missing_status.setText(
+                f"{visible} visible app(s) with missing or unresolved icons"
+                if visible
+                else "No matching apps — try another filter or Refresh"
+            )
 
     def _missing_show_detail(self, item):
         if not item:
@@ -3249,36 +4497,70 @@ class CombinedWindow(QMainWindow):
         self._jump_to_map_app(row.get("desktop_id"))
 
     def _jump_to_map_app(self, desktop_id):
-        """Switch to Map and select the given application id."""
+        """Switch to Map and select the given application in step 2.
+
+        Selection is deferred until after the Map tab is shown. Selecting a
+        QListWidget item while its parent tab is still hidden often fails to
+        apply current-item highlight and scroll, which made Open in Map look
+        like a no-op.
+        """
         if not desktop_id or not hasattr(self, "app_list"):
             return
         self.main_tabs.setCurrentIndex(0)
-        if hasattr(self, "app_search"):
-            self.app_search.clear()
-        # Ensure all rows visible then select
-        for i in range(self.app_list.count()):
-            self.app_list.item(i).setHidden(False)
-        found = None
-        for i in range(self.app_list.count()):
-            item = self.app_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == desktop_id:
-                found = item
-                break
-        if found:
+
+        def _select():
+            if not hasattr(self, "app_list"):
+                return
+            # Clear filter so the target row is not left hidden
+            if hasattr(self, "app_search"):
+                # Block signals while clearing so we control visibility below
+                self.app_search.blockSignals(True)
+                self.app_search.clear()
+                self.app_search.blockSignals(False)
+            for i in range(self.app_list.count()):
+                self.app_list.item(i).setHidden(False)
+
+            found = None
+            for i in range(self.app_list.count()):
+                item = self.app_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == desktop_id:
+                    found = item
+                    break
+
+            if not found:
+                QMessageBox.information(
+                    self,
+                    "App not in Map list",
+                    f"Could not find {desktop_id} in the Map application list.\n"
+                    "It may be hidden or not loaded at startup.",
+                )
+                return
+
             self.app_list.setCurrentItem(found)
-            self.app_list.scrollToItem(found)
+            self.app_list.setCurrentRow(self.app_list.row(found))
+            self.app_list.scrollToItem(
+                found, QListWidget.ScrollHint.PositionAtCenter
+            )
+            self.app_list.setFocus(Qt.FocusReason.OtherFocusReason)
+            # Keep only this app (and name-collisions) visible so selection is obvious
+            if hasattr(self, "app_search"):
+                stem = desktop_id[:-8] if desktop_id.endswith(".desktop") else desktop_id
+                self.app_search.setText(stem)
+            self._update_mapping_summary()
+            label = found.text() or desktop_id
             if self.statusBar():
                 self.statusBar().showMessage(
-                    f"Selected {found.text()} — pick an icon and Apply",
-                    8000,
+                    f"Map step 2: selected {label} ({desktop_id}) — pick an icon in step 1, then Apply",
+                    10000,
                 )
-        else:
-            QMessageBox.information(
-                self,
-                "App not in Map list",
-                f"Could not find {desktop_id} in the Map application list.\n"
-                "It may be hidden or not loaded at startup.",
-            )
+            if hasattr(self, "plan_label") and self.plan_label is not None:
+                self.plan_label.setText(
+                    f"Application selected: <b>{label}</b> "
+                    f"(<code>{desktop_id}</code>). Choose an icon in step 1, then Apply."
+                )
+
+        # After tab switch / layout so highlight + scroll actually take effect
+        QTimer.singleShot(0, _select)
 
     # ── Settings callbacks ───────────────────────────────────────────────
     def _on_theme(self, theme):
@@ -3432,15 +4714,19 @@ class CombinedWindow(QMainWindow):
             item = QListWidgetItem(os.path.basename(fp))
             item.setData(Qt.ItemDataRole.UserRole, fp)
             ext = os.path.splitext(fp)[1].lower()
-            if ext == ".png":
+            sz = getattr(self, "_map_icon_size", 32)
+            if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".svg", ".svgz"):
                 pix = QPixmap(fp)
                 if not pix.isNull():
-                    item.setIcon(QIcon(pix.scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio,
-                                                   Qt.TransformationMode.SmoothTransformation)))
+                    item.setIcon(QIcon(pix.scaled(
+                        sz, sz,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )))
             else:
                 ti = QIcon.fromTheme("image-x-generic")
                 if not ti.isNull():
-                    item.setIcon(QIcon(ti.pixmap(28, 28)))
+                    item.setIcon(QIcon(ti.pixmap(sz, sz)))
             self.file_list.addItem(item)
 
     def _fill_system_list(self):
@@ -3564,7 +4850,7 @@ class CombinedWindow(QMainWindow):
             self._browse_for_icon_file()
 
     def _browse_for_icon_file(self):
-        """Open a file browser so the user can pick an .icns/.png from anywhere.
+        """Open a file browser for any supported icon/image format.
 
         Prefers kdialog on KDE (native open dialog — same stack as Dolphin),
         then Qt's dialog. The selected file is added to the list so it can be
@@ -3572,6 +4858,11 @@ class CombinedWindow(QMainWindow):
         """
         start = self._icon_start_dir()
         path = None
+        # Keep kdialog filter in sync with ICON_EXTENSIONS / Qt dialog
+        kdialog_filter = (
+            "*.png *.jpg *.jpeg *.webp *.svg *.svgz *.icns *.bmp *.gif *.xpm "
+            "*.PNG *.JPG *.JPEG *.WEBP *.SVG *.ICNS|Icons and images\n*|All files"
+        )
 
         if shutil.which("kdialog"):
             try:
@@ -3580,7 +4871,7 @@ class CombinedWindow(QMainWindow):
                         "kdialog",
                         "--title", "Select icon file",
                         "--getopenfilename", start,
-                        "*.icns *.png *.ICNS *.PNG|Icon files\n*|All files",
+                        kdialog_filter,
                     ],
                     capture_output=True, text=True, timeout=600,
                 )
@@ -3595,7 +4886,9 @@ class CombinedWindow(QMainWindow):
                 self,
                 "Select icon file",
                 start,
-                "Icon files (*.icns *.png *.ICNS *.PNG);;All files (*)",
+                "Icons and images (*.png *.jpg *.jpeg *.webp *.svg *.svgz *.icns "
+                "*.bmp *.gif *.xpm *.PNG *.JPG *.JPEG *.WEBP *.SVG *.ICNS);;"
+                "All files (*)",
             )
             if chosen and os.path.isfile(chosen):
                 path = chosen
@@ -3610,7 +4903,9 @@ class CombinedWindow(QMainWindow):
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self, "Unsupported file",
-                f"Please choose an .icns or .png file.\n\nGot: {ext or '(no extension)'}",
+                "Please choose a supported icon/image file.\n"
+                "PNG, JPG, WEBP, SVG, ICNS, BMP, GIF, XPM.\n\n"
+                f"Got: {ext or '(no extension)'}",
             )
             return
 
@@ -3701,8 +4996,8 @@ class CombinedWindow(QMainWindow):
             QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
             return
         src = os.path.join(backup_dir, choice)
-        desktop_name = choice.split(".backup.")[0]
-        if not is_valid_desktop_id(desktop_name):
+        desktop_name = parse_backup_desktop_id(choice)
+        if not desktop_name:
             self._restore_status.setText("Invalid desktop id in backup name")
             QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
             return
@@ -3711,36 +5006,49 @@ class CombinedWindow(QMainWindow):
         try:
             if not os.path.isfile(src) or not path_is_under(src, backup_dir):
                 raise OSError("backup path escaped backup directory")
-            os.makedirs(dest_dir, exist_ok=True)
-            # Atomic restore: copy to temp sibling then replace
-            fd, tmp = tempfile.mkstemp(prefix=".kappicon-restore-", dir=dest_dir)
-            os.close(fd)
+            if self._apply_busy:
+                raise ApplyError("Another icon operation is in progress.")
+            display = self.desktop_labels.get(desktop_name, desktop_name)
+            self._set_apply_busy(True)
             try:
-                shutil.copy2(src, tmp)
-                os.chmod(tmp, 0o644)
-                os.replace(tmp, dest)
-            except Exception:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-            for cmd in (["kbuildsycoca6"], ["kbuildsycoca5"]):
-                try:
-                    _run_host(cmd, capture_output=True, timeout=10)
-                    break
-                except Exception:
-                    continue
-            try:
-                _run_host(
-                    ["update-desktop-database", dest_dir],
-                    capture_output=True, timeout=10,
-                )
-            except Exception:
-                pass
+                with apply_lock():
+                    # Snapshot under the lock so Undo matches the pre-replace state
+                    prev = snapshot_user_desktop(desktop_name)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    # Atomic restore: copy to temp sibling then replace
+                    fd, tmp = tempfile.mkstemp(prefix=".kappicon-restore-", dir=dest_dir)
+                    os.close(fd)
+                    try:
+                        shutil.copy2(src, tmp)
+                        os.chmod(tmp, 0o644)
+                        os.replace(tmp, dest)
+                    except Exception:
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                        raise
+                self._push_undo(desktop_name, display, prev)
+                icon_now = read_desktop_icon_value(dest) or ""
+                self._update_app_list_icon(desktop_name, icon_now)
+                schedule_icon_cache_refresh(self)
+                if hasattr(self, "_refresh_overrides_list"):
+                    QTimer.singleShot(0, self._refresh_overrides_list)
+            finally:
+                self._set_apply_busy(False)
             self._restore_status.setText("Restored!")
             QTimer.singleShot(2000, lambda: self._restore_status.setText(""))
+            if self.statusBar():
+                self.statusBar().showMessage(
+                    f"Restored {desktop_name} from backup (Undo reverses this)",
+                    6000,
+                )
+        except ApplyError as e:
+            self._set_apply_busy(False)
+            self._restore_status.setText(f"Failed: {e}")
+            QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
         except Exception as e:
+            self._set_apply_busy(False)
             self._restore_status.setText(f"Failed: {e}")
             QTimer.singleShot(3000, lambda: self._restore_status.setText(""))
 
@@ -3849,17 +5157,34 @@ class CombinedWindow(QMainWindow):
 
     def _update_mapping_summary(self):
         """Keep the right-hand “icon → app” story in sync with both lists."""
-        ai = self.app_list.currentItem() if hasattr(self, "app_list") else None
+        if self._apply_busy:
+            return
+        selected_apps = self._selected_map_apps() if hasattr(self, "app_list") else []
+        ai = None
+        if selected_apps:
+            ai = selected_apps[0]
+        elif hasattr(self, "app_list"):
+            ai = self.app_list.currentItem()
+            if ai and ai.isHidden():
+                ai = None
         fi = self.file_list.currentItem() if hasattr(self, "file_list") else None
+        n_apps = len(selected_apps) if selected_apps else (1 if ai else 0)
 
         # Target app card
-        if ai:
+        if n_apps > 1:
+            self.target_name_label.setText(f"{n_apps} applications selected")
+            self.target_meta_label.setText(
+                "Ctrl/Shift-click to change the selection. Apply updates all of them."
+            )
+            self.target_icon_label.clear()
+            self.target_icon_label.setText(str(n_apps))
+        elif ai:
             desktop = ai.data(Qt.ItemDataRole.UserRole)
             display = ai.data(Qt.ItemDataRole.UserRole + 1) or ai.text()
             cur_icon = ai.data(Qt.ItemDataRole.UserRole + 2)
             self.target_name_label.setText(display)
             self.target_meta_label.setText(f"Desktop file: {desktop}")
-            pix = resolve_icon(cur_icon)
+            pix = resolve_icon(cur_icon, size=48)
             if pix:
                 self.target_icon_label.setPixmap(
                     pix.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
@@ -3887,26 +5212,30 @@ class CombinedWindow(QMainWindow):
                 else:
                     icon_desc = os.path.basename(str(data))
 
-        # Always keep the button caption short; long names go in plan + tooltip.
-        self.select_btn.setText("Apply")
-        if icon_ok and ai:
-            display = ai.data(Qt.ItemDataRole.UserRole + 1) or ai.text()
-            self.plan_label.setText(
-                f"Will set {display}'s launcher icon to {icon_desc}."
-            )
+        # Short caption; details in plan + tooltip (HIG)
+        if n_apps > 1:
+            self.select_btn.setText(f"Apply to {n_apps} apps")
+        else:
+            self.select_btn.setText("Apply")
+        if icon_ok and n_apps:
+            if n_apps > 1:
+                self.plan_label.setText(
+                    f"Will set {n_apps} launcher icons to {icon_desc}."
+                )
+                self.select_btn.setToolTip(f"Apply {icon_desc} to {n_apps} apps")
+            else:
+                display = ai.data(Qt.ItemDataRole.UserRole + 1) or ai.text()
+                self.plan_label.setText(
+                    f"Will set {display}'s launcher icon to {icon_desc}."
+                )
+                self.select_btn.setToolTip(f"Apply to {display} (window stays open)")
             self.select_btn.setEnabled(True)
             self.select_btn.setDefault(True)
-            self.select_btn.setToolTip(f"Apply to {display}")
-            if self.statusBar() and self.main_tabs.currentIndex() == 0:
-                self.statusBar().showMessage(
-                    f"Ready: apply {icon_desc} → {display}",
-                    8000,
-                )
         elif icon_ok:
             self.plan_label.setText("Now select the application to change (step 2).")
             self.select_btn.setEnabled(False)
             self.select_btn.setToolTip("Select an application first")
-        elif ai:
+        elif n_apps:
             self.plan_label.setText("Now select the icon to use (step 1).")
             self.select_btn.setEnabled(False)
             self.select_btn.setToolTip("Select an icon first")
@@ -3914,7 +5243,24 @@ class CombinedWindow(QMainWindow):
             self.plan_label.setText("Select an icon (step 1) and an application (step 2).")
             self.select_btn.setEnabled(False)
             self.select_btn.setToolTip("Select an icon and an application")
-        self.reset_btn.setEnabled(bool(ai))
+        # Reset only when at least one selected app has a system .desktop to restore
+        can_reset = False
+        if n_apps and not self._apply_busy:
+            for it in (selected_apps if selected_apps else ([ai] if ai else [])):
+                desk = it.data(Qt.ItemDataRole.UserRole) if it else None
+                if desk and find_system_desktop_path(desk):
+                    can_reset = True
+                    break
+        self.reset_btn.setEnabled(can_reset)
+        if n_apps and not can_reset and not self._apply_busy:
+            self.reset_btn.setToolTip(
+                "No system .desktop for the selected app(s) — cannot reset a user-only launcher"
+            )
+        elif can_reset:
+            self.reset_btn.setToolTip(
+                "Restore the package/system icon when a system .desktop exists "
+                "(same as Overrides → Reset to system icon)"
+            )
 
     def _filter_files(self, text):
         q = text.lower()
@@ -3934,7 +5280,9 @@ class CombinedWindow(QMainWindow):
             item.setHidden(q not in hay if q else False)
 
     def _filter_apps(self, text):
-        q = text.lower()
+        q = (text or "").lower()
+        mode = getattr(self, "_app_filter_mode", "all")
+        recents = set(self._load_recent_list("map/recent_apps"))
         for i in range(self.app_list.count()):
             item = self.app_list.item(i)
             hay = item.text().lower()
@@ -3942,59 +5290,446 @@ class CombinedWindow(QMainWindow):
             hay += " " + str(desktop).lower()
             tip = item.toolTip() or ""
             hay += " " + tip.lower()
-            item.setHidden(q not in hay if q else False)
+            text_ok = (not q) or (q in hay)
+            scope_ok = True
+            if mode == "customized":
+                user_path = os.path.join(USER_APPS_DIR, str(desktop))
+                scope_ok = os.path.isfile(user_path)
+            # Recents stay visible when searching empty + all (sorted by paint order later not needed)
+            item.setHidden(not (text_ok and scope_ok))
+            # Soft boost: prefix recent marker in tooltip only
+            if desktop in recents and not (item.toolTip() or "").startswith("Recent:"):
+                item.setToolTip(f"Recent · {item.toolTip() or desktop}")
 
-    def _accept(self):
-        fi = self.file_list.currentItem()
-        ai = self.app_list.currentItem()
-        if not fi or not ai:
-            return
+    def _selected_map_apps(self):
+        """Visible selected app items (batch-safe)."""
+        if not hasattr(self, "app_list"):
+            return []
+        out = []
+        for item in self.app_list.selectedItems():
+            if item.isHidden():
+                continue
+            desktop = item.data(Qt.ItemDataRole.UserRole)
+            if desktop and is_valid_desktop_id(desktop):
+                out.append(item)
+        return out
+
+    def _current_icon_spec(self):
+        """Return icon selection string (theme:… or path), or None / BROWSE_FOR_ICON."""
+        fi = self.file_list.currentItem() if hasattr(self, "file_list") else None
+        if not fi:
+            return None
         data = fi.data(Qt.ItemDataRole.UserRole)
-        desktop = ai.data(Qt.ItemDataRole.UserRole)
         if data == BROWSE_FOR_ICON or not data:
+            return BROWSE_FOR_ICON
+        if isinstance(data, str) and data.startswith(THEME_ICON_PREFIX):
+            theme_name = data[len(THEME_ICON_PREFIX):]
+            if not theme_name or any(c in theme_name for c in "/\\\n\r"):
+                return None
+            return data
+        if isinstance(data, str) and os.path.isfile(data):
+            return data
+        return None
+
+    def _shape_pref(self):
+        return self.settings.value("icons/shape", "as-is", type=str) or "as-is"
+
+    def _backup_pref(self):
+        return bool(self.settings.value("backups/enabled", False, type=bool))
+
+    def _set_apply_busy(self, busy):
+        self._apply_busy = bool(busy)
+        for name in ("select_btn", "reset_btn"):
+            w = getattr(self, name, None)
+            if w is not None and not busy:
+                pass  # re-enabled via summary
+            elif w is not None and busy:
+                w.setEnabled(False)
+        self._sync_undo_actions()
+        if not busy:
+            self._update_mapping_summary()
+
+    def _push_undo(self, desktop_id, display, previous_bytes):
+        self._undo_stack.append({
+            "desktop_id": desktop_id,
+            "display": display or desktop_id,
+            "previous_bytes": previous_bytes,
+        })
+        if len(self._undo_stack) > APPLY_UNDO_MAX:
+            self._undo_stack = self._undo_stack[-APPLY_UNDO_MAX:]
+        self._sync_undo_actions()
+
+    def _undo_last_apply(self):
+        if self._apply_busy or not self._undo_stack:
+            return
+        entry = self._undo_stack.pop()
+        self._sync_undo_actions()
+        desktop_id = entry["desktop_id"]
+        display = entry.get("display") or desktop_id
+        try:
+            with apply_lock():
+                restore_user_desktop_snapshot(desktop_id, entry.get("previous_bytes"))
+                # Prune under the same lock (no concurrent apply can race the keep-set)
+                try:
+                    prune_unreferenced_kappicon_assets(
+                        extra_keep=undo_keep_icon_names(self._undo_stack)
+                    )
+                except Exception:
+                    pass
+            schedule_icon_cache_refresh(self)
+            # Refresh list icon from desktop
+            icon_now = read_desktop_icon_value(
+                find_any_desktop_path(desktop_id) or ""
+            )
+            self._update_app_list_icon(desktop_id, icon_now)
+            if self.statusBar():
+                self.statusBar().showMessage(
+                    f"Undid icon change for {display}", 6000
+                )
+            if hasattr(self, "plan_label"):
+                self.plan_label.setText(f"Undid last apply for <b>{display}</b>.")
+            if hasattr(self, "_refresh_overrides_list"):
+                self._refresh_overrides_list()
+        except ApplyError as e:
+            QMessageBox.warning(self, "Undo failed", str(e))
+            # put back so user can retry
+            self._undo_stack.append(entry)
+            self._sync_undo_actions()
+        except Exception as e:
+            QMessageBox.warning(self, "Undo failed", str(e))
+            self._undo_stack.append(entry)
+            self._sync_undo_actions()
+
+    def _update_app_list_icon(self, desktop_id, icon_name):
+        if not hasattr(self, "app_list"):
+            return
+        for i in range(self.app_list.count()):
+            item = self.app_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == desktop_id:
+                item.setData(Qt.ItemDataRole.UserRole + 2, icon_name or "")
+                pix = resolve_icon(icon_name, size=self._map_icon_size) if icon_name else None
+                if pix:
+                    item.setIcon(QIcon(pix))
+                else:
+                    item.setIcon(theme_icon("image-missing", "dialog-warning"))
+                break
+        # Keep app_data in sync for Missing scan
+        for idx, row in enumerate(self.app_data):
+            if row[0] == desktop_id:
+                self.app_data[idx] = (row[0], icon_name or "", row[2], row[3])
+                break
+        self.desktop_paths[desktop_id] = os.path.join(USER_APPS_DIR, desktop_id)
+
+    def _remember_recent_icon(self, icon_spec):
+        if not icon_spec or icon_spec == BROWSE_FOR_ICON:
+            return
+        key = "map/recent_icons"
+        items = self._load_recent_list(key)
+        s = str(icon_spec)
+        items = [x for x in items if x != s]
+        items.insert(0, s)
+        self._save_recent_list(key, items[:RECENT_MAX])
+
+    def _remember_recent_app(self, desktop_id):
+        if not desktop_id:
+            return
+        key = "map/recent_apps"
+        items = self._load_recent_list(key)
+        items = [x for x in items if x != desktop_id]
+        items.insert(0, desktop_id)
+        self._save_recent_list(key, items[:RECENT_MAX])
+
+    def _load_recent_list(self, key):
+        raw = self.settings.value(key, [])
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = [raw] if raw else []
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(x) for x in raw if x]
+
+    def _save_recent_list(self, key, items):
+        # QSettings list of strings is portable enough
+        self.settings.setValue(key, list(items))
+
+    def _apply_icon_specs(self, icon_spec, app_items, *, confirm_batch=True):
+        """In-process apply to one or more apps. Window stays open."""
+        if self._apply_busy:
+            return
+        if not icon_spec or icon_spec == BROWSE_FOR_ICON:
             if self.icon_source == "files":
                 self._browse_for_icon_file()
             return
-        if not desktop or not is_valid_desktop_id(desktop):
+        if not app_items:
             return
-        if isinstance(data, str) and data.startswith(THEME_ICON_PREFIX):
-            theme_name = data[len(THEME_ICON_PREFIX):]
-            # Theme icon names must not smuggle path separators into Icon=
-            if not theme_name or any(c in theme_name for c in "/\\\n\r"):
+
+        n = len(app_items)
+        if n > 1 and confirm_batch:
+            names = ", ".join(
+                (it.data(Qt.ItemDataRole.UserRole + 1) or it.text())
+                for it in app_items[:5]
+            )
+            extra = f" and {n - 5} more" if n > 5 else ""
+            confirm = QMessageBox.question(
+                self,
+                "Apply to multiple apps?",
+                f"Apply this icon to <b>{n}</b> applications?\n\n{names}{extra}\n\n"
+                "You can undo each change from Edit → Undo last icon apply.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
                 return
-            self.selected_file = data
-            self.selected_app = desktop
-            self.close()
+
+        shape = self._shape_pref()
+        backup = self._backup_pref()
+        self._set_apply_busy(True)
+        ok = 0
+        errors = []
+        try:
+            for item in app_items:
+                desktop = item.data(Qt.ItemDataRole.UserRole)
+                display = item.data(Qt.ItemDataRole.UserRole + 1) or item.text()
+                try:
+                    with apply_lock():
+                        result = apply_icon_to_desktop(
+                            desktop, icon_spec, shape=shape, backup=backup
+                        )
+                        # Undo snapshot before prune so keep-set includes it
+                        if not result.get("noop"):
+                            self._push_undo(
+                                desktop, display, result.get("previous_bytes")
+                            )
+                        try:
+                            prune_unreferenced_kappicon_assets(
+                                extra_keep=undo_keep_icon_names(self._undo_stack)
+                            )
+                        except Exception:
+                            pass
+                    self._update_app_list_icon(desktop, result.get("icon_value") or "")
+                    self._remember_recent_app(desktop)
+                    ok += 1
+                except ApplyError as e:
+                    errors.append(f"{display}: {e}")
+                except Exception as e:
+                    errors.append(f"{display}: {e}")
+            self._remember_recent_icon(icon_spec)
+            schedule_icon_cache_refresh(self)
+            if hasattr(self, "_refresh_overrides_list"):
+                # Defer so we don't rebuild mid-lock UI thrash
+                QTimer.singleShot(0, self._refresh_overrides_list)
+            if hasattr(self, "_refresh_missing_list"):
+                QTimer.singleShot(0, self._refresh_missing_list)
+        finally:
+            self._set_apply_busy(False)
+
+        if ok and self.statusBar():
+            if n == 1:
+                disp = app_items[0].data(Qt.ItemDataRole.UserRole + 1) or app_items[0].text()
+                self.statusBar().showMessage(
+                    f"Applied icon to {disp} — window stays open for more changes",
+                    8000,
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"Applied icon to {ok}/{n} applications", 8000
+                )
+        if ok and hasattr(self, "plan_label"):
+            if n == 1:
+                disp = app_items[0].data(Qt.ItemDataRole.UserRole + 1) or app_items[0].text()
+                self.plan_label.setText(
+                    f"Applied to <b>{disp}</b>. Pick another app or icon, or Undo."
+                )
+            else:
+                self.plan_label.setText(
+                    f"Applied to <b>{ok}</b> app(s). Edit → Undo last icon apply reverts one at a time."
+                )
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Some applies failed",
+                "\n".join(errors[:12]) + ("\n…" if len(errors) > 12 else ""),
+            )
+
+    def _accept(self):
+        """Apply without closing (in-process). Supports multi-select batch."""
+        if self._apply_busy:
             return
-        if not isinstance(data, str) or not os.path.isfile(data):
+        icon_spec = self._current_icon_spec()
+        if icon_spec == BROWSE_FOR_ICON:
+            if self.icon_source == "files":
+                self._browse_for_icon_file()
             return
-        self.selected_file = data
-        self.selected_app = desktop
-        self.close()
+        if not icon_spec:
+            return
+        apps = self._selected_map_apps()
+        if not apps:
+            # Fall back to current item if selection empty but current exists
+            ai = self.app_list.currentItem() if hasattr(self, "app_list") else None
+            if ai and not ai.isHidden():
+                apps = [ai]
+        if not apps:
+            return
+        self._apply_icon_specs(icon_spec, apps)
 
     def _reset_app_icon(self):
-        ai = self.app_list.currentItem()
-        if not ai:
+        if self._apply_busy:
             return
-        desktop = ai.data(Qt.ItemDataRole.UserRole)
-        if not desktop or not is_valid_desktop_id(desktop):
+        apps = self._selected_map_apps()
+        if not apps:
+            ai = self.app_list.currentItem() if hasattr(self, "app_list") else None
+            if ai and not ai.isHidden():
+                apps = [ai]
+        if not apps:
             return
-        display = ai.data(Qt.ItemDataRole.UserRole + 1) or ai.text()
-        from PyQt6.QtWidgets import QMessageBox
+        # Pre-filter: only apps with a system desktop (match Overrides UX)
+        resettable = []
+        skipped = []
+        for it in apps:
+            desk = it.data(Qt.ItemDataRole.UserRole)
+            disp = it.data(Qt.ItemDataRole.UserRole + 1) or it.text()
+            if desk and find_system_desktop_path(desk):
+                resettable.append(it)
+            else:
+                skipped.append(disp)
+        if not resettable:
+            QMessageBox.information(
+                self,
+                "Cannot reset",
+                "No system .desktop was found for the selected application(s).\n"
+                "Reset cannot invent an original icon for a user-only launcher.\n"
+                "Use a backup restore if you saved one, or assign an icon on Map.",
+            )
+            return
+        if len(resettable) == 1:
+            display = resettable[0].data(Qt.ItemDataRole.UserRole + 1) or resettable[0].text()
+            msg = f"Reset “{display}” to the system icon?"
+        else:
+            msg = f"Reset {len(resettable)} application(s) to their system icons?"
+        if skipped:
+            msg += (
+                f"\n\nSkipped (no system .desktop): {', '.join(skipped[:5])}"
+                + ("…" if len(skipped) > 5 else "")
+            )
         confirm = QMessageBox.question(
             self,
-            "Reset Icon?",
-            f"Are you sure you want to reset {display}'s icon to the default system icon?",
+            "Reset to system icon?",
+            msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.No,
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        self.selected_file = "RESET"
-        self.selected_app = desktop
-        self.close()
+        self._apply_icon_specs("RESET", resettable, confirm_batch=False)
+
+    def _restore_map_session(self):
+        """Restore source, theme, filters, last selection (silent, post-build)."""
+        src = self.settings.value("map/icon_source", "", type=str) or ""
+        if src in ("files", "system", "icontheme") and hasattr(self, "src_combo"):
+            idx = self.src_combo.findData(src)
+            if idx >= 0:
+                self.src_combo.blockSignals(True)
+                self.src_combo.setCurrentIndex(idx)
+                self.src_combo.blockSignals(False)
+                self._set_icon_source(src)
+        theme_path = self.settings.value("map/icon_theme_path", "", type=str) or ""
+        if theme_path and hasattr(self, "theme_combo"):
+            tidx = self.theme_combo.findData(theme_path)
+            if tidx >= 0:
+                self.theme_combo.setCurrentIndex(tidx)
+        icon_f = self.settings.value("map/icon_filter", "", type=str) or ""
+        app_f = self.settings.value("map/app_filter", "", type=str) or ""
+        if hasattr(self, "file_search") and icon_f:
+            self.file_search.blockSignals(True)
+            self.file_search.setText(icon_f)
+            self.file_search.blockSignals(False)
+            self._filter_files(icon_f)
+        if hasattr(self, "app_search") and app_f:
+            self.app_search.blockSignals(True)
+            self.app_search.setText(app_f)
+            self.app_search.blockSignals(False)
+        self._filter_apps(app_f if hasattr(self, "app_search") else "")
+        last_app = self.settings.value("map/last_app", "", type=str) or ""
+        if last_app and hasattr(self, "app_list"):
+            for i in range(self.app_list.count()):
+                item = self.app_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == last_app and not item.isHidden():
+                    self.app_list.setCurrentItem(item)
+                    self.app_list.scrollToItem(item)
+                    break
+        last_icon = self.settings.value("map/last_icon", "", type=str) or ""
+        if last_icon and hasattr(self, "file_list"):
+            for i in range(self.file_list.count()):
+                item = self.file_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == last_icon and not item.isHidden():
+                    self.file_list.setCurrentItem(item)
+                    self.file_list.scrollToItem(item)
+                    break
+        self._update_mapping_summary()
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData() and event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                if path and os.path.splitext(path)[1].lower() in ICON_EXTENSIONS | IMAGE_IMPORT_EXTENSIONS:
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        """Drop image → select on Map (or load into Create). Never auto-applies."""
+        paths = []
+        if event.mimeData() and event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                if path and os.path.isfile(path):
+                    ext = os.path.splitext(path)[1].lower()
+                    if ext in ICON_EXTENSIONS | IMAGE_IMPORT_EXTENSIONS:
+                        paths.append(path)
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        path = paths[0]
+        # Create tab focused → canvas; else Map icon selection
+        if hasattr(self, "main_tabs") and self.main_tabs.currentIndex() == 1:
+            if hasattr(self, "pixel_canvas"):
+                self.pixel_canvas.load_from_file(path, fit=True, size=STANDARD_ICON_SIZE)
+                self.pixel_canvas.mark_clean()
+                if hasattr(self, "editor_name") and not self.editor_name.text().strip():
+                    self.editor_name.setText(os.path.splitext(os.path.basename(path))[0])
+                if self.statusBar():
+                    self.statusBar().showMessage(
+                        f"Imported {os.path.basename(path)} into Create", 5000
+                    )
+            return
+        self.main_tabs.setCurrentIndex(0)
+        self._set_icon_source("files")
+        self._add_icon_file(path)
+        if self.statusBar():
+            self.statusBar().showMessage(
+                f"Selected {os.path.basename(path)} — choose an app, then Apply",
+                6000,
+            )
 
     def closeEvent(self, event):
+        # Persist light session state
+        try:
+            self.settings.setValue("window/width", self.width())
+            self.settings.setValue("window/height", self.height())
+            if hasattr(self, "app_list") and self.app_list.currentItem():
+                self.settings.setValue(
+                    "map/last_app",
+                    self.app_list.currentItem().data(Qt.ItemDataRole.UserRole) or "",
+                )
+            if hasattr(self, "file_list") and self.file_list.currentItem():
+                data = self.file_list.currentItem().data(Qt.ItemDataRole.UserRole)
+                if data and data != BROWSE_FOR_ICON:
+                    self.settings.setValue("map/last_icon", data)
+        except Exception:
+            pass
         if self._preview_tmpdir:
             shutil.rmtree(self._preview_tmpdir, ignore_errors=True)
         super().closeEvent(event)
@@ -4093,21 +5828,22 @@ elif not icon_files:
         "folder under Settings → Source Folder.",
     )
 
+# Apply / reset run in-process while the window is open (no close-to-apply).
+# Optional legacy RESULT lines kept for rare external drivers; normally empty.
 app.exec()
 
 if win.selected_file and win.selected_app:
     print(win.selected_file)
     print(win.selected_app)
     print("BACKUP=1" if settings.value("backups/enabled", False, type=bool) else "BACKUP=0")
-else:
-    sys.exit(1)
+sys.exit(0)
 PYEOF
 )
 PY_STATUS=$?
 
-# Exit if cancelled (user closed window without mapping)
-if [ $PY_STATUS -ne 0 ] || [ -z "$RESULT" ]; then
-    if [ $PY_STATUS -ne 0 ] && [ $PY_STATUS -ne 1 ]; then
+# GUI owns apply now. Non-zero only means a hard failure (e.g. missing PyQt6).
+if [ $PY_STATUS -ne 0 ]; then
+    if [ $PY_STATUS -ne 1 ]; then
         echo "❌ GUI failed (exit $PY_STATUS). Is PyQt6 installed? Try: python3 -c 'import PyQt6'"
         exit 1
     fi
@@ -4115,13 +5851,13 @@ if [ $PY_STATUS -ne 0 ] || [ -z "$RESULT" ]; then
     exit 0
 fi
 
-# Parse GUI result carefully (paths may contain spaces; must not contain newlines)
+# Legacy close-to-apply RESULT (usually empty — Apply keeps the window open)
 SELECTED_ICON=$(printf '%s\n' "$RESULT" | sed -n '1p')
 SELECTED_APP=$(printf '%s\n' "$RESULT" | sed -n '2p')
 BACKUP_ENABLED=$(printf '%s\n' "$RESULT" | sed -n '3p' | cut -d= -f2)
 
 if [ -z "$SELECTED_ICON" ] || [ -z "$SELECTED_APP" ]; then
-    echo "Cancelled."
+    # Normal path after in-process applies
     exit 0
 fi
 
@@ -4227,10 +5963,6 @@ PY
 fi
 
 # 2. Resolve Icon= value — theme name or converted custom file
-APP_CLEAN_NAME=$(basename -- "$SELECTED_APP" .desktop)
-APP_CLEAN_NAME=$(printf '%s' "$APP_CLEAN_NAME" | tr -c 'A-Za-z0-9._+-' '_' | sed 's/^_\+//;s/_\+$//')
-[ -n "$APP_CLEAN_NAME" ] || APP_CLEAN_NAME="app"
-PNG_OUTPUT="$TARGET_DIR/${APP_CLEAN_NAME}.png"
 ICON_VALUE=""
 
 # User shape preference from Settings (no guessing)
@@ -4245,6 +5977,23 @@ case "$ICON_SHAPE" in
     as-is|square|rounded|circle) ;;
     *) ICON_SHAPE="as-is" ;;
 esac
+
+# Content-addressed theme name helper (matches in-process GUI engine)
+kappicon_theme_name_sh() {
+    local desktop_id="$1" src="$2" shape="$3"
+    python3 - "$desktop_id" "$src" "$shape" <<'PY'
+import hashlib, re, sys
+desktop_id, path, shape = sys.argv[1], sys.argv[2], sys.argv[3]
+base = desktop_id[:-8] if desktop_id.endswith(".desktop") else desktop_id
+label = re.sub(r"[^A-Za-z0-9._+-]", "_", base).strip("_")[:48] or "app"
+id_hash = hashlib.sha256(desktop_id.encode()).hexdigest()[:10]
+h = hashlib.sha256(f"{shape}\0{desktop_id}".encode())
+with open(path, "rb") as f:
+    for chunk in iter(lambda: f.read(65536), b""):
+        h.update(chunk)
+print(f"kappicon-{label}-{id_hash}-{h.hexdigest()[:12]}")
+PY
+}
 
 # Rasterize SRC → OUT at 512² with optional mask (square / rounded / circle).
 # Writes via a temp file then renames onto OUT (atomic install).
@@ -4344,7 +6093,11 @@ else
     FILE_EXT="${SELECTED_ICON_PATH##*.}"
     FILE_EXT=$(printf '%s' "$FILE_EXT" | tr '[:upper:]' '[:lower:]')
 
-    # As designed + SVG: use original file (Plasma keeps full quality / shape)
+    ICON_THEME_NAME=$(kappicon_theme_name_sh "$SELECTED_APP" "$SELECTED_ICON_PATH" "$ICON_SHAPE")
+    [ -n "$ICON_THEME_NAME" ] || { show_error "Failed to compute icon name."; exit 1; }
+    PNG_OUTPUT="$TARGET_DIR/${ICON_THEME_NAME}.png"
+
+    # As designed + SVG: install original vector into hicolor scalable
     if [ "$ICON_SHAPE" = "as-is" ] && [[ "$FILE_EXT" == svg || "$FILE_EXT" == svgz ]]; then
         ICON_VALUE="$SELECTED_ICON_PATH"
     else
@@ -4429,10 +6182,12 @@ fi
 chmod 644 "$USER_APP_DIR/$SELECTED_APP" 2>/dev/null || true
 
 # For custom image files, also install into the user hicolor theme and use an
-# icon *name* in Icon=. Plasma menus refresh theme icons more reliably than
-# absolute paths under $XDG_PICTURES_DIR, and only one desktop id is used (no dupes).
+# icon *name* in Icon=. Content-addressed name so Undo/re-apply never clobber.
 if [[ "$SELECTED_ICON" != theme:* && -f "$ICON_VALUE" ]]; then
-    ICON_THEME_NAME="kappicon-${APP_CLEAN_NAME}"
+    # ICON_THEME_NAME already computed from source path + shape + desktop id
+    if [ -z "${ICON_THEME_NAME:-}" ]; then
+        ICON_THEME_NAME=$(kappicon_theme_name_sh "$SELECTED_APP" "$ICON_VALUE" "$ICON_SHAPE")
+    fi
     HICOLOR="$USER_ICONS_DIR/hicolor"
     # scalable / large sizes for menus and panels
     if [[ "${ICON_VALUE##*.}" =~ ^(svg|svgz)$ ]]; then

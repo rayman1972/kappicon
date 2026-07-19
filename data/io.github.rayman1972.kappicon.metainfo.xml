@@ -17,14 +17,15 @@
       application — without switching your whole system theme.
     </p>
     <p>
-      Changes are user-level only: your system packages stay intact. Optional backups,
-      icon shape masks, a simple Create editor, and a terminal CLI are included.
+      Changes are user-level only: your system packages stay intact. Apply keeps the
+      window open for ricing. Optional backups, Overrides and Missing tabs, icon shape
+      masks, a Create editor, and a terminal CLI are included.
     </p>
     <ul>
-      <li>Map from file (PNG, SVG, ICNS, and more)</li>
-      <li>Map from another app’s theme icon</li>
-      <li>Map from installed icon theme packs</li>
-      <li>Create tab with undo/redo and icon library</li>
+      <li>Map from file, another app, or installed icon theme packs</li>
+      <li>Stay-open Apply, multi-select batch, session undo</li>
+      <li>Overrides (current vs system preview) and Missing icons</li>
+      <li>Create tab with undo/redo, pan/zoom import, icon library</li>
       <li>CLI: kappicon-cli</li>
     </ul>
   </description>
@@ -39,9 +40,7 @@
     <binary>kappicon</binary>
     <binary>kappicon-cli</binary>
   </provides>
-  <!-- stock: AUR uses Icon=kappicon; Flatpak renames icon to the app-id -->
   <icon type="stock">kappicon</icon>
-  <icon type="stock">io.github.rayman1972.kappicon</icon>
   <icon type="remote" height="256" width="256">https://raw.githubusercontent.com/rayman1972/kappicon/main/assets/kappicon.png</icon>
 
   <categories>
@@ -91,9 +90,26 @@
       <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-settings.png</image>
       <caption>Settings — appearance, shape, backups</caption>
     </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-overrides.png</image>
+      <caption>Overrides — current vs system icon preview</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-missing.png</image>
+      <caption>Missing — apps with empty or unresolved icons</caption>
+    </screenshot>
   </screenshots>
 
   <releases>
+    <release version="3.1.0" date="2026-07-19">
+      <description>
+        <p>
+          Stay-open Apply with batch and session undo; Overrides and Missing tabs;
+          content-addressed custom icons; safer reset/restore; user-level install by default.
+        </p>
+      </description>
+      <url>https://github.com/rayman1972/kappicon/releases/tag/v3.1.0</url>
+    </release>
     <release version="3.0.1" date="2026-07-18">
       <description>
         <p>AppStream metainfo for software centers; packaging polish.</p>

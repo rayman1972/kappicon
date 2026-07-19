@@ -383,20 +383,20 @@ PY
 DOWNLOADS_DIR=$(cfg_get "source/folder" "$XDG_DOWNLOAD_DIR")
 BACKUP_ENABLED=$(cfg_get "backups/enabled" "false")
 
-if ! command -v fzf &>/dev/null; then
-    echo "❌ fzf is not installed. Please install it first (or run the GUI: kappicon)." >&2
-    exit 1
-fi
-
-MAGICK_CMD="magick"
-if ! command -v magick &>/dev/null; then
-    if command -v convert &>/dev/null; then
-        MAGICK_CMD="convert"
-    else
-        echo "❌ ImageMagick is not installed. Please install it (magick or convert)." >&2
-        exit 1
-    fi
-fi
+# Help / lightweight flags must work without mapper-only dependencies (fzf, ImageMagick)
+case "${1:-}" in
+    --help|-h)
+        echo "Usage: kappicon-cli [OPTION]"
+        echo ""
+        echo "Options:"
+        echo "  (none)       Launch the interactive icon mapper (needs fzf + ImageMagick)"
+        echo "  --settings   Configure source folder, backups, etc."
+        echo "  --restore    Restore a .desktop file from backup"
+        echo "  --refresh    Force refresh icon caches"
+        echo "  --help       Show this help"
+        exit 0
+        ;;
+esac
 
 # ── Helpers: desktop file locations ──────────────────────────────────────
 get_desktop_dirs() {
@@ -495,9 +495,16 @@ do_restore() {
     case "$selected" in
         */*|*".."*) echo "❌ Invalid backup name."; exit 1 ;;
     esac
-    desktop_name="${selected%%.backup.*}"
+    # Parse <desktop_id>.backup.<YYYYMMDDHHMMSS>.<pid>.<suffix> (id may contain .backup.)
+    desktop_name=$(python3 - "$selected" <<'PY'
+import re, sys
+name = sys.argv[1]
+m = re.match(r"^(.+)\.backup\.(\d{14})\.(\d+)\.([A-Za-z0-9]+)$", name)
+print(m.group(1) if m else "")
+PY
+)
     if ! is_valid_desktop_id "$desktop_name"; then
-        echo "❌ Backup does not map to a valid desktop id: $desktop_name"
+        echo "❌ Backup does not map to a valid desktop id: ${desktop_name:-$selected}"
         exit 1
     fi
     src="$BACKUP_DIR/$selected"
@@ -584,20 +591,24 @@ case "${1:-}" in
     --settings)  do_settings; exit 0 ;;
     --restore)   do_restore; exit 0 ;;
     --refresh)   do_refresh; exit 0 ;;
-    --help|-h)
-        echo "Usage: kappicon-cli [OPTION]"
-        echo ""
-        echo "Options:"
-        echo "  (none)       Launch the interactive icon mapper"
-        echo "  --settings   Configure source folder, backups, etc."
-        echo "  --restore    Restore a .desktop file from backup"
-        echo "  --refresh    Force refresh icon caches"
-        echo "  --help       Show this help"
-        exit 0
-        ;;
 esac
 
-# ── Main: interactive icon mapper ────────────────────────────────────────
+# ── Main: interactive icon mapper (needs fzf + ImageMagick) ──────────────
+if ! command -v fzf &>/dev/null; then
+    echo "❌ fzf is not installed. Please install it first (or run the GUI: kappicon)." >&2
+    exit 1
+fi
+
+MAGICK_CMD="magick"
+if ! command -v magick &>/dev/null; then
+    if command -v convert &>/dev/null; then
+        MAGICK_CMD="convert"
+    else
+        echo "❌ ImageMagick is not installed. Please install it (magick or convert)." >&2
+        exit 1
+    fi
+fi
+
 if [ ! -d "$DOWNLOADS_DIR" ]; then
     echo "❌ Source folder not found: $DOWNLOADS_DIR"
     echo "   Run: kappicon-cli --settings   (option 1) to set a different folder."
@@ -649,13 +660,6 @@ if [ -z "$SELECTED_APP" ] || ! is_valid_desktop_id "$SELECTED_APP"; then
     exit 1
 fi
 
-# Clean app name for filename (basename already validated)
-APP_CLEAN_NAME=$(basename -- "$SELECTED_APP" .desktop)
-# Sanitize for filesystem / icon theme name
-APP_CLEAN_NAME=$(printf '%s' "$APP_CLEAN_NAME" | tr -c 'A-Za-z0-9._+-' '_' | sed 's/^_\+//;s/_\+$//')
-[ -n "$APP_CLEAN_NAME" ] || APP_CLEAN_NAME="app"
-PNG_OUTPUT="$TARGET_DIR/${APP_CLEAN_NAME}.png"
-
 SRC_PATH="$DOWNLOADS_DIR/$SELECTED_ICNS"
 if [ ! -f "$SRC_PATH" ]; then
     echo "❌ Icon file disappeared or is unreadable: $SRC_PATH"
@@ -669,16 +673,46 @@ fi
 FILE_EXT="${SRC_PATH##*.}"
 FILE_EXT=$(printf '%s' "$FILE_EXT" | tr '[:upper:]' '[:lower:]')
 
+# Collision-resistant + content-addressed theme name (matches GUI contract)
+ICON_THEME_NAME=$(python3 - "$SELECTED_APP" "$SRC_PATH" <<'PY'
+import hashlib, re, sys
+desktop_id, path = sys.argv[1], sys.argv[2]
+base = desktop_id[:-8] if desktop_id.endswith(".desktop") else desktop_id
+label = re.sub(r"[^A-Za-z0-9._+-]", "_", base).strip("_")[:48] or "app"
+id_hash = hashlib.sha256(desktop_id.encode()).hexdigest()[:10]
+h = hashlib.sha256(b"as-is\0" + desktop_id.encode())
+with open(path, "rb") as f:
+    for chunk in iter(lambda: f.read(65536), b""):
+        h.update(chunk)
+print(f"kappicon-{label}-{id_hash}-{h.hexdigest()[:12]}")
+PY
+)
+[ -n "$ICON_THEME_NAME" ] || { echo "❌ Failed to compute icon name."; exit 1; }
+PNG_OUTPUT="$TARGET_DIR/${ICON_THEME_NAME}.png"
+HICOLOR="$USER_ICONS_DIR/hicolor"
+
 # Serialize mutations of shared state
 if ! acquire_apply_lock; then
     exit 1
 fi
 
-# SVG: keep original path so rounded corners / alpha stay intact
+# Render / stage asset, then install into user hicolor (never depend on Downloads path)
 case "$FILE_EXT" in
     svg|svgz)
-        PNG_OUTPUT="$SRC_PATH"
-        echo "✅ Using SVG icon as-is: $PNG_OUTPUT"
+        echo "✅ Installing SVG into user hicolor (scalable)…"
+        mkdir -p "$HICOLOR/scalable/apps"
+        staged=$(mktemp "$HICOLOR/scalable/apps/.kappicon-XXXXXX") || exit 1
+        if ! cp -- "$SRC_PATH" "$staged"; then
+            rm -f -- "$staged"
+            echo "❌ Failed to install SVG icon."
+            exit 1
+        fi
+        if ! atomic_replace "$staged" "$HICOLOR/scalable/apps/${ICON_THEME_NAME}.${FILE_EXT}"; then
+            rm -f -- "$staged"
+            echo "❌ Failed to install SVG icon."
+            exit 1
+        fi
+        ICON_VALUE="$ICON_THEME_NAME"
         ;;
     *)
         WORK_DIR=$(mktemp -d) || { echo "❌ mktemp failed"; exit 1; }
@@ -689,6 +723,7 @@ case "$FILE_EXT" in
         fi
 
         # Render to a temp sibling then rename (no half-written PNG on crash/race)
+        mkdir -p "$TARGET_DIR"
         PNG_TMP=$(mktemp "$TARGET_DIR/.kappicon-render-XXXXXX") || exit 1
 
         case "$FILE_EXT" in
@@ -747,7 +782,32 @@ case "$FILE_EXT" in
         fi
         safe_cleanup "$WORK_DIR"
         WORK_DIR=""
-        echo "✅ Icon saved as: $PNG_OUTPUT"
+        echo "✅ Staged PNG: $PNG_OUTPUT"
+
+        # Install multi-size hicolor (same contract as GUI)
+        for sz in 512 256 128 64 48; do
+            mkdir -p "$HICOLOR/${sz}x${sz}/apps"
+            dest="$HICOLOR/${sz}x${sz}/apps/${ICON_THEME_NAME}.png"
+            staged=$(mktemp "$HICOLOR/${sz}x${sz}/apps/.kappicon-XXXXXX") || continue
+            if [ "$sz" -eq 512 ]; then
+                if ! cp -- "$PNG_OUTPUT" "$staged"; then
+                    rm -f -- "$staged"
+                    continue
+                fi
+            else
+                if ! "$MAGICK_CMD" "$PNG_OUTPUT" -background none -resize "${sz}x${sz}" \
+                    "$staged" 2>/dev/null; then
+                    rm -f -- "$staged"
+                    continue
+                fi
+            fi
+            atomic_replace "$staged" "$dest" || rm -f -- "$staged"
+        done
+        if [ ! -f "$HICOLOR/512x512/apps/${ICON_THEME_NAME}.png" ]; then
+            echo "❌ Failed to install icon into the hicolor theme."
+            exit 1
+        fi
+        ICON_VALUE="$ICON_THEME_NAME"
         ;;
 esac
 
@@ -786,11 +846,11 @@ if [ "$APP_PATH" != "$USER_APP_DIR/$SELECTED_APP" ]; then
     fi
 fi
 
-if ! set_desktop_icon "$USER_APP_DIR/$SELECTED_APP" "$PNG_OUTPUT"; then
+if ! set_desktop_icon "$USER_APP_DIR/$SELECTED_APP" "$ICON_VALUE"; then
     echo "❌ Failed to update Icon= in $SELECTED_APP"
     exit 1
 fi
 
 echo "🎉 Success! Custom icon fully assigned to $SELECTED_APP"
-echo "   Icon file: $PNG_OUTPUT"
+echo "   Icon= $ICON_VALUE  (user hicolor)"
 do_refresh
