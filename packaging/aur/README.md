@@ -40,7 +40,7 @@ cd kappicon
 # copy PKGBUILD + .SRCINFO from this repo's packaging/aur/kappicon/
 cp /path/to/kappicon/packaging/aur/kappicon/{PKGBUILD,.SRCINFO} .
 git add PKGBUILD .SRCINFO
-git commit -m "kappicon 3.0.0-1"
+git commit -m "kappicon 3.1.0-1"
 git push
 
 # Git version
