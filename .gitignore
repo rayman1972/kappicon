@@ -9,3 +9,6 @@ packaging/flatpak/build-dir/
 packaging/flatpak/repo/
 packaging/flatpak/.flatpak-builder/
 *.flatpak
+
+# Internal planning notes (not part of the public product tree)
+docs/PROJECT.md
