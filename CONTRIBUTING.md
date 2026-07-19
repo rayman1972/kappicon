@@ -30,7 +30,7 @@ Requirements are listed in the [README](README.md#requirements).
 | `cli/kappicon-cli` | Terminal mapper (`fzf`) |
 | `install.sh` | User install (XDG-aware) |
 | `data/*.metainfo.xml` | AppStream metadata |
-| `packaging/aur/` | AUR PKGBUILDs |
+| `packaging/aur/` | AUR package sources (`PKGBUILD`, `.SRCINFO` only) |
 
 ## Pull requests
 

@@ -42,7 +42,7 @@ yay -S kappicon-git
 - [kappicon](https://aur.archlinux.org/packages/kappicon) — tagged release
 - [kappicon-git](https://aur.archlinux.org/packages/kappicon-git) — latest `main`
 
-PKGBUILDs are also kept in-tree under [`packaging/aur/`](packaging/aur/) (see [packaging/aur/README.md](packaging/aur/README.md) for updates).
+In-tree AUR package sources live under [`packaging/aur/`](packaging/aur/) (`kappicon` and `kappicon-git`).
 
 ## Screenshots
 
