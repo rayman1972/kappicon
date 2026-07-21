@@ -108,11 +108,13 @@ safe_cleanup() {
 acquire_apply_lock() {
     mkdir -p "$DATA_DIR"
     exec 9>"$LOCK_FILE" || return 1
-    if command -v flock &>/dev/null; then
-        if ! flock -w 45 9; then
-            show_error "Another kAppIcon operation is in progress (lock timeout)."
-            return 1
-        fi
+    if ! command -v flock &>/dev/null; then
+        show_error "flock is required for safe apply (install util-linux)."
+        return 1
+    fi
+    if ! flock -w 45 9; then
+        show_error "Another kAppIcon operation is in progress (lock timeout)."
+        return 1
     fi
     return 0
 }

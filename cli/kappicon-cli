@@ -117,11 +117,13 @@ acquire_apply_lock() {
     mkdir -p "$DATA_DIR"
     # FD 9 held for the rest of this process
     exec 9>"$LOCK_FILE" || return 1
-    if command -v flock &>/dev/null; then
-        if ! flock -w 45 9; then
-            echo "❌ Another kAppIcon operation is in progress (lock timeout)." >&2
-            return 1
-        fi
+    if ! command -v flock &>/dev/null; then
+        echo "❌ flock is required for safe apply (install util-linux)." >&2
+        return 1
+    fi
+    if ! flock -w 45 9; then
+        echo "❌ Another kAppIcon operation is in progress (lock timeout)." >&2
+        return 1
     fi
     return 0
 }

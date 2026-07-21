@@ -113,7 +113,23 @@ Supported image types include **PNG, JPG, WEBP, SVG, ICNS, BMP, GIF, XPM**.
 - **ImageMagick** (`magick` or `convert`) for rasterizing custom icons
 - **icns2png** (`libicns` / `icnsutils`) for Apple `.icns` files
 - **fzf** for the interactive CLI mapper (not required for `--help` / `--refresh` / `--restore`)
+- **util-linux `flock`** for CLI and legacy shell mutation paths (exclusive apply lock)
 - **kdialog** (optional; native file dialogs / notifications on KDE)
+
+### Minimum tested versions
+
+These are **development / “tested with” floors**, not a hard claim that every older distro package is unsupported. Distro package **names** below are what `install.sh` and AUR use; package versions come from your distro.
+
+| Component | Floor / note |
+|-----------|----------------|
+| **Python** | **≥ 3.9** (tests use modern type hints; currently tested on 3.12+ / 3.14) |
+| **PyQt6** | Distro packages (`python3-pyqt6` / `python-pyqt6` / openSUSE `python3*-PyQt6`); no pip pin required |
+| **ImageMagick** | `magick` **or** legacy `convert` on `PATH` |
+| **icns2png** | From `libicns` / `icnsutils` / `libicns-utils` for `.icns` |
+| **fzf** | Interactive CLI mapper only |
+| **flock** | From **util-linux** (CLI / shell apply lock) |
+| **sha256sum** / **curl** / **tar** | Non-git `./install.sh --update` (coreutils + curl) |
+| **desktop-file-validate** | Optional; used by `./scripts/validate.sh` when installed |
 
 ## Installation
 
@@ -123,11 +139,14 @@ cd kappicon
 ./install.sh
 ```
 
-To update later (from a git clone):
+To update later:
 
 ```bash
 ./install.sh --update
 ```
+
+- **Git clone:** `git pull --rebase`, then reinstall from the working tree.
+- **Non-git install:** downloads the latest **GitHub release** source tarball for a **tag** and verifies the release asset **`SHA256SUMS`** with `sha256sum` **before** replacing binaries (never raw `main`). Maintainers must attach `SHA256SUMS` on each release (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 `install.sh` installs into `$XDG_BIN_HOME` (default `~/.local/bin`) and adds a desktop entry under `$XDG_DATA_HOME/applications`. It is **user-level only** by default (no sudo).
 
@@ -139,10 +158,12 @@ Install missing packages yourself, or opt in:
 
 | Distro | Packages |
 |--------|----------|
-| **Arch / CachyOS** | `python python-pyqt6 libicns imagemagick kdialog fzf` |
-| **Debian / Ubuntu** | `python3 python3-pyqt6 icnsutils imagemagick kdialog fzf` |
-| **Fedora** | `python3 python3-pyqt6 libicns-utils ImageMagick kdialog fzf` |
-| **openSUSE Leap / Tumbleweed** | `python3` `python3-PyQt6` (or `python3XY-PyQt6` for your Python) `libicns` `ImageMagick` `kdialog` `fzf` |
+| **Arch / CachyOS** | `python python-pyqt6 libicns imagemagick kdialog fzf util-linux` |
+| **Debian / Ubuntu** | `python3 python3-pyqt6 icnsutils imagemagick kdialog fzf util-linux` |
+| **Fedora** | `python3 python3-pyqt6 libicns-utils ImageMagick kdialog fzf util-linux` |
+| **openSUSE Leap / Tumbleweed** | `python3` `python3-PyQt6` (or `python3XY-PyQt6` for your Python) `libicns` `ImageMagick` `kdialog` `fzf` `util-linux` |
+
+Package names are authoritative for install; versions come from the distro. Floors in **Minimum tested versions** are what maintainers aim to test against.
 
 On openSUSE, `--install-deps` picks the PyQt6 RPM that matches your default `python3` when possible, and can fall back to `pip install --user PyQt6`.
 

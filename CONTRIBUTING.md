@@ -20,7 +20,10 @@ kappicon              # GUI
 kappicon-cli --help   # CLI
 ```
 
-Requirements are listed in the [README](README.md#requirements).
+Requirements and **minimum tested versions** are listed in the
+[README](README.md#requirements) (Python ≥ 3.9, distro PyQt6, ImageMagick,
+icns tooling, fzf, util-linux `flock`). Prefer distro packages over pip-only
+installs; AUR + `install.sh` remain first-class.
 
 ### Layout
 
@@ -51,6 +54,37 @@ version/metadata, `desktop-file-validate` when installed):
 ```bash
 ./scripts/validate.sh
 ```
+
+Mutation/core tests need **Python 3** + stdlib only (PyQt6 is stubbed). Full GUI
+needs distro **PyQt6**. CLI/shell apply paths need **`flock`** (util-linux).
+
+Both commands are the continuous validation entry points for local/CI use:
+
+```bash
+./scripts/validate.sh && python3 -m unittest discover -s tests -v
+```
+
+## Release checksums
+
+Non-git `./install.sh --update` installs only from a **tagged** GitHub source
+archive after verifying a published **`SHA256SUMS`** asset. Empty release assets
+⇒ non-git update **fails closed** by design.
+
+When cutting a release:
+
+1. Set `VERSION` / AppStream release to `X.Y.Z` and tag `vX.Y.Z`.
+2. Create the GitHub release for that tag (GitHub generates the source archive).
+3. Download the source tarball and save it as `kappicon-X.Y.Z.tar.gz`:
+   ```bash
+   curl -sfL -o kappicon-X.Y.Z.tar.gz \
+     "https://github.com/rayman1972/kappicon/archive/refs/tags/vX.Y.Z.tar.gz"
+   ```
+4. Generate checksums:
+   ```bash
+   sha256sum kappicon-X.Y.Z.tar.gz > SHA256SUMS
+   ```
+5. **Upload `SHA256SUMS` as a release asset** on that GitHub release (required for non-git update).
+6. Keep AUR `packaging/aur/kappicon/PKGBUILD` `sha256sums` in sync with the same archive when bumping the stable package.
 
 ## Pull requests
 
