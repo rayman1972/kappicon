@@ -22,7 +22,8 @@ provides=("${pkgname}")
 conflicts=("${pkgname}-git")
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
 # Regenerated for the v3.2.0 tree; re-run `makepkg -g` after tagging if the tarball differs.
-sha256sums=('PLACEHOLDER')
+# After tagging v3.2.0:  curl -sL "$url/archive/refs/tags/v$pkgver.tar.gz" | sha256sum
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 
 package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
