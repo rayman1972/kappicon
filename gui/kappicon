@@ -94,7 +94,26 @@ find_desktop_files() {
     done < <(get_desktop_dirs)
 }
 
-DESKTOP_LIST=$(find_desktop_files | sort -u)
+# Optional: time desktop discovery when KAPPICON_TIMING is set (PERF-01)
+_kappicon_timing_on=0
+case "${KAPPICON_TIMING:-}" in
+    1|true|TRUE|yes|YES|on|ON) _kappicon_timing_on=1 ;;
+esac
+if [ "$_kappicon_timing_on" = "1" ]; then
+    _t0=$(date +%s%N 2>/dev/null || echo "")
+    DESKTOP_LIST=$(find_desktop_files | sort -u)
+    if [ -n "$_t0" ] && [ "${#_t0}" -ge 10 ]; then
+        _t1=$(date +%s%N 2>/dev/null || echo "")
+        if [ -n "$_t1" ] && [ "${#_t1}" -ge 10 ]; then
+            _ms=$(( (_t1 - _t0) / 1000000 ))
+            echo "kappicon timing: shell.desktop_list_find: ${_ms}.0 ms" >&2
+        fi
+    else
+        echo "kappicon timing: shell.desktop_list_find: (date +%s%N unavailable; list built, ms not measured)" >&2
+    fi
+else
+    DESKTOP_LIST=$(find_desktop_files | sort -u)
+fi
 export XDG_CONFIG_HOME XDG_DATA_HOME XDG_BIN_HOME
 export XDG_DOWNLOAD_DIR XDG_PICTURES_DIR
 export CONFIG_DIR DATA_DIR USER_APPS_DIR USER_ICONS_DIR TARGET_DIR

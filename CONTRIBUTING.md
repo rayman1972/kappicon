@@ -64,6 +64,30 @@ Both commands are the continuous validation entry points for local/CI use:
 ./scripts/validate.sh && python3 -m unittest discover -s tests -v
 ```
 
+Multi-distro non-GUI checks (Arch + Debian/Ubuntu, optional containers): see
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
+
+### Performance timing
+
+Opt-in measurement for startup and theme discovery (no change when unset):
+
+```bash
+KAPPICON_TIMING=1 kappicon
+# or from a checkout:
+KAPPICON_TIMING=1 ./gui/kappicon
+```
+
+Logs go to **stderr** as lines like `kappicon timing: <label>: <ms> ms`.
+Typical labels:
+
+- `shell.desktop_list_find` — bash desktop-file discovery (if timed)
+- `python.main` / `python.run_app` / `startup.build_icon_files`
+- `discover_icon_themes` — installed theme pack discovery at window init
+- `scan_theme_icons:<name>` — first scan of a theme pack (or after mtime change)
+
+Use this when investigating sluggish startup or Map theme browsing. It is not
+required for `./scripts/validate.sh` or the unit test suite.
+
 ## Release checksums
 
 Non-git `./install.sh --update` installs only from a **tagged** GitHub source

@@ -1108,8 +1108,13 @@ class CombinedWindow(QMainWindow):
         self.desktop_labels = {d[0]: d[2] for d in app_data}
         # theme icons already referenced by installed .desktop files
         self.system_icons = collect_system_icons([(d[0], d[1]) for d in app_data])
-        self.installed_themes = discover_icon_themes()
-        self._theme_icons_cache = {}  # theme path -> [(name, file_path), ...]
+        from kappicon.timing import span as _timing_span
+
+        with _timing_span("discover_icon_themes"):
+            self.installed_themes = discover_icon_themes()
+        # theme path -> (mtime or None, [(name, file_path), ...])
+        # mtime invalidation: re-scan when theme dir mtime changes (PERF-02 light win)
+        self._theme_icons_cache = {}
         self.icon_source = "files"  # "files" | "system" | "icontheme"
         self.selected_file = None   # path or "theme:<name>" (legacy exit protocol unused for Apply)
         self.selected_app = None
@@ -3221,17 +3226,32 @@ class CombinedWindow(QMainWindow):
             self.file_list.addItem(item)
             return
 
-        # Re-scan if uncached or previous scan found nothing (layout edge cases)
-        if theme_path not in self._theme_icons_cache or not self._theme_icons_cache[theme_path]:
+        # Re-scan if uncached, mtime changed, or previous scan found nothing
+        try:
+            theme_mtime = os.path.getmtime(theme_path)
+        except OSError:
+            theme_mtime = None
+        cached = self._theme_icons_cache.get(theme_path)
+        need_scan = (
+            cached is None
+            or not cached[1]
+            or (theme_mtime is not None and cached[0] is not None and theme_mtime != cached[0])
+        )
+        if need_scan:
             if self.statusBar():
                 self.statusBar().showMessage("Scanning theme icons…")
             QApplication.processEvents()
-            self._theme_icons_cache[theme_path] = scan_theme_icons(theme_path)
+            from kappicon.timing import span as _timing_span
+
+            short = os.path.basename(theme_path.rstrip(os.sep)) or theme_path
+            with _timing_span(f"scan_theme_icons:{short}"):
+                icons_list = scan_theme_icons(theme_path)
+            self._theme_icons_cache[theme_path] = (theme_mtime, icons_list)
             if self.statusBar():
-                n = len(self._theme_icons_cache[theme_path])
+                n = len(icons_list)
                 self.statusBar().showMessage(f"Found {n} icons in theme.", 4000)
 
-        icons = self._theme_icons_cache[theme_path]
+        icons = self._theme_icons_cache[theme_path][1]
         theme_label = self.theme_combo.currentText()
         # List icons without embedding thousands of pixmaps (keeps UI snappy);
         # the right-hand preview still loads the selected file.
@@ -4181,6 +4201,8 @@ class CombinedWindow(QMainWindow):
 
 def run_app(argv=None) -> int:
     """Build QApplication and CombinedWindow; return exit code."""
+    from kappicon.timing import span as _timing_span
+
     if argv is None:
         argv = sys.argv
     app = QApplication(list(argv))
@@ -4205,11 +4227,12 @@ def run_app(argv=None) -> int:
                     files.append(path)
         return files
 
-    icon_files = scan_icons(source_folder)
-    # Always include icons created in the KAppIcon library
-    for p in scan_icons(LIBRARY_DIR):
-        if p not in icon_files:
-            icon_files.append(p)
+    with _timing_span("startup.build_icon_files"):
+        icon_files = scan_icons(source_folder)
+        # Always include icons created in the KAppIcon library
+        for p in scan_icons(LIBRARY_DIR):
+            if p not in icon_files:
+                icon_files.append(p)
 
     def desktop_path_priority(path):
         """Higher = preferred when the same .desktop id exists in multiple places.
