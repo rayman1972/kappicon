@@ -31,6 +31,26 @@ Requirements are listed in the [README](README.md#requirements).
 | `install.sh` | User install (XDG-aware) |
 | `data/*.metainfo.xml` | AppStream metadata |
 | `packaging/aur/` | AUR package sources (`PKGBUILD`, `.SRCINFO` only) |
+| `tests/` | Headless mutation/core tests (temp XDG; no display) |
+| `scripts/validate.sh` | Syntax/metadata checks (when present) |
+
+### Automated tests
+
+Mutation and core engine tests run without a display and without your real home
+directory. They extract the embedded Python from `gui/kappicon`, **truncate before**
+the Scan+run bootstrap (no `QApplication` / `app.exec`), and stub PyQt6 so core
+paths can load headless.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Optional continuous validation (shell syntax, embedded Python `compile()`,
+version/metadata, `desktop-file-validate` when installed):
+
+```bash
+./scripts/validate.sh
+```
 
 ## Pull requests
 
