@@ -13,3 +13,8 @@ packaging/flatpak/.flatpak-builder/
 # Internal planning notes (not part of the public product tree)
 docs/PROJECT.md
 .planning/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
