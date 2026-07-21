@@ -93,7 +93,7 @@ Only menu-visible, runnable apps with empty or unresolved `Icon=` (hidden helper
 | **Map · Batch** | Ctrl/Shift multi-select apps → **Apply to N apps** (with confirm) |
 | **Map · Undo** | Session **Undo last icon apply** (Edit menu / Ctrl+Z on Map); Create keeps canvas undo |
 | **Map · Density & memory** | Compact / Comfortable / Large list icons; remembers source, filters, theme pack, last app |
-| **Create** | Pixel canvas (pen / eraser / fill / picker); **import with pan/zoom**; always **512×512** library PNGs |
+| **Create** | Pixel canvas (pen / eraser / fill / picker); **import with pan/zoom**; always **512×512** library PNGs; import keeps transparency or solid square fill (shape from Settings on Apply) |
 | **Drag and drop** | Drop an image onto the window to select it on Map or load Create — **never** auto-applies |
 | **Overrides** | Review customized launchers with **current vs original** preview; open in Map or reset to system |
 | **Missing** | Visible menu apps with empty or unresolved `Icon=` (skips hidden helpers); filter empty vs unresolved; jump to Map |

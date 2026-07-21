@@ -2256,12 +2256,23 @@ class ImportPositionView(QWidget):
         self._drag_origin = None
         self._drag_dx0 = 0.0
         self._drag_dy0 = 0.0
+        # Background: None = keep transparency; else solid square under the image.
+        # Rounded/circle masks are Settings → applied only on Map Apply.
+        self._bg_color = None  # QColor | None
         self.setMinimumSize(360, 360)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.fit()
+
+    def set_background(self, color=None):
+        """Set solid square background color, or None to keep transparency."""
+        self._bg_color = QColor(color) if color is not None else None
+        if self._bg_color is not None and not self._bg_color.isValid():
+            self._bg_color = QColor(255, 255, 255)
+        self.update()
+        self.changed.emit()
 
     def scale(self):
         return self._scale
@@ -2315,7 +2326,11 @@ class ImportPositionView(QWidget):
         out = QImage(self._canvas, self._canvas, QImage.Format.Format_ARGB32)
         out.fill(Qt.GlobalColor.transparent)
         p = QPainter(out)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        full = QRectF(0, 0, self._canvas, self._canvas)
+        if self._bg_color is not None:
+            p.fillRect(full, self._bg_color)
         target = QRectF(
             self._dx, self._dy,
             self._src.width() * self._scale,
@@ -2353,9 +2368,10 @@ class ImportPositionView(QWidget):
         path = QPainterPath()
         path.addRoundedRect(QRectF(ox, oy, side, side), 6, 6)
         p.setClipPath(path)
-        p.fillRect(QRectF(ox, oy, side, side), QColor(30, 30, 30))
+        crop = QRectF(ox, oy, side, side)
+        p.fillRect(crop, QColor(30, 30, 30))
 
-        # Checkerboard for transparency
+        # Checkerboard for transparency (under plate / image)
         chk = 12
         c1, c2 = QColor(50, 50, 50), QColor(40, 40, 40)
         for row in range(int(side // chk) + 1):
@@ -2364,6 +2380,10 @@ class ImportPositionView(QWidget):
                     int(ox + col * chk), int(oy + row * chk), chk, chk,
                     c1 if (row + col) % 2 == 0 else c2,
                 )
+
+        # Optional solid square under the image (shape masks happen on Map Apply)
+        if self._bg_color is not None:
+            p.fillRect(crop, self._bg_color)
 
         # Map canvas coords → widget
         def c2w(cx, cy):
@@ -2438,13 +2458,16 @@ class ImportPositionDialog(QDialog):
     def __init__(self, source: QImage, canvas_size=STANDARD_ICON_SIZE, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Position import")
-        self.resize(560, 640)
-        self.setMinimumSize(420, 480)
+        self.resize(560, 700)
+        self.setMinimumSize(420, 520)
+        self._settings = QSettings("KAppIcon", "KAppIcon")
 
         layout = QVBoxLayout(self)
         layout.addWidget(make_hint_label(
             "Drag the picture to move it. Zoom so the part you want fills the square — "
-            "that square becomes your icon."
+            "that square becomes your icon. Transparent PNGs can stay transparent or "
+            "sit on a solid color plate. Icon shape (rounded / circle) is applied later "
+            "from Settings when you Map the icon."
         ))
 
         self.view = ImportPositionView(source, canvas_size=canvas_size, parent=self)
@@ -2486,15 +2509,103 @@ class ImportPositionDialog(QDialog):
         preset_row.addStretch(1)
         layout.addLayout(preset_row)
 
+        # ── Background: keep transparency or solid square plate ──────────
+        # Shape masks (rounded / circle) live in Settings → Applied icon shape
+        # and run at Map Apply — Create always works on a square canvas.
+        bg_box = QGroupBox("Background")
+        bg_l = QVBoxLayout(bg_box)
+        bg_l.addWidget(make_hint_label(
+            "Keep transparency, or fill the square with a solid color under the image. "
+            "Rounded or circular icon masks are chosen in Settings and applied on Map."
+        ))
+        mode_row = QHBoxLayout()
+        self.bg_keep = QRadioButton("Keep transparency")
+        self.bg_solid = QRadioButton("Solid color")
+        self.bg_mode_group = QButtonGroup(self)
+        self.bg_mode_group.addButton(self.bg_keep)
+        self.bg_mode_group.addButton(self.bg_solid)
+        mode_row.addWidget(self.bg_keep)
+        mode_row.addWidget(self.bg_solid)
+        mode_row.addSpacing(12)
+        mode_row.addWidget(QLabel("Color:"))
+        self.bg_color_btn = QPushButton()
+        self.bg_color_btn.setFixedSize(36, 28)
+        self.bg_color_btn.setToolTip("Choose background color")
+        self.bg_color_btn.clicked.connect(self._pick_bg_color)
+        mode_row.addWidget(self.bg_color_btn)
+        mode_row.addStretch(1)
+        bg_l.addLayout(mode_row)
+        layout.addWidget(bg_box)
+
+        # Restore last choices (default: keep transparency)
+        saved_mode = self._settings.value("create/import_bg_mode", "transparent", type=str)
+        saved_color = self._settings.value("create/import_bg_color", "#ffffff", type=str)
+        self._bg_color = QColor(saved_color if saved_color else "#ffffff")
+        if not self._bg_color.isValid():
+            self._bg_color = QColor(255, 255, 255)
+        if saved_mode == "solid":
+            self.bg_solid.setChecked(True)
+        else:
+            self.bg_keep.setChecked(True)
+
+        self.bg_keep.toggled.connect(self._on_bg_mode)
+        self.bg_solid.toggled.connect(self._on_bg_mode)
+        self._update_color_btn()
+        self._on_bg_mode()
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Use this crop")
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._accept_save_prefs)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
         self._sync_slider()
+
+    def _update_color_btn(self):
+        c = self._bg_color
+        # Show true color; ignore alpha in button face for readability
+        face = QColor(c.red(), c.green(), c.blue())
+        self.bg_color_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {face.name()}; border: 1px solid #666; "
+            f"border-radius: 4px; }}"
+        )
+
+    def _pick_bg_color(self):
+        c = QColorDialog.getColor(
+            self._bg_color, self, "Background color",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel,
+        )
+        if c.isValid():
+            self._bg_color = c
+            self._update_color_btn()
+            if self.bg_solid.isChecked():
+                self._apply_bg_to_view()
+
+    def _on_bg_mode(self, _on=None):
+        solid = self.bg_solid.isChecked()
+        self.bg_color_btn.setEnabled(solid)
+        self._apply_bg_to_view()
+
+    def _apply_bg_to_view(self):
+        # Always square in Create — Map Apply applies rounded/circle from Settings
+        if self.bg_solid.isChecked():
+            self.view.set_background(self._bg_color)
+        else:
+            self.view.set_background(None)
+
+    def _accept_save_prefs(self):
+        mode = "solid" if self.bg_solid.isChecked() else "transparent"
+        self._settings.setValue("create/import_bg_mode", mode)
+        if self._bg_color.alpha() < 255:
+            self._settings.setValue(
+                "create/import_bg_color",
+                self._bg_color.name(QColor.NameFormat.HexArgb),
+            )
+        else:
+            self._settings.setValue("create/import_bg_color", self._bg_color.name())
+        self.accept()
 
     def _do_fit(self):
         self.view.fit()
@@ -2873,7 +2984,7 @@ class CombinedWindow(QMainWindow):
             self,
             "About kAppIcon",
             "<h3>kAppIcon</h3>"
-            "<p>Version 3.1.0</p>"
+            "<p>Version 3.1.1</p>"
             "<p>A Linux utility to change application icons, reuse theme icons from other apps, "
             "and design your own custom icons. Review overrides and find apps missing icons.</p>"
             "<p>Designed for Plasma / Breeze, following freedesktop.org desktop entry specifications "

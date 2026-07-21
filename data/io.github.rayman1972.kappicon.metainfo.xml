@@ -101,6 +101,15 @@
   </screenshots>
 
   <releases>
+    <release version="3.1.1" date="2026-07-20">
+      <description>
+        <p>
+          Create import: keep PNG transparency or fill a solid square background;
+          rounded/circle masks stay in Settings and apply on Map.
+        </p>
+      </description>
+      <url>https://github.com/rayman1972/kappicon/releases/tag/v3.1.1</url>
+    </release>
     <release version="3.1.0" date="2026-07-19">
       <description>
         <p>
