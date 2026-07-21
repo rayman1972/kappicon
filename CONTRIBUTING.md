@@ -29,20 +29,20 @@ installs; AUR + `install.sh` remain first-class.
 
 | Path | Role |
 |------|------|
-| `gui/kappicon` | GUI (bash + embedded PyQt6) |
+| `gui/kappicon` | Thin bash launcher (`python3 -m kappicon`) |
+| `python/kappicon/` | Shared Python package (mutation + GUI) |
 | `cli/kappicon-cli` | Terminal mapper (`fzf`) |
-| `install.sh` | User install (XDG-aware) |
+| `install.sh` | User install (XDG-aware; installs package under `$DATA_DIR/python`) |
 | `data/*.metainfo.xml` | AppStream metadata |
 | `packaging/aur/` | AUR package sources (`PKGBUILD`, `.SRCINFO` only) |
 | `tests/` | Headless mutation/core tests (temp XDG; no display) |
-| `scripts/validate.sh` | Syntax/metadata checks (when present) |
+| `scripts/validate.sh` | Syntax/metadata + package compile checks |
 
 ### Automated tests
 
 Mutation and core engine tests run without a display and without your real home
-directory. They extract the embedded Python from `gui/kappicon`, **truncate before**
-the Scan+run bootstrap (no `QApplication` / `app.exec`), and stub PyQt6 so core
-paths can load headless.
+directory. They import `python/kappicon` under temporary XDG (no Bash heredoc
+extract). PyQt6 is not required for mutation tests.
 
 ```bash
 python3 -m unittest discover -s tests -v

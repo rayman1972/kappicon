@@ -76,6 +76,15 @@ install_from_tree() {
     install_bin "$root/gui/kappicon" "$INSTALL_DIR/kappicon"
     install_bin "$root/cli/kappicon-cli" "$INSTALL_DIR/kappicon-cli"
     chmod +x "$INSTALL_DIR/kappicon" "$INSTALL_DIR/kappicon-cli"
+    # Shared Python package (mutation + GUI); launcher sets PYTHONPATH to DATA_DIR/python
+    if [ -d "$root/python/kappicon" ]; then
+        mkdir -p "$DATA_DIR/python"
+        rm -rf "$DATA_DIR/python/kappicon"
+        cp -a "$root/python/kappicon" "$DATA_DIR/python/kappicon"
+    else
+        echo "❌ Missing python/kappicon package in source tree." >&2
+        return 1
+    fi
     rm -f "$INSTALL_DIR/kappicon-gui" \
         "$INSTALL_DIR/apply-mac-icon" "$INSTALL_DIR/apply-mac-icon-gui" \
         "$ICONS_DIR/macosicons.png" "$ICONS_DIR/macosicons-gui.png" \
@@ -204,8 +213,9 @@ if [ "$DO_UPDATE" = "1" ]; then
         exit 1
     }
     EXTRACTED=$(find "$STAGE/src" -mindepth 1 -maxdepth 1 -type d | head -n1)
-    [ -n "$EXTRACTED" ] && [ -f "$EXTRACTED/gui/kappicon" ] && [ -f "$EXTRACTED/cli/kappicon-cli" ] || {
-        echo "❌ Unexpected archive layout (missing gui/kappicon or cli/kappicon-cli)."
+    [ -n "$EXTRACTED" ] && [ -f "$EXTRACTED/gui/kappicon" ] && [ -f "$EXTRACTED/cli/kappicon-cli" ] \
+        && [ -d "$EXTRACTED/python/kappicon" ] || {
+        echo "❌ Unexpected archive layout (need gui/kappicon, cli/kappicon-cli, python/kappicon)."
         exit 1
     }
 
@@ -390,51 +400,13 @@ install_deps() {
 
 install_deps
 
-mkdir -p "$INSTALL_DIR" "$APPS_DIR" "$ICONS_DIR" "$DATA_DIR/icons" "$CONFIG_DIR"
-
-# GUI: kappicon · CLI: kappicon-cli
-install_bin gui/kappicon "$INSTALL_DIR/kappicon"
-install_bin cli/kappicon-cli "$INSTALL_DIR/kappicon-cli"
-chmod +x "$INSTALL_DIR/kappicon" "$INSTALL_DIR/kappicon-cli"
-# Drop leftover names from older installs / rebrand
-# CLI is terminal-only — never ship a menu entry for it.
-rm -f "$INSTALL_DIR/kappicon-gui" \
-    "$INSTALL_DIR/apply-mac-icon" "$INSTALL_DIR/apply-mac-icon-gui" \
-    "$ICONS_DIR/macosicons.png" "$ICONS_DIR/macosicons-gui.png" \
-    "$APPS_DIR/macosicons.desktop" \
-    "$APPS_DIR/macosicons-gui.desktop" \
-    "$APPS_DIR/kappicon-cli.desktop" 2>/dev/null || true
-if [ "$XDG_DATA_HOME" != "$HOME/.local/share" ]; then
-    rm -f "$HOME/.local/share/applications/kappicon-cli.desktop" \
-        "$HOME/.local/share/applications/macosicons.desktop" \
-        "$HOME/.local/share/applications/macosicons-gui.desktop" 2>/dev/null || true
-fi
-
-if [ -f assets/kappicon.png ]; then
-    cp assets/kappicon.png "$ICONS_DIR/kappicon.png"
-fi
-if [ -f assets/kappicon-gui.png ]; then
-    cp assets/kappicon-gui.png "$ICONS_DIR/kappicon-gui.png"
-fi
-
-# Desktop launcher — GUI only (CLI is run from the terminal)
-cp gui/kappicon.desktop "$APPS_DIR/kappicon.desktop"
-
-# AppStream metainfo for software centers (Pamac / GNOME Software / Discover)
-METAINFO_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/metainfo"
-if [ -f data/io.github.rayman1972.kappicon.metainfo.xml ]; then
-    mkdir -p "$METAINFO_DIR"
-    cp data/io.github.rayman1972.kappicon.metainfo.xml \
-        "$METAINFO_DIR/io.github.rayman1972.kappicon.metainfo.xml"
-fi
+install_from_tree "$(pwd)"
 
 if command -v kbuildsycoca6 &> /dev/null; then
     kbuildsycoca6 --noincremental
 elif command -v kbuildsycoca5 &> /dev/null; then
     kbuildsycoca5 --noincremental
 fi
-
-[ -f VERSION ] && cp VERSION "$LOCAL_VERSION_FILE"
 
 echo "✅ Done! Run:  kappicon   or search for “kAppIcon” in the app menu."
 echo "   CLI:        kappicon-cli --help"

@@ -38,6 +38,9 @@ package() {
   install -Dm755 gui/kappicon "${pkgdir}/usr/bin/kappicon"
   install -Dm755 cli/kappicon-cli "${pkgdir}/usr/bin/kappicon-cli"
 
+  install -d "${pkgdir}/usr/lib/kappicon/python"
+  cp -a python/kappicon "${pkgdir}/usr/lib/kappicon/python/kappicon"
+
   install -Dm644 gui/kappicon.desktop \
     "${pkgdir}/usr/share/applications/kappicon.desktop"
 

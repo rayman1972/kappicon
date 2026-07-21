@@ -26,9 +26,13 @@ sha256sums=('4ab5b64d50a8ed244b4343f169815d441afb0a3cb40d531a20aea5838fdc6fa8')
 package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
 
-  # Binaries (GUI + CLI)
+  # Binaries (GUI thin launcher + CLI)
   install -Dm755 gui/kappicon "${pkgdir}/usr/bin/kappicon"
   install -Dm755 cli/kappicon-cli "${pkgdir}/usr/bin/kappicon-cli"
+
+  # Shared Python package (mutation + GUI); launcher resolves /usr/lib/kappicon/python
+  install -d "${pkgdir}/usr/lib/kappicon/python"
+  cp -a python/kappicon "${pkgdir}/usr/lib/kappicon/python/kappicon"
 
   # Desktop launcher (GUI only)
   install -Dm644 gui/kappicon.desktop \

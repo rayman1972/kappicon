@@ -1,4 +1,4 @@
-"""Smoke tests: temp XDG isolation + truncated engine load (no GUI)."""
+"""Smoke tests: temp XDG isolation + package engine load (no GUI)."""
 
 from __future__ import annotations
 
@@ -6,12 +6,7 @@ import os
 import unittest
 from pathlib import Path
 
-from tests.support.load_engine import (
-    clear_engine_cache,
-    extract_gui_python_source,
-    load_engine,
-    mutation_source_for_exec,
-)
+from tests.support.load_engine import clear_engine_cache, load_engine
 from tests.support.xdg_sandbox import temp_xdg
 
 
@@ -20,17 +15,19 @@ class TestHarnessSmoke(unittest.TestCase):
         self._real_home = Path(os.path.expanduser("~")).resolve()
         clear_engine_cache()
 
-    def test_mutation_source_excludes_bootstrap(self) -> None:
-        full = extract_gui_python_source()
-        trunc = mutation_source_for_exec(full)
-        self.assertNotIn("app.exec", trunc)
-        self.assertNotIn("sys.exit", trunc)
-        self.assertNotIn("Scan + run", trunc)
-        self.assertIn("apply_icon_to_desktop", trunc)
-        self.assertIn("is_valid_desktop_id", trunc)
-        # Preferred cut: no UI classes
-        self.assertNotIn("class PixelCanvas", trunc)
-        self.assertNotIn("class CombinedWindow", trunc)
+    def test_package_exports_mutation_api(self) -> None:
+        with temp_xdg() as sandbox:
+            eng = load_engine()
+            self.assertTrue(callable(eng.apply_icon_to_desktop))
+            self.assertTrue(callable(eng.is_valid_desktop_id))
+            # Implementation lives in package, not a heredoc exec
+            self.assertTrue(
+                str(getattr(eng.apply_icon_to_desktop, "__module__", "")).startswith(
+                    "kappicon"
+                )
+                or eng.apply_icon_to_desktop.__module__ == "kappicon.mutation"
+                or "kappicon" in eng.apply_icon_to_desktop.__module__,
+            )
 
     def test_engine_loads_under_temp_xdg(self) -> None:
         with temp_xdg() as sandbox:
@@ -59,7 +56,6 @@ class TestHarnessSmoke(unittest.TestCase):
                     str(p).startswith(str(sandbox.root.resolve())),
                     f"{attr}={p} not under sandbox",
                 )
-                # Must not sit under the pre-sandbox real home XDG trees
                 self.assertFalse(
                     str(p).startswith(str(real_local) + os.sep)
                     or p == real_local
