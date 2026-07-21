@@ -1,13 +1,12 @@
 #!/bin/bash
+# Thin launcher: XDG bootstrap, desktop discovery, package path, exec GUI.
+# All launcher mutation is in python/kappicon (no shell Icon= engine).
+
 # ── XDG Base Directory + user dirs ───────────────────────────────────────
-# Honor XDG_* so non-default layouts and localized Pictures/Downloads work.
 : "${XDG_CONFIG_HOME:=$HOME/.config}"
 : "${XDG_DATA_HOME:=$HOME/.local/share}"
-# Informal but widely used for user binaries (not in the base spec)
 : "${XDG_BIN_HOME:=$HOME/.local/bin}"
 
-# Resolve XDG user dir (DOWNLOAD, PICTURES, …). Prefers `xdg-user-dir`, then
-# $XDG_CONFIG_HOME/user-dirs.dirs, then $HOME/<EnglishDefault>.
 xdg_user_dir() {
     local key="$1" fallback="$2" val="" udf line varname
     if command -v xdg-user-dir >/dev/null 2>&1; then
@@ -36,8 +35,6 @@ xdg_user_dir() {
 XDG_DOWNLOAD_DIR=$(xdg_user_dir DOWNLOAD "$HOME/Downloads")
 XDG_PICTURES_DIR=$(xdg_user_dir PICTURES "$HOME/Pictures")
 
-# Inside Flatpak, prefer host paths for launcher/icon integration when HOME is the real home
-# (manifest grants --filesystem=home). Cache tools may need host execution.
 run_host() {
     if [ -n "${FLATPAK_ID:-}" ] && command -v flatpak-spawn >/dev/null 2>&1; then
         flatpak-spawn --host -- "$@"
@@ -54,201 +51,7 @@ TARGET_DIR="${TARGET_DIR:-$XDG_PICTURES_DIR/KAppIcon}"
 DOWNLOADS_DIR="${DOWNLOADS_DIR:-$XDG_DOWNLOAD_DIR}"
 LIBRARY_DIR="$DATA_DIR/icons"
 BACKUP_DIR_DEFAULT="$DATA_DIR/backups"
-LOCK_FILE="$DATA_DIR/apply.lock"
 mkdir -p "$TARGET_DIR" "$LIBRARY_DIR" "$BACKUP_DIR_DEFAULT" "$USER_APPS_DIR"
-
-# Track temp workdirs for EXIT/INT/TERM cleanup
-WORK_DIR=""
-cleanup_on_exit() {
-    [ -n "${WORK_DIR:-}" ] && safe_cleanup "$WORK_DIR"
-    WORK_DIR=""
-}
-trap cleanup_on_exit EXIT INT TERM HUP
-
-# Freedesktop desktop ids are basenames; never allow path components.
-is_valid_desktop_id() {
-    local id="$1"
-    [ -n "$id" ] || return 1
-    case "$id" in
-        */*|*"\\"*|*".."*|*$'\n'*|*$'\r'*|.*|"") return 1 ;;
-    esac
-    [[ "$id" == *.desktop ]] || return 1
-    [ "$(basename -- "$id")" = "$id" ] || return 1
-    [ "${#id}" -gt 8 ] || return 1
-    return 0
-}
-
-is_temp_path() {
-    local p="$1" real base
-    [ -n "$p" ] || return 1
-    real=$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")
-    [ -n "$real" ] && [ "$real" != "/" ] || return 1
-    for base in /tmp /var/tmp "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}"; do
-        [ -n "$base" ] || continue
-        base=$(readlink -f "$base" 2>/dev/null || printf '%s' "$base")
-        [ -n "$base" ] && [ "$base" != "/" ] || continue
-        case "$real" in
-            "$base"/*) return 0 ;;
-        esac
-    done
-    return 1
-}
-
-safe_cleanup() {
-    local dir="$1"
-    [ -n "$dir" ] || return 0
-    if is_temp_path "$dir"; then
-        cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
-        rm -rf -- "$dir"
-    else
-        echo "Refusing to remove $dir — not under a temp directory" >&2
-    fi
-}
-
-acquire_apply_lock() {
-    mkdir -p "$DATA_DIR"
-    exec 9>"$LOCK_FILE" || return 1
-    if ! command -v flock &>/dev/null; then
-        show_error "flock is required for safe apply (install util-linux)."
-        return 1
-    fi
-    if ! flock -w 45 9; then
-        show_error "Another kAppIcon operation is in progress (lock timeout)."
-        return 1
-    fi
-    return 0
-}
-
-atomic_replace() {
-    local src="$1" dest="$2"
-    mv -f -- "$src" "$dest"
-}
-
-# Unique backup: timestamp + pid + random (no same-second clobber).
-backup_desktop_file() {
-    local src="$1"
-    local backup_dir="${2:-$BACKUP_DIR_DEFAULT}"
-    local base dest
-    [ -f "$src" ] || return 1
-    mkdir -p "$backup_dir" || return 1
-    base=$(basename -- "$src")
-    is_valid_desktop_id "$base" || return 1
-    dest="$backup_dir/${base}.backup.$(date +%Y%m%d%H%M%S).$$.$RANDOM"
-    while [ -e "$dest" ]; do
-        dest="$backup_dir/${base}.backup.$(date +%Y%m%d%H%M%S).$$.$RANDOM"
-    done
-    cp -a -- "$src" "$dest" || return 1
-    printf '%s\n' "$dest"
-}
-
-# Set Icon= only inside [Desktop Entry], atomically.
-set_desktop_icon() {
-    local desktop_file="$1" icon_value="$2"
-    python3 - "$desktop_file" "$icon_value" <<'PY'
-import os, sys, tempfile
-
-path, icon = sys.argv[1], sys.argv[2]
-if not path or not icon:
-    sys.exit("empty path or icon")
-
-try:
-    with open(path, "r", errors="replace") as f:
-        lines = f.readlines()
-except OSError as e:
-    print(e, file=sys.stderr)
-    sys.exit(1)
-
-out = []
-in_entry = False
-icon_set = False
-for line in lines:
-    stripped = line.strip()
-    if stripped.startswith("[") and stripped.endswith("]"):
-        if in_entry and not icon_set:
-            out.append(f"Icon={icon}\n")
-            icon_set = True
-        in_entry = stripped == "[Desktop Entry]"
-        out.append(line if line.endswith("\n") else line + "\n")
-        continue
-    if in_entry and stripped.startswith("Icon="):
-        if not icon_set:
-            out.append(f"Icon={icon}\n")
-            icon_set = True
-        continue
-    out.append(line if line.endswith("\n") or line == "" else line + "\n")
-
-if in_entry and not icon_set:
-    out.append(f"Icon={icon}\n")
-elif not icon_set:
-    out.insert(0, "[Desktop Entry]\n")
-    out.insert(1, f"Icon={icon}\n")
-
-dirn = os.path.dirname(path) or "."
-fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".desktop", dir=dirn)
-try:
-    with os.fdopen(fd, "w") as f:
-        f.writelines(out)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    raise
-PY
-}
-
-clear_desktop_icon() {
-    local desktop_file="$1"
-    python3 - "$desktop_file" <<'PY'
-import os, sys, tempfile
-
-path = sys.argv[1]
-try:
-    with open(path, "r", errors="replace") as f:
-        lines = f.readlines()
-except OSError as e:
-    print(e, file=sys.stderr)
-    sys.exit(1)
-
-out = []
-in_entry = False
-for line in lines:
-    stripped = line.strip()
-    if stripped.startswith("[") and stripped.endswith("]"):
-        in_entry = stripped == "[Desktop Entry]"
-        out.append(line if line.endswith("\n") else line + "\n")
-        continue
-    if in_entry and stripped.startswith("Icon="):
-        continue
-    out.append(line if line.endswith("\n") or line == "" else line + "\n")
-
-dirn = os.path.dirname(path) or "."
-fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".desktop", dir=dirn)
-try:
-    with os.fdopen(fd, "w") as f:
-        f.writelines(out)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    raise
-PY
-}
 
 get_desktop_dirs() {
     local dirs=()
@@ -291,74 +94,21 @@ find_desktop_files() {
     done < <(get_desktop_dirs)
 }
 
-find_desktop_path() {
-    local id="$1" d
-    local user_dir="$USER_APPS_DIR"
-    if [ -f "$user_dir/$id" ]; then
-        printf '%s\n' "$user_dir/$id"
-        return 0
-    fi
-    while IFS= read -r d; do
-        [ -n "$d" ] || continue
-        if [ -f "$d/$id" ]; then
-            printf '%s\n' "$d/$id"
-            return 0
-        fi
-    done < <(get_desktop_dirs)
-    return 1
-}
-
-show_error() {
-    local msg="$1"
-    if command -v kdialog &>/dev/null; then
-        kdialog --title "Error" --error "$msg"
-    elif command -v zenity &>/dev/null; then
-        zenity --error --title="Error" --text="$msg"
-    elif command -v notify-send &>/dev/null; then
-        notify-send -u critical "Error" "$msg"
-    else
-        echo "❌ Error: $msg" >&2
-    fi
-}
-
-show_info() {
-    local msg="$1"
-    if command -v kdialog &>/dev/null; then
-        kdialog --title "Success!" --passivepopup "$msg" 3
-    elif command -v notify-send &>/dev/null; then
-        notify-send "Success!" "$msg"
-    elif command -v zenity &>/dev/null; then
-        zenity --info --title="Success!" --text="$msg" --timeout=3
-    else
-        echo "✅ Success: $msg"
-    fi
-}
-
-MAGICK_CMD="magick"
-if ! command -v magick &>/dev/null; then
-    if command -v convert &>/dev/null; then
-        MAGICK_CMD="convert"
-    else
-        MAGICK_CMD=""
-    fi
-fi
-# ImageMagick is only required when rasterizing custom files (not theme icons).
-
-# 1. UNIFIED PyQt6 WINDOW — Map icons, edit/create icons, settings
 DESKTOP_LIST=$(find_desktop_files | sort -u)
 export XDG_CONFIG_HOME XDG_DATA_HOME XDG_BIN_HOME
 export XDG_DOWNLOAD_DIR XDG_PICTURES_DIR
 export CONFIG_DIR DATA_DIR USER_APPS_DIR USER_ICONS_DIR TARGET_DIR
 export DOWNLOADS_DIR LIBRARY_DIR BACKUP_DIR_DEFAULT
 export DESKTOP_LIST
+export FLATPAK_ID
 
 # ── Python package path (no pip install required) ────────────────────────
 _kappicon_resolve_python_path() {
-    local cand script_dir repo_root
     if [ -n "${KAPPICON_PYTHON_PATH:-}" ] && [ -d "${KAPPICON_PYTHON_PATH}/kappicon" ]; then
         printf '%s\n' "$KAPPICON_PYTHON_PATH"
         return 0
     fi
+    local script_dir repo_root
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
     repo_root="$(cd "$script_dir/.." && pwd)"
     if [ -d "$repo_root/python/kappicon" ]; then
@@ -383,7 +133,5 @@ KAPPICON_PYTHON_PATH="$(_kappicon_resolve_python_path)" || {
 export KAPPICON_PYTHON_PATH
 export PYTHONPATH="${KAPPICON_PYTHON_PATH}${PYTHONPATH:+:$PYTHONPATH}"
 
-# Launch GUI (in-process apply; no RESULT close-to-apply protocol)
+# All launcher mutation is in-package (no shell Icon= / flock helpers).
 exec python3 -m kappicon
-
-# Note: legacy close-to-apply shell mutation removed from runtime path (exec above).

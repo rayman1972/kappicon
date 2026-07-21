@@ -56,6 +56,112 @@ TARGET_DIR="${TARGET_DIR:-$XDG_PICTURES_DIR/KAppIcon}"
 LOCK_FILE="$DATA_DIR/apply.lock"
 mkdir -p "$TARGET_DIR" "$CONFIG_DIR" "$BACKUP_DIR" "$USER_APPS_DIR"
 
+# Package path for shared mutation (same order as gui/kappicon)
+_kappicon_resolve_python_path() {
+    if [ -n "${KAPPICON_PYTHON_PATH:-}" ] && [ -d "${KAPPICON_PYTHON_PATH}/kappicon" ]; then
+        printf '%s\n' "$KAPPICON_PYTHON_PATH"
+        return 0
+    fi
+    local script_dir repo_root
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+    repo_root="$(cd "$script_dir/.." && pwd)"
+    if [ -d "$repo_root/python/kappicon" ]; then
+        printf '%s\n' "$repo_root/python"
+        return 0
+    fi
+    if [ -d "${DATA_DIR}/python/kappicon" ]; then
+        printf '%s\n' "${DATA_DIR}/python"
+        return 0
+    fi
+    if [ -d /usr/lib/kappicon/python/kappicon ]; then
+        printf '%s\n' "/usr/lib/kappicon/python"
+        return 0
+    fi
+    return 1
+}
+
+kappicon_ensure_package() {
+    KAPPICON_PYTHON_PATH="$(_kappicon_resolve_python_path)" || {
+        echo "❌ kAppIcon Python package not found; reinstall or set KAPPICON_PYTHON_PATH" >&2
+        exit 1
+    }
+    export KAPPICON_PYTHON_PATH
+    export PYTHONPATH="${KAPPICON_PYTHON_PATH}${PYTHONPATH:+:$PYTHONPATH}"
+    export XDG_CONFIG_HOME XDG_DATA_HOME XDG_BIN_HOME
+    export XDG_DOWNLOAD_DIR XDG_PICTURES_DIR
+    export DATA_DIR USER_APPS_DIR USER_ICONS_DIR TARGET_DIR
+    export BACKUP_DIR_DEFAULT="${BACKUP_DIR_DEFAULT:-$BACKUP_DIR}"
+    export BACKUP_DIR
+}
+
+# Apply icon via shared package (fcntl lock + hicolor + Icon=). Prints icon_value on success.
+kappicon_cli_apply() {
+    local desktop_id="$1" src_path="$2" backup_flag="$3"
+    kappicon_ensure_package
+    BACKUP_DIR_DEFAULT="$BACKUP_DIR" python3 - "$desktop_id" "$src_path" "$backup_flag" <<'PY'
+import sys
+from kappicon import ApplyError, apply_icon_to_desktop, apply_lock
+
+desktop_id, src, backup_s = sys.argv[1], sys.argv[2], sys.argv[3]
+backup = backup_s.lower() in ("1", "true", "yes", "on")
+try:
+    with apply_lock():
+        result = apply_icon_to_desktop(desktop_id, src, shape="as-is", backup=backup)
+except ApplyError as e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
+print(result.get("icon_value") or "")
+PY
+}
+
+# Restore backup basename into USER_APPS_DIR via package lock + atomic copy.
+kappicon_cli_restore() {
+    local selected="$1"
+    kappicon_ensure_package
+    BACKUP_DIR_DEFAULT="$BACKUP_DIR" python3 - "$selected" <<'PY'
+import os
+import sys
+from kappicon import ApplyError, apply_lock, parse_backup_desktop_id
+from kappicon.desktop import _atomic_copy_file, is_valid_desktop_id
+from kappicon.paths import BACKUP_DIR, USER_APPS_DIR
+
+selected = sys.argv[1]
+desktop_id = parse_backup_desktop_id(selected)
+if not desktop_id or not is_valid_desktop_id(desktop_id):
+    print(f"Backup does not map to a valid desktop id: {desktop_id or selected}", file=sys.stderr)
+    sys.exit(1)
+src = os.path.join(BACKUP_DIR, selected)
+if not os.path.isfile(src):
+    print(f"Backup file missing: {src}", file=sys.stderr)
+    sys.exit(1)
+src_real = os.path.realpath(src)
+backup_real = os.path.realpath(BACKUP_DIR)
+if not (src_real == backup_real or src_real.startswith(backup_real + os.sep)):
+    print("Backup path escaped backup directory.", file=sys.stderr)
+    sys.exit(1)
+dest = os.path.join(USER_APPS_DIR, desktop_id)
+try:
+    with apply_lock():
+        os.makedirs(USER_APPS_DIR, exist_ok=True)
+        _atomic_copy_file(src, dest)
+        try:
+            os.chmod(dest, 0o644)
+        except OSError:
+            pass
+except ApplyError as e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
+print(desktop_id)
+PY
+}
+
+
 # Track temp workdirs for EXIT/INT/TERM cleanup (avoids leaks on interrupt)
 WORK_DIR=""
 cleanup_on_exit() {
@@ -113,160 +219,14 @@ safe_cleanup() {
 
 # Serialize apply/restore against concurrent CLI+GUI instances (race on
 # same .desktop / same PNG / same backup second).
-acquire_apply_lock() {
-    mkdir -p "$DATA_DIR"
-    # FD 9 held for the rest of this process
-    exec 9>"$LOCK_FILE" || return 1
-    if ! command -v flock &>/dev/null; then
-        echo "❌ flock is required for safe apply (install util-linux)." >&2
-        return 1
-    fi
-    if ! flock -w 45 9; then
-        echo "❌ Another kAppIcon operation is in progress (lock timeout)." >&2
-        return 1
-    fi
-    return 0
-}
 
 # Atomic rename when possible (same filesystem).
-atomic_replace() {
-    local src="$1" dest="$2"
-    mv -f -- "$src" "$dest"
-}
 
 # Unique backup path: timestamp + pid + random (no second-collision clobber).
-backup_desktop_file() {
-    local src="$1"
-    local base dest
-    [ -f "$src" ] || return 1
-    mkdir -p "$BACKUP_DIR" || return 1
-    base=$(basename -- "$src")
-    if ! is_valid_desktop_id "$base"; then
-        echo "❌ Refusing to backup invalid desktop id: $base" >&2
-        return 1
-    fi
-    dest="$BACKUP_DIR/${base}.backup.$(date +%Y%m%d%H%M%S).$$.$RANDOM"
-    while [ -e "$dest" ]; do
-        dest="$BACKUP_DIR/${base}.backup.$(date +%Y%m%d%H%M%S).$$.$RANDOM"
-    done
-    cp -a -- "$src" "$dest" || return 1
-    printf '%s\n' "$dest"
-}
 
 # Set Icon= only inside [Desktop Entry] (never Action sections), atomically.
-set_desktop_icon() {
-    local desktop_file="$1" icon_value="$2"
-    python3 - "$desktop_file" "$icon_value" <<'PY'
-import os, sys, tempfile
-
-path, icon = sys.argv[1], sys.argv[2]
-if not path or not icon:
-    sys.exit("empty path or icon")
-if os.path.sep in os.path.basename(path) or path.endswith(os.path.sep):
-    sys.exit("invalid desktop path")
-
-try:
-    with open(path, "r", errors="replace") as f:
-        lines = f.readlines()
-except OSError as e:
-    print(e, file=sys.stderr)
-    sys.exit(1)
-
-out = []
-in_entry = False
-icon_set = False
-for line in lines:
-    stripped = line.strip()
-    if stripped.startswith("[") and stripped.endswith("]"):
-        # Leaving Desktop Entry without Icon= — append before next section
-        if in_entry and not icon_set:
-            out.append(f"Icon={icon}\n")
-            icon_set = True
-        in_entry = stripped == "[Desktop Entry]"
-        out.append(line if line.endswith("\n") else line + "\n")
-        continue
-    if in_entry and stripped.startswith("Icon="):
-        if not icon_set:
-            out.append(f"Icon={icon}\n")
-            icon_set = True
-        # Drop duplicate Icon= lines in the same section
-        continue
-    out.append(line if line.endswith("\n") or line == "" else line + "\n")
-
-if in_entry and not icon_set:
-    out.append(f"Icon={icon}\n")
-elif not icon_set:
-    # No [Desktop Entry] at all — prepend a minimal one
-    out.insert(0, "[Desktop Entry]\n")
-    out.insert(1, f"Icon={icon}\n")
-
-dirn = os.path.dirname(path) or "."
-fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".desktop", dir=dirn)
-try:
-    with os.fdopen(fd, "w") as f:
-        f.writelines(out)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    raise
-PY
-}
 
 # Remove Icon= only from [Desktop Entry], atomically.
-clear_desktop_icon() {
-    local desktop_file="$1"
-    python3 - "$desktop_file" <<'PY'
-import os, sys, tempfile
-
-path = sys.argv[1]
-try:
-    with open(path, "r", errors="replace") as f:
-        lines = f.readlines()
-except OSError as e:
-    print(e, file=sys.stderr)
-    sys.exit(1)
-
-out = []
-in_entry = False
-for line in lines:
-    stripped = line.strip()
-    if stripped.startswith("[") and stripped.endswith("]"):
-        in_entry = stripped == "[Desktop Entry]"
-        out.append(line if line.endswith("\n") else line + "\n")
-        continue
-    if in_entry and stripped.startswith("Icon="):
-        continue
-    out.append(line if line.endswith("\n") or line == "" else line + "\n")
-
-dirn = os.path.dirname(path) or "."
-fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".desktop", dir=dirn)
-try:
-    with os.fdopen(fd, "w") as f:
-        f.writelines(out)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    raise
-PY
-}
 
 # Resolve desktop id → full path (user override wins).
 find_desktop_path() {
@@ -482,63 +442,26 @@ do_restore() {
         echo "❌ No backups directory found."
         exit 1
     fi
-    mapfile -t backups < <(find "$BACKUP_DIR" -maxdepth 1 -name "*.backup.*" -printf "%f\n" 2>/dev/null | sort -r)
+    mapfile -t backups < <(find "$BACKUP_DIR" -maxdepth 1 -name "*.backup.*" -printf "%f
+" 2>/dev/null | sort -r)
     if [ ${#backups[@]} -eq 0 ]; then
         echo "❌ No backups found in $BACKUP_DIR"
         exit 1
     fi
     echo "📋 Available backups:"
-    selected=$(printf '%s\n' "${backups[@]}" | fzf --height 40% --reverse --prompt="Restore > ")
+    selected=$(printf '%s
+' "${backups[@]}" | fzf --height 40% --reverse --prompt="Restore > ")
     if [ -z "$selected" ]; then
         echo "Cancelled."
         exit 0
     fi
-    # Only allow restore from inside BACKUP_DIR (no path components in selection)
     case "$selected" in
         */*|*".."*) echo "❌ Invalid backup name."; exit 1 ;;
     esac
-    # Parse <desktop_id>.backup.<YYYYMMDDHHMMSS>.<pid>.<suffix> (id may contain .backup.)
-    desktop_name=$(python3 - "$selected" <<'PY'
-import re, sys
-name = sys.argv[1]
-m = re.match(r"^(.+)\.backup\.(\d{14})\.(\d+)\.([A-Za-z0-9]+)$", name)
-print(m.group(1) if m else "")
-PY
-)
-    if ! is_valid_desktop_id "$desktop_name"; then
-        echo "❌ Backup does not map to a valid desktop id: ${desktop_name:-$selected}"
+    desktop_name=$(kappicon_cli_restore "$selected") || {
+        echo "❌ Restore failed."
         exit 1
-    fi
-    src="$BACKUP_DIR/$selected"
-    dest="$USER_APPS_DIR/$desktop_name"
-    if [ ! -f "$src" ]; then
-        echo "❌ Backup file missing: $src"
-        exit 1
-    fi
-    # Guard: resolved path must stay under BACKUP_DIR
-    src_real=$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")
-    backup_real=$(readlink -f "$BACKUP_DIR" 2>/dev/null || printf '%s' "$BACKUP_DIR")
-    case "$src_real" in
-        "$backup_real"/*) ;;
-        *) echo "❌ Backup path escaped backup directory."; exit 1 ;;
-    esac
-
-    if ! acquire_apply_lock; then
-        exit 1
-    fi
-    mkdir -p "$USER_APPS_DIR"
-    tmp=$(mktemp "$USER_APPS_DIR/.kappicon-restore-XXXXXX") || exit 1
-    if ! cp -a -- "$src" "$tmp"; then
-        rm -f -- "$tmp"
-        echo "❌ Failed to copy backup."
-        exit 1
-    fi
-    chmod 644 "$tmp" 2>/dev/null || true
-    if ! atomic_replace "$tmp" "$dest"; then
-        rm -f -- "$tmp"
-        echo "❌ Failed to install restored desktop file."
-        exit 1
-    fi
+    }
     echo "✅ Restored $desktop_name from backup."
     do_refresh
 }
@@ -601,14 +524,9 @@ if ! command -v fzf &>/dev/null; then
     exit 1
 fi
 
-MAGICK_CMD="magick"
-if ! command -v magick &>/dev/null; then
-    if command -v convert &>/dev/null; then
-        MAGICK_CMD="convert"
-    else
-        echo "❌ ImageMagick is not installed. Please install it (magick or convert)." >&2
-        exit 1
-    fi
+# ImageMagick needed for non-SVG rasters (package enforces at apply time)
+if ! command -v magick &>/dev/null && ! command -v convert &>/dev/null; then
+    echo "⚠️  ImageMagick not found (magick/convert). Non-SVG icons may fail at apply."
 fi
 
 if [ ! -d "$DOWNLOADS_DIR" ]; then
@@ -675,184 +593,17 @@ fi
 FILE_EXT="${SRC_PATH##*.}"
 FILE_EXT=$(printf '%s' "$FILE_EXT" | tr '[:upper:]' '[:lower:]')
 
-# Collision-resistant + content-addressed theme name (matches GUI contract)
-ICON_THEME_NAME=$(python3 - "$SELECTED_APP" "$SRC_PATH" <<'PY'
-import hashlib, re, sys
-desktop_id, path = sys.argv[1], sys.argv[2]
-base = desktop_id[:-8] if desktop_id.endswith(".desktop") else desktop_id
-label = re.sub(r"[^A-Za-z0-9._+-]", "_", base).strip("_")[:48] or "app"
-id_hash = hashlib.sha256(desktop_id.encode()).hexdigest()[:10]
-h = hashlib.sha256(b"as-is\0" + desktop_id.encode())
-with open(path, "rb") as f:
-    for chunk in iter(lambda: f.read(65536), b""):
-        h.update(chunk)
-print(f"kappicon-{label}-{id_hash}-{h.hexdigest()[:12]}")
-PY
-)
-[ -n "$ICON_THEME_NAME" ] || { echo "❌ Failed to compute icon name."; exit 1; }
-PNG_OUTPUT="$TARGET_DIR/${ICON_THEME_NAME}.png"
-HICOLOR="$USER_ICONS_DIR/hicolor"
-
-# Serialize mutations of shared state
-if ! acquire_apply_lock; then
+# Shared package mutation (lock + hicolor + Icon=)
+echo "📐 Applying icon via shared kAppIcon engine…"
+ICON_VALUE=$(kappicon_cli_apply "$SELECTED_APP" "$SRC_PATH" "$BACKUP_ENABLED") || {
+    echo "❌ Failed to apply icon to $SELECTED_APP"
+    exit 1
+}
+if [ -z "$ICON_VALUE" ]; then
+    echo "❌ Apply returned empty icon value."
     exit 1
 fi
-
-# Render / stage asset, then install into user hicolor (never depend on Downloads path)
-case "$FILE_EXT" in
-    svg|svgz)
-        echo "✅ Installing SVG into user hicolor (scalable)…"
-        mkdir -p "$HICOLOR/scalable/apps"
-        staged=$(mktemp "$HICOLOR/scalable/apps/.kappicon-XXXXXX") || exit 1
-        if ! cp -- "$SRC_PATH" "$staged"; then
-            rm -f -- "$staged"
-            echo "❌ Failed to install SVG icon."
-            exit 1
-        fi
-        if ! atomic_replace "$staged" "$HICOLOR/scalable/apps/${ICON_THEME_NAME}.${FILE_EXT}"; then
-            rm -f -- "$staged"
-            echo "❌ Failed to install SVG icon."
-            exit 1
-        fi
-        ICON_VALUE="$ICON_THEME_NAME"
-        ;;
-    *)
-        WORK_DIR=$(mktemp -d) || { echo "❌ mktemp failed"; exit 1; }
-        SOURCE_COPY="$WORK_DIR/source.$FILE_EXT"
-        if ! cp -- "$SRC_PATH" "$SOURCE_COPY"; then
-            echo "❌ Failed to copy source icon."
-            exit 1
-        fi
-
-        # Render to a temp sibling then rename (no half-written PNG on crash/race)
-        mkdir -p "$TARGET_DIR"
-        PNG_TMP=$(mktemp "$TARGET_DIR/.kappicon-render-XXXXXX") || exit 1
-
-        case "$FILE_EXT" in
-            icns)
-                echo "🚀 Extracting image assets safely..."
-                if ! command -v icns2png &>/dev/null; then
-                    echo "❌ icns2png is not installed (package: libicns / icnsutils)."
-                    rm -f -- "$PNG_TMP"
-                    exit 1
-                fi
-                (cd "$WORK_DIR" && icns2png -x "source.$FILE_EXT") > /dev/null 2>&1
-                EXTRACTED_FILE=$(find "$WORK_DIR" -maxdepth 1 \( -name '*1024x1024*.png' -o -name '*512x512*.png' \) 2>/dev/null | head -n 1)
-                if [ -z "$EXTRACTED_FILE" ]; then
-                    EXTRACTED_FILE=$(find "$WORK_DIR" -maxdepth 1 -name '*.png' -printf '%s\t%p\n' 2>/dev/null | sort -nr | head -n 1 | cut -f2-)
-                fi
-                if [ -f "$EXTRACTED_FILE" ]; then
-                    echo "📐 Applying the icon..."
-                    # No -fuzz/-trim: those nibble anti-aliased rounded corners
-                    if ! "$MAGICK_CMD" "$EXTRACTED_FILE" -background none -alpha set \
-                        -resize 512x512 -gravity center -extent 512x512 "$PNG_TMP"; then
-                        echo "❌ ImageMagick failed to process extracted PNG."
-                        rm -f -- "$PNG_TMP"
-                        exit 1
-                    fi
-                else
-                    echo "❌ Extraction failed! Could not extract a valid PNG from this .icns file."
-                    rm -f -- "$PNG_TMP"
-                    exit 1
-                fi
-                ;;
-            png|jpg|jpeg|webp|bmp|gif|xpm)
-                echo "📐 Applying the icon..."
-                if ! "$MAGICK_CMD" "$SOURCE_COPY" -background none -alpha set \
-                    -resize 512x512 -gravity center -extent 512x512 "$PNG_TMP" 2>/dev/null; then
-                    echo "❌ Could not process this image file (.$FILE_EXT)."
-                    rm -f -- "$PNG_TMP"
-                    exit 1
-                fi
-                if [ ! -s "$PNG_TMP" ]; then
-                    echo "❌ Could not process this image file (.$FILE_EXT)."
-                    rm -f -- "$PNG_TMP"
-                    exit 1
-                fi
-                ;;
-            *)
-                echo "❌ Unsupported file type: .$FILE_EXT (use png/jpg/webp/svg/icns)"
-                rm -f -- "$PNG_TMP"
-                exit 1
-                ;;
-        esac
-
-        if ! atomic_replace "$PNG_TMP" "$PNG_OUTPUT"; then
-            rm -f -- "$PNG_TMP"
-            echo "❌ Failed to install rendered icon."
-            exit 1
-        fi
-        safe_cleanup "$WORK_DIR"
-        WORK_DIR=""
-        echo "✅ Staged PNG: $PNG_OUTPUT"
-
-        # Install multi-size hicolor (same contract as GUI)
-        for sz in 512 256 128 64 48; do
-            mkdir -p "$HICOLOR/${sz}x${sz}/apps"
-            dest="$HICOLOR/${sz}x${sz}/apps/${ICON_THEME_NAME}.png"
-            staged=$(mktemp "$HICOLOR/${sz}x${sz}/apps/.kappicon-XXXXXX") || continue
-            if [ "$sz" -eq 512 ]; then
-                if ! cp -- "$PNG_OUTPUT" "$staged"; then
-                    rm -f -- "$staged"
-                    continue
-                fi
-            else
-                if ! "$MAGICK_CMD" "$PNG_OUTPUT" -background none -resize "${sz}x${sz}" \
-                    "$staged" 2>/dev/null; then
-                    rm -f -- "$staged"
-                    continue
-                fi
-            fi
-            atomic_replace "$staged" "$dest" || rm -f -- "$staged"
-        done
-        if [ ! -f "$HICOLOR/512x512/apps/${ICON_THEME_NAME}.png" ]; then
-            echo "❌ Failed to install icon into the hicolor theme."
-            exit 1
-        fi
-        ICON_VALUE="$ICON_THEME_NAME"
-        ;;
-esac
-
-# Overwrite user local app config — prefer an existing user override if present
-USER_APP_DIR="$USER_APPS_DIR"
-mkdir -p "$USER_APP_DIR"
-APP_PATH=$(find_desktop_path "$SELECTED_APP" || true)
-
-if [ -z "$APP_PATH" ] || [ ! -f "$APP_PATH" ]; then
-    echo "❌ Could not find desktop entry: $SELECTED_APP"
-    exit 1
-fi
-
-# Backup if enabled
-if [ "$BACKUP_ENABLED" = "true" ]; then
-    if backup_desktop_file "$APP_PATH" >/dev/null; then
-        echo "📦 Backup saved."
-    else
-        echo "⚠️  Backup failed; aborting to avoid unrecoverable change." >&2
-        exit 1
-    fi
-fi
-
-if [ "$APP_PATH" != "$USER_APP_DIR/$SELECTED_APP" ]; then
-    tmp=$(mktemp "$USER_APP_DIR/.kappicon-desktop-XXXXXX") || exit 1
-    if ! cp -a -- "$APP_PATH" "$tmp"; then
-        rm -f -- "$tmp"
-        echo "❌ Failed to copy desktop entry to user applications."
-        exit 1
-    fi
-    chmod 644 "$tmp" 2>/dev/null || true
-    if ! atomic_replace "$tmp" "$USER_APP_DIR/$SELECTED_APP"; then
-        rm -f -- "$tmp"
-        echo "❌ Failed to install user desktop entry."
-        exit 1
-    fi
-fi
-
-if ! set_desktop_icon "$USER_APP_DIR/$SELECTED_APP" "$ICON_VALUE"; then
-    echo "❌ Failed to update Icon= in $SELECTED_APP"
-    exit 1
-fi
-
 echo "🎉 Success! Custom icon fully assigned to $SELECTED_APP"
 echo "   Icon= $ICON_VALUE  (user hicolor)"
 do_refresh
+
