@@ -7,17 +7,20 @@
 [![UI](https://img.shields.io/badge/UI-PyQt6-41cd52.svg)](#requirements)
 [![Release](https://img.shields.io/github/v/release/rayman1972/kappicon?include_prereleases&label=release)](https://github.com/rayman1972/kappicon/releases)
 
-**Version 3.1** — change **Linux app launcher icons** without root.
+**Version 3.2** — change **Linux app launcher icons** without root.
 
 **kAppIcon** is a small **icon manager** for **KDE Plasma** and other **freedesktop** desktops. Map a custom image, copy another app’s icon, or pick one icon from any installed **icon theme** (WhiteSur, Tela, Breeze, Papirus, …) and apply it to a single application — without switching your whole system theme.
 
 It only edits **user-level** [desktop entries](https://specifications.freedesktop.org/desktop-entry-spec/) (`.desktop` files), installs custom icons into your personal **hicolor** theme when needed, and refreshes Plasma / GTK icon caches so menus and panels pick up the change.
 
+From **3.2** the app is a thin `kappicon` launcher plus a shared **Python package** (`python/kappicon/`) used by both the GUI and CLI for safe apply / reset / restore. You still start it with one command: `kappicon` (and the menu `.desktop` entry).
+
 | | |
 |---|---|
-| **GUI** | `kappicon` — Map · Create · Settings · Overrides · Missing |
-| **CLI** | `kappicon-cli` — interactive terminal mapper (`fzf`) |
-| **Install** | `./install.sh` → `~/.local/bin` (XDG paths; user-level by default) |
+| **GUI** | `kappicon` — Map · Create · Settings · Overrides · Missing (PyQt6) |
+| **CLI** | `kappicon-cli` — interactive terminal mapper (`fzf`); same mutation engine as the GUI |
+| **Core** | `python/kappicon/` — shared lock, desktop writes, icons, discovery |
+| **Install** | `./install.sh` → `~/.local/bin` + package under `~/.local/share/kappicon/python` (XDG; user-level by default) |
 | **Source** | [github.com/rayman1972/kappicon](https://github.com/rayman1972/kappicon) |
 
 ### Quick install
@@ -100,8 +103,9 @@ Only menu-visible, runnable apps with empty or unresolved `Icon=` (hidden helper
 | **Shapes** | When applying custom images: as designed, or mask to square / rounded / circle |
 | **Reset** | Restore an app’s system icon (Map and Overrides); preserves other desktop customizations when needed |
 | **Backups** | Optional auto-backup of `.desktop` files before changes + restore UI (Undo can reverse a restore) |
-| **CLI** | Terminal mapper with `fzf` (`kappicon-cli`); same user-level hicolor / lock contract for applies |
-| **Safe by design** | User overrides only, exclusive apply lock, atomic writes, validated desktop ids, content-addressed custom icons |
+| **CLI** | Terminal mapper with `fzf` (`kappicon-cli`); shared Python mutation API with the GUI |
+| **Safe by design** | User overrides only, exclusive apply lock (`fcntl`), atomic writes, validated desktop ids, content-addressed custom icons |
+| **Tests** | Headless suite + `./scripts/validate.sh` (see [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)) |
 
 Supported image types include **PNG, JPG, WEBP, SVG, ICNS, BMP, GIF, XPM**.
 
@@ -113,7 +117,6 @@ Supported image types include **PNG, JPG, WEBP, SVG, ICNS, BMP, GIF, XPM**.
 - **ImageMagick** (`magick` or `convert`) for rasterizing custom icons
 - **icns2png** (`libicns` / `icnsutils`) for Apple `.icns` files
 - **fzf** for the interactive CLI mapper (not required for `--help` / `--refresh` / `--restore`)
-- **util-linux `flock`** for CLI and legacy shell mutation paths (exclusive apply lock)
 - **kdialog** (optional; native file dialogs / notifications on KDE)
 
 ### Minimum tested versions
@@ -127,7 +130,6 @@ These are **development / “tested with” floors**, not a hard claim that ever
 | **ImageMagick** | `magick` **or** legacy `convert` on `PATH` |
 | **icns2png** | From `libicns` / `icnsutils` / `libicns-utils` for `.icns` |
 | **fzf** | Interactive CLI mapper only |
-| **flock** | From **util-linux** (CLI / shell apply lock) |
 | **sha256sum** / **curl** / **tar** | Non-git `./install.sh --update` (coreutils + curl) |
 | **desktop-file-validate** | Optional; used by `./scripts/validate.sh` when installed |
 
@@ -158,10 +160,10 @@ Install missing packages yourself, or opt in:
 
 | Distro | Packages |
 |--------|----------|
-| **Arch / CachyOS** | `python python-pyqt6 libicns imagemagick kdialog fzf util-linux` |
-| **Debian / Ubuntu** | `python3 python3-pyqt6 icnsutils imagemagick kdialog fzf util-linux` |
-| **Fedora** | `python3 python3-pyqt6 libicns-utils ImageMagick kdialog fzf util-linux` |
-| **openSUSE Leap / Tumbleweed** | `python3` `python3-PyQt6` (or `python3XY-PyQt6` for your Python) `libicns` `ImageMagick` `kdialog` `fzf` `util-linux` |
+| **Arch / CachyOS** | `python python-pyqt6 libicns imagemagick kdialog fzf` |
+| **Debian / Ubuntu** | `python3 python3-pyqt6 icnsutils imagemagick kdialog fzf` |
+| **Fedora** | `python3 python3-pyqt6 libicns-utils ImageMagick kdialog fzf` |
+| **openSUSE Leap / Tumbleweed** | `python3` `python3-PyQt6` (or `python3XY-PyQt6` for your Python) `libicns` `ImageMagick` `kdialog` `fzf` |
 
 Package names are authoritative for install; versions come from the distro. Floors in **Minimum tested versions** are what maintainers aim to test against.
 

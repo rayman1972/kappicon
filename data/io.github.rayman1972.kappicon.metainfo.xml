@@ -26,7 +26,8 @@
       <li>Stay-open Apply, multi-select batch, session undo</li>
       <li>Overrides (current vs system preview) and Missing icons</li>
       <li>Create tab with undo/redo, pan/zoom import, icon library</li>
-      <li>CLI: kappicon-cli</li>
+      <li>CLI: kappicon-cli (shared mutation engine with the GUI)</li>
+      <li>Shared Python package core with thin desktop launcher</li>
     </ul>
   </description>
 
@@ -101,6 +102,16 @@
   </screenshots>
 
   <releases>
+    <release version="3.2.0" date="2026-07-21">
+      <description>
+        <p>
+          Architecture 3.2: shared Python package (python/kappicon) for GUI and CLI
+          mutation, thin launchers, automated tests and validate.sh, safer non-git
+          update with release checksums, and opt-in KAPPICON_TIMING for startup metrics.
+        </p>
+      </description>
+      <url>https://github.com/rayman1972/kappicon/releases/tag/v3.2.0</url>
+    </release>
     <release version="3.1.1" date="2026-07-20">
       <description>
         <p>
