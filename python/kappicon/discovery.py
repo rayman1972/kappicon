@@ -5,7 +5,13 @@ import os
 import re
 
 from .desktop import is_valid_desktop_id, path_is_under, read_desktop_icon_value
-from .paths import USER_APPS_DIR, USER_ICONS_DIR
+from .paths import (
+    DATA_DIR,
+    LIBRARY_DIR,
+    TARGET_DIR,
+    USER_APPS_DIR,
+    USER_ICONS_DIR,
+)
 
 
 def icon_resolves(icon_name):
