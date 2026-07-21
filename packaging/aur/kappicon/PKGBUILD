@@ -21,9 +21,7 @@ optdepends=(
 provides=("${pkgname}")
 conflicts=("${pkgname}-git")
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
-# Regenerated for the v3.2.0 tree; re-run `makepkg -g` after tagging if the tarball differs.
-# After tagging v3.2.0:  curl -sL "$url/archive/refs/tags/v$pkgver.tar.gz" | sha256sum
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums=('96d687b61c7672f7c4624c78dcba50b91565a7252aa997fb34e709664ff3dd34')
 
 package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
