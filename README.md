@@ -1,5 +1,9 @@
 # kAppIcon
 
+> **Literally no one:** …
+>
+> **Me:** Challenge accepted!
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
 [![Arch](https://img.shields.io/badge/arch-x86__64%20%7C%20arm64-blue.svg)](#requirements)
