@@ -63,6 +63,12 @@ Browse packs such as **WhiteSur**, **Tela**, **Breeze**, or any theme under `~/.
 
 ![Map from icon theme](screenshots/gui-map-icon-theme.png)
 
+### Map — batch multi-select
+
+Ctrl/Shift-select several apps, then **Apply to N apps** in one go. The window stays open so you can rice many launchers in one sitting.
+
+![Map batch apply](screenshots/gui-map-batch.png)
+
 ### Create — pixel editor, import with pan/zoom, library
 
 Draw or import, **Undo** / **Redo** on the canvas, then save a standard 512×512 icon to your library (or **Save and use in Map**).
