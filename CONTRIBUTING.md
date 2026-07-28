@@ -20,10 +20,9 @@ kappicon              # GUI
 kappicon-cli --help   # CLI
 ```
 
-Requirements and **minimum tested versions** are listed in the
-[README](README.md#requirements) (Python ≥ 3.9, distro PyQt6, ImageMagick,
-icns tooling, fzf, util-linux `flock`). Prefer distro packages over pip-only
-installs; AUR + `install.sh` remain first-class.
+Requirements: **Python ≥ 3.9**, distro PyQt6, ImageMagick, icns tooling, fzf
+(see the [Requirements wiki](https://github.com/rayman1972/kappicon/wiki/Requirements)).
+Prefer distro packages over pip-only installs; AUR + `install.sh` remain first-class.
 
 ### Layout
 
