@@ -95,6 +95,7 @@ Tab walkthrough and CLI flags → **[Usage wiki](https://github.com/rayman1972/k
 | [Installation](https://github.com/rayman1972/kappicon/wiki/Installation) | Install, update, deps |
 | [Requirements](https://github.com/rayman1972/kappicon/wiki/Requirements) | Python, PyQt6, tools |
 | [Usage](https://github.com/rayman1972/kappicon/wiki/Usage) | GUI + CLI |
+| [FAQ](https://github.com/rayman1972/kappicon/wiki/FAQ) | Common questions |
 | [Paths](https://github.com/rayman1972/kappicon/wiki/Paths) | XDG locations |
 | [How it works](https://github.com/rayman1972/kappicon/wiki/How-it-works) | Overrides, icons, safety |
 | [Architecture](https://github.com/rayman1972/kappicon/wiki/Architecture) | Package layout |
