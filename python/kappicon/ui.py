@@ -12,7 +12,9 @@ from PyQt6.QtWidgets import (
     QMainWindow, QGroupBox, QFormLayout, QDialogButtonBox, QStatusBar,
     QStyle, QStyleFactory, QRadioButton, QDialog, QSlider,
     QAbstractItemView, QMenu, QAbstractSpinBox, QTextEdit, QPlainTextEdit,
+    QSpinBox, QScrollArea, QDoubleSpinBox,
 )
+from kappicon import editor_ops
 from PyQt6.QtGui import (
     QPixmap, QIcon, QColor, QPainter, QPainterPath, QPalette,
     QCursor, QImage, QPen, QKeySequence, QShortcut, QAction,
@@ -267,6 +269,7 @@ class PixelCanvas(QFrame):
         self.grid_size = grid_size
         self.tool = "pen"  # pen | eraser | fill | picker
         self.color = QColor(0, 120, 215, 255)
+        self.brush_size = 1  # pen/eraser diameter in pixels
         self.show_grid = True
         self._drawing = False
         self._stroke_undo_pushed = False  # one undo entry per pen/eraser stroke
@@ -445,6 +448,25 @@ class PixelCanvas(QFrame):
             return x, y
         return None
 
+    def set_brush_size(self, size):
+        self.brush_size = max(1, min(64, int(size)))
+
+    def _stamp_disk(self, cx, cy, color):
+        """Paint a filled disk of brush_size diameter centered on (cx, cy)."""
+        r = max(1, int(self.brush_size))
+        # Odd sizes center on the cell; even sizes bias down-right
+        half = r // 2
+        rad2 = (r / 2.0) ** 2
+        w = self.grid_size
+        for dy in range(-half, r - half):
+            for dx in range(-half, r - half):
+                # Circular brush (square for size 1)
+                if r > 1 and (dx + 0.5) ** 2 + (dy + 0.5) ** 2 > rad2 + 0.25:
+                    continue
+                x, y = cx + dx, cy + dy
+                if 0 <= x < w and 0 <= y < w:
+                    self._image.setPixelColor(x, y, color)
+
     def _apply_tool(self, x, y, *, begin_stroke=False):
         if self.tool == "picker":
             self.color = self._image.pixelColor(x, y)
@@ -461,9 +483,9 @@ class PixelCanvas(QFrame):
                 self._push_undo()
                 self._stroke_undo_pushed = True
         if self.tool == "pen":
-            self._image.setPixelColor(x, y, self.color)
+            self._stamp_disk(x, y, self.color)
         elif self.tool == "eraser":
-            self._image.setPixelColor(x, y, QColor(0, 0, 0, 0))
+            self._stamp_disk(x, y, QColor(0, 0, 0, 0))
         elif self.tool == "fill":
             self._flood_fill(x, y, self.color)
         self.update()
@@ -589,6 +611,8 @@ class ImportPositionView(QWidget):
         # Background: None = keep transparency; else solid square under the image.
         # Rounded/circle masks are Settings → applied only on Map Apply.
         self._bg_color = None  # QColor | None
+        # "smooth" = soft upscale (photos); "crisp" = nearest (pixel art / small icons)
+        self._scale_mode = "smooth"
         self.setMinimumSize(360, 360)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
@@ -604,12 +628,26 @@ class ImportPositionView(QWidget):
         self.update()
         self.changed.emit()
 
+    def scale_mode(self):
+        return self._scale_mode
+
+    def set_scale_mode(self, mode: str):
+        mode = (mode or "smooth").lower().strip()
+        if mode not in ("smooth", "crisp"):
+            mode = "smooth"
+        if mode == self._scale_mode:
+            return
+        self._scale_mode = mode
+        self.update()
+        self.changed.emit()
+
     def scale(self):
         return self._scale
 
     def set_scale_factor(self, factor, anchor_canvas=None):
         """Set absolute scale; optional anchor in canvas coords (default center)."""
-        factor = max(0.02, min(32.0, float(factor)))
+        # Allow higher zoom for tiny sources (e.g. 16px → 512 needs scale 32)
+        factor = max(0.02, min(64.0, float(factor)))
         if abs(factor - self._scale) < 1e-9:
             return
         if anchor_canvas is None:
@@ -651,22 +689,57 @@ class ImportPositionView(QWidget):
         self.update()
         self.changed.emit()
 
+    def place_integer(self, factor: int):
+        """Map 1 source pixel → *factor* canvas pixels, centered (sharp for pixel art)."""
+        n = max(1, int(factor))
+        w, h = self._src.width(), self._src.height()
+        if w < 1 or h < 1:
+            return
+        self._scale = float(n)
+        self._dx = (self._canvas - w * self._scale) / 2.0
+        self._dy = (self._canvas - h * self._scale) / 2.0
+        self.update()
+        self.changed.emit()
+
+    def place_max_integer(self):
+        """Largest integer scale that still fits the whole image in the square."""
+        n = editor_ops.max_integer_scale(
+            self._src.width(), self._src.height(), self._canvas
+        )
+        self.place_integer(n)
+        return n
+
+    def _smooth_draw(self) -> bool:
+        return self._scale_mode != "crisp"
+
     def render_canvas(self) -> QImage:
         """Rasterize current view into a canvas_size² icon."""
         out = QImage(self._canvas, self._canvas, QImage.Format.Format_ARGB32)
         out.fill(Qt.GlobalColor.transparent)
         p = QPainter(out)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        smooth = self._smooth_draw()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, smooth)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, smooth)
         full = QRectF(0, 0, self._canvas, self._canvas)
         if self._bg_color is not None:
             p.fillRect(full, self._bg_color)
-        target = QRectF(
-            self._dx, self._dy,
-            self._src.width() * self._scale,
-            self._src.height() * self._scale,
-        )
-        p.drawImage(target, self._src)
+        # Integer crisp path: scale with nearest neighbor first for perfect blocks
+        tw = max(1, int(round(self._src.width() * self._scale)))
+        th = max(1, int(round(self._src.height() * self._scale)))
+        if not smooth and abs(self._scale - round(self._scale)) < 1e-6:
+            scaled = self._src.scaled(
+                tw, th,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            p.drawImage(int(round(self._dx)), int(round(self._dy)), scaled)
+        else:
+            target = QRectF(
+                self._dx, self._dy,
+                self._src.width() * self._scale,
+                self._src.height() * self._scale,
+            )
+            p.drawImage(target, self._src)
         p.end()
         return out
 
@@ -685,8 +758,9 @@ class ImportPositionView(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        smooth = self._smooth_draw()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, smooth)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, smooth)
         p.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Base))
 
         ox, oy, side = self._view_metrics()
@@ -735,9 +809,10 @@ class ImportPositionView(QWidget):
 
         # Corner labels
         p.setPen(QColor(180, 190, 200))
+        mode = "crisp" if not smooth else "smooth"
         p.drawText(
             int(ox), int(oy + side + 16),
-            f"Drag to move · scroll to zoom · {self._canvas}×{self._canvas} crop",
+            f"Drag · scroll zoom · {self._canvas}×{self._canvas} · {mode}",
         )
 
     def mousePressEvent(self, event):
@@ -788,9 +863,15 @@ class ImportPositionDialog(QDialog):
     def __init__(self, source: QImage, canvas_size=STANDARD_ICON_SIZE, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Position import")
-        self.resize(560, 700)
-        self.setMinimumSize(420, 520)
+        self.resize(560, 740)
+        self.setMinimumSize(420, 560)
         self._settings = QSettings("KAppIcon", "KAppIcon")
+        self._source = source.convertToFormat(QImage.Format.Format_ARGB32)
+        self._canvas_size = max(8, int(canvas_size))
+        self._src_w = self._source.width()
+        self._src_h = self._source.height()
+        self._low_res = editor_ops.is_modest_resolution(self._source)
+        self._very_low = editor_ops.is_low_resolution(self._source)
 
         layout = QVBoxLayout(self)
         layout.addWidget(make_hint_label(
@@ -800,8 +881,63 @@ class ImportPositionDialog(QDialog):
             "from Settings when you Map the icon."
         ))
 
-        self.view = ImportPositionView(source, canvas_size=canvas_size, parent=self)
+        # Low-resolution guidance (only when it matters)
+        self.quality_banner = QLabel()
+        self.quality_banner.setWordWrap(True)
+        self.quality_banner.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        hint = editor_ops.import_quality_hint(self._source, self._canvas_size)
+        if hint:
+            self.quality_banner.setText(hint)
+            # Soft warning style without custom theme skins
+            self.quality_banner.setStyleSheet(
+                "QLabel { padding: 8px; border-radius: 4px; "
+                "background-color: palette(alternate-base); }"
+            )
+            layout.addWidget(self.quality_banner)
+        else:
+            self.quality_banner.hide()
+
+        self.view = ImportPositionView(self._source, canvas_size=self._canvas_size, parent=self)
         layout.addWidget(self.view, stretch=1)
+
+        # Scaling quality: crisp avoids blur on small sources
+        scale_box = QGroupBox("Scaling quality")
+        scale_l = QVBoxLayout(scale_box)
+        scale_row = QHBoxLayout()
+        self.scale_crisp = QRadioButton("Crisp (pixel art / small icons)")
+        self.scale_smooth = QRadioButton("Smooth (photos / soft logos)")
+        self.scale_mode_group = QButtonGroup(self)
+        self.scale_mode_group.addButton(self.scale_crisp)
+        self.scale_mode_group.addButton(self.scale_smooth)
+        scale_row.addWidget(self.scale_crisp)
+        scale_row.addWidget(self.scale_smooth)
+        scale_row.addStretch(1)
+        scale_l.addLayout(scale_row)
+        scale_l.addWidget(make_hint_label(
+            f"Source: {self._src_w}×{self._src_h}. "
+            "Crisp uses nearest-neighbor (sharp blocks). "
+            "Smooth softens edges — fine for large photos, blurry for tiny PNGs."
+        ))
+        layout.addWidget(scale_box)
+
+        default_mode = editor_ops.recommended_scale_mode(self._source)
+        # Remember last manual choice only when source is large enough either way
+        saved_scale = self._settings.value("create/import_scale_mode", "", type=str) or ""
+        if self._low_res:
+            mode = "crisp"  # force helpful default for small sources
+        elif saved_scale in ("crisp", "smooth"):
+            mode = saved_scale
+        else:
+            mode = default_mode
+        if mode == "crisp":
+            self.scale_crisp.setChecked(True)
+        else:
+            self.scale_smooth.setChecked(True)
+        self.view.set_scale_mode(mode)
+        self.scale_crisp.toggled.connect(self._on_scale_mode)
+        self.scale_smooth.toggled.connect(self._on_scale_mode)
 
         zoom_row = QHBoxLayout()
         self.zoom_out_btn = QPushButton("−")
@@ -813,7 +949,8 @@ class ImportPositionDialog(QDialog):
         self.zoom_in_btn.setToolTip("Zoom in")
         self.zoom_in_btn.clicked.connect(lambda: self.view.zoom_by(1.15))
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        self.zoom_slider.setRange(5, 800)  # percent of “fit” scale, relative stored below
+        # Wider range so 1× native sits on the slider for tiny sources
+        self.zoom_slider.setRange(1, 1600)  # percent of “fit” scale
         self.zoom_slider.setToolTip("Zoom")
         self._fit_scale = max(self.view.scale(), 1e-6)
         self._updating_slider = False
@@ -836,8 +973,31 @@ class ImportPositionDialog(QDialog):
         fill_btn.clicked.connect(self._do_fill)
         preset_row.addWidget(fit_btn)
         preset_row.addWidget(fill_btn)
-        preset_row.addStretch(1)
+
+        # Integer zoom — critical for small pixel sources
+        max_int = editor_ops.max_integer_scale(self._src_w, self._src_h, self._canvas_size)
+        int_row = QHBoxLayout()
+        int_row.addWidget(QLabel("Integer:"))
+        for n in (1, 2, 4, 8, 16):
+            if n > max_int and n != 1:
+                continue
+            btn = QPushButton(f"×{n}")
+            btn.setToolTip(
+                f"1 source pixel = {n} canvas pixels (sharp). "
+                f"Max that fits: ×{max_int}"
+            )
+            btn.setEnabled(n <= max_int)
+            btn.clicked.connect(lambda _=False, k=n: self._do_integer(k))
+            int_row.addWidget(btn)
+        max_btn = QPushButton(f"Max ×{max_int}")
+        max_btn.setToolTip(
+            "Largest integer scale that still fits the whole image — best for tiny icons"
+        )
+        max_btn.clicked.connect(self._do_max_integer)
+        int_row.addWidget(max_btn)
+        int_row.addStretch(1)
         layout.addLayout(preset_row)
+        layout.addLayout(int_row)
 
         # ── Background: keep transparency or solid square plate ──────────
         # Shape masks (rounded / circle) live in Settings → Applied icon shape
@@ -891,6 +1051,14 @@ class ImportPositionDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        # Small sources: open on max integer + crisp instead of soft Fit
+        if self._low_res:
+            self.view.place_max_integer()
+            self._fit_scale = max(
+                min(self._canvas_size / max(self._src_w, 1),
+                    self._canvas_size / max(self._src_h, 1)),
+                1e-6,
+            )
         self._sync_slider()
 
     def _update_color_btn(self):
@@ -935,7 +1103,13 @@ class ImportPositionDialog(QDialog):
             )
         else:
             self._settings.setValue("create/import_bg_color", self._bg_color.name())
+        scale_mode = "crisp" if self.scale_crisp.isChecked() else "smooth"
+        self._settings.setValue("create/import_scale_mode", scale_mode)
         self.accept()
+
+    def _on_scale_mode(self, _on=None):
+        mode = "crisp" if self.scale_crisp.isChecked() else "smooth"
+        self.view.set_scale_mode(mode)
 
     def _do_fit(self):
         self.view.fit()
@@ -944,6 +1118,19 @@ class ImportPositionDialog(QDialog):
 
     def _do_fill(self):
         self.view.fill()
+        self._sync_slider()
+
+    def _do_integer(self, n: int):
+        # Integer zoom pairs best with crisp; switch if user is still on smooth
+        if not self.scale_crisp.isChecked():
+            self.scale_crisp.setChecked(True)
+        self.view.place_integer(n)
+        self._sync_slider()
+
+    def _do_max_integer(self):
+        if not self.scale_crisp.isChecked():
+            self.scale_crisp.setChecked(True)
+        self.view.place_max_integer()
         self._sync_slider()
 
     def _on_slider(self, value):
@@ -957,13 +1144,27 @@ class ImportPositionDialog(QDialog):
     def _sync_slider(self):
         self._updating_slider = True
         pct = int(round((self.view.scale() / self._fit_scale) * 100))
-        pct = max(5, min(800, pct))
+        pct = max(1, min(1600, pct))
         self.zoom_slider.setValue(pct)
-        self.zoom_label.setText(f"{pct}%")
+        # Show both relative % and effective px scale for clarity on tiny sources
+        src_label = f"{self._src_w}×{self._src_h}"
+        self.zoom_label.setText(f"×{self.view.scale():.1f}")
+        self.zoom_label.setToolTip(
+            f"{pct}% of Fit · source {src_label} · canvas {self._canvas_size}×{self._canvas_size}"
+        )
         self._updating_slider = False
 
     def result_image(self) -> QImage:
         return self.view.render_canvas()
+
+    def import_status_suffix(self) -> str:
+        """Short note for the Create status bar after accept."""
+        mode = self.view.scale_mode()
+        sc = self.view.scale()
+        bits = [f"{self._src_w}×{self._src_h}", mode, f"×{sc:.1f}"]
+        if self._low_res:
+            bits.append("try Pad + Outline if edges need polish")
+        return " · ".join(bits)
 
 
 # ── KDE / Breeze helpers ─────────────────────────────────────────────────
@@ -1702,127 +1903,311 @@ class CombinedWindow(QMainWindow):
 
     # ── Icon editor / creator tab ────────────────────────────────────────
     def _build_editor_tab(self, parent):
+        """Create layout: slim Draw rail | roomy canvas + Transform/Prep | Library.
+
+        Transform and Prep sit under the canvas (full width) so labels are not
+        crushed into a 200px stack. Progressive disclosure via short tooltips.
+        """
         layout = QHBoxLayout(parent)
         layout.setContentsMargins(0, layout_spacing(), 0, 0)
         layout.setSpacing(layout_spacing())
 
-        # Left: tools (QGroupBox + QToolButtons with theme icons)
-        tools = QGroupBox("Tools")
-        tools.setFixedWidth(180)
-        tl = QVBoxLayout(tools)
+        # ── Left: Draw only (comfortable, not a toolbox dump) ───────────
+        tools = QGroupBox("Draw")
+        tools.setFixedWidth(148)
+        draw_l = QVBoxLayout(tools)
+        draw_l.setSpacing(6)
 
         self.editor_tool_group = QButtonGroup(self)
         self.editor_tool_group.setExclusive(True)
         self._tool_btns = {}
+        # 2×2 icon grid — labels live in tooltips to free horizontal space
         tool_defs = (
             ("pen", "Pen", ("draw-brush", "edit-draw")),
             ("eraser", "Eraser", ("draw-eraser", "edit-delete")),
             ("fill", "Fill", ("fill-color", "color-fill")),
             ("picker", "Picker", ("color-picker", "gtk-color-picker")),
         )
-        for key, label, icons in tool_defs:
+        tool_grid = QHBoxLayout()
+        tool_grid.setSpacing(4)
+        col_a = QVBoxLayout()
+        col_a.setSpacing(4)
+        col_b = QVBoxLayout()
+        col_b.setSpacing(4)
+        for i, (key, label, icons) in enumerate(tool_defs):
             b = QToolButton()
             b.setText(label)
             b.setIcon(theme_icon(*icons))
-            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            b.setIconSize(QSize(22, 22))
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
             b.setCheckable(True)
+            b.setAutoRaise(False)
+            b.setMinimumSize(60, 52)
             b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            b.setToolTip(label)
             b.clicked.connect(lambda checked, k=key: self._editor_set_tool(k))
             self.editor_tool_group.addButton(b)
             self._tool_btns[key] = b
-            tl.addWidget(b)
+            (col_a if i % 2 == 0 else col_b).addWidget(b)
+        tool_grid.addLayout(col_a)
+        tool_grid.addLayout(col_b)
+        draw_l.addLayout(tool_grid)
         self._tool_btns["pen"].setChecked(True)
 
-        tl.addWidget(QLabel("Color"))
+        draw_l.addWidget(QLabel("Brush"))
+        self.brush_spin = QSpinBox()
+        self.brush_spin.setRange(1, 64)
+        self.brush_spin.setValue(1)
+        self.brush_spin.setToolTip("Pen and eraser size in pixels")
+        self.brush_spin.valueChanged.connect(self._editor_set_brush_size)
+        draw_l.addWidget(self.brush_spin)
+
+        draw_l.addWidget(QLabel("Color"))
         self.color_btn = QPushButton("Choose…")
         self.color_btn.setIcon(theme_icon("color-management", "fill-color"))
         self.color_btn.clicked.connect(self._editor_pick_color)
-        tl.addWidget(self.color_btn)
+        draw_l.addWidget(self.color_btn)
 
-        tl.addWidget(QLabel("Canvas size"))
+        draw_l.addWidget(QLabel("Canvas"))
         self.size_combo = QComboBox()
         for s in (16, 32, 48, 64, 128, 256, 512):
-            self.size_combo.addItem(f"{s} × {s}", s)
+            self.size_combo.addItem(f"{s}×{s}", s)
         self.size_combo.setCurrentIndex(3)  # 64
         self.size_combo.currentIndexChanged.connect(self._editor_resize)
-        tl.addWidget(self.size_combo)
+        draw_l.addWidget(self.size_combo)
 
-        self.grid_check = QCheckBox("Show pixel grid")
+        self.grid_check = QCheckBox("Pixel grid")
         self.grid_check.setChecked(True)
         self.grid_check.toggled.connect(self._editor_toggle_grid)
-        tl.addWidget(self.grid_check)
+        draw_l.addWidget(self.grid_check)
 
-        tl.addStretch(1)
-
-        # History: undo / redo / clear
+        draw_l.addSpacing(4)
         hist_row = QHBoxLayout()
-        hist_row.setSpacing(6)
-        self.undo_btn = QPushButton("Undo")
+        hist_row.setSpacing(4)
+        self.undo_btn = QToolButton()
+        self.undo_btn.setText("Undo")
         self.undo_btn.setIcon(theme_icon("edit-undo", "edit-undo"))
+        self.undo_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.undo_btn.setToolTip("Undo last change (Ctrl+Z)")
         self.undo_btn.setEnabled(False)
         self.undo_btn.clicked.connect(self._editor_undo)
         hist_row.addWidget(self.undo_btn)
-
-        self.redo_btn = QPushButton("Redo")
+        self.redo_btn = QToolButton()
+        self.redo_btn.setText("Redo")
         self.redo_btn.setIcon(theme_icon("edit-redo", "edit-redo"))
+        self.redo_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.redo_btn.setToolTip("Redo (Ctrl+Shift+Z or Ctrl+Y)")
         self.redo_btn.setEnabled(False)
         self.redo_btn.clicked.connect(self._editor_redo)
         hist_row.addWidget(self.redo_btn)
-        tl.addLayout(hist_row)
+        draw_l.addLayout(hist_row)
 
-        clear_btn = QPushButton("Clear canvas")
+        clear_btn = QPushButton("Clear")
         clear_btn.setIcon(theme_icon("edit-clear", "edit-delete"))
         clear_btn.setToolTip("Erase everything (can be undone)")
         clear_btn.clicked.connect(lambda: self.pixel_canvas.clear())
-        tl.addWidget(clear_btn)
-
+        draw_l.addWidget(clear_btn)
+        draw_l.addStretch(1)
         layout.addWidget(tools)
 
-        # Center: canvas
-        canvas_box = QGroupBox("Canvas")
-        center = QVBoxLayout(canvas_box)
-        center.addWidget(make_hint_label(
-            "Draw with the pen, or import a photo or logo. "
-            f"Imports are always fitted into a {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE} canvas. "
-            "Undo last step with Ctrl+Z."
-        ))
+        # ── Center: canvas gets the space; Transform + Prep sit below ───
+        center_w = QWidget()
+        center = QVBoxLayout(center_w)
+        center.setContentsMargins(0, 0, 0, 0)
+        center.setSpacing(layout_spacing())
+
         self.pixel_canvas = PixelCanvas(64)
         self.pixel_canvas.changed.connect(self._editor_on_change)
         self.pixel_canvas.history_changed.connect(self._editor_update_history_buttons)
         center.addWidget(self.pixel_canvas, stretch=1)
-        layout.addWidget(canvas_box, stretch=1)
+
+        # Transform — one horizontal strip (full labels, no stacking)
+        xform = QGroupBox("Transform")
+        xf = QHBoxLayout(xform)
+        xf.setSpacing(6)
+
+        def _xform_btn(text, tip, icons, slot):
+            b = QPushButton(text)
+            b.setIcon(theme_icon(*icons))
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            xf.addWidget(b)
+            return b
+
+        _xform_btn(
+            "Flip H", "Flip horizontal",
+            ("object-flip-horizontal", "edit-mirror-horizontal"),
+            lambda: self._editor_apply_op(editor_ops.flip_horizontal, "Flipped horizontal"),
+        )
+        _xform_btn(
+            "Flip V", "Flip vertical",
+            ("object-flip-vertical", "edit-mirror-vertical"),
+            lambda: self._editor_apply_op(editor_ops.flip_vertical, "Flipped vertical"),
+        )
+        _xform_btn(
+            "↺ 90°", "Rotate 90° counter-clockwise",
+            ("object-rotate-left", "edit-redo"),
+            lambda: self._editor_apply_op(
+                lambda im: editor_ops.rotate_90(im, clockwise=False), "Rotated 90° CCW"
+            ),
+        )
+        _xform_btn(
+            "↻ 90°", "Rotate 90° clockwise",
+            ("object-rotate-right", "edit-undo"),
+            lambda: self._editor_apply_op(
+                lambda im: editor_ops.rotate_90(im, clockwise=True), "Rotated 90° CW"
+            ),
+        )
+        _xform_btn(
+            "Center", "Center opaque content on the canvas",
+            ("align-horizontal-center", "format-justify-center"),
+            lambda: self._editor_apply_op(editor_ops.center_content, "Centered content"),
+        )
+        _xform_btn(
+            "Trim", "Crop empty edges and re-fit content in the square",
+            ("transform-crop", "edit-cut"),
+            lambda: self._editor_apply_op(
+                lambda im: editor_ops.trim_to_content(im, square=True), "Trimmed to content"
+            ),
+        )
+        xf.addStretch(1)
+        center.addWidget(xform)
+
+        # Prep + size previews side by side under the canvas
+        below = QHBoxLayout()
+        below.setSpacing(layout_spacing())
+
+        prep = QGroupBox("Prep")
+        prep.setToolTip(
+            "One-click polish; each action is a single Undo step. "
+            "Shape masks (rounded/circle) stay in Settings → Apply."
+        )
+        pl = QVBoxLayout(prep)
+        pl.setSpacing(6)
+
+        pad_row = QHBoxLayout()
+        pad_row.addWidget(QLabel("Pad %"))
+        self.pad_spin = QSpinBox()
+        self.pad_spin.setRange(0, 40)
+        self.pad_spin.setValue(int(self.settings.value("create/pad_percent", 12) or 12))
+        self.pad_spin.setToolTip("Transparent margin as % of the canvas edge")
+        self.pad_spin.setMaximumWidth(72)
+        pad_row.addWidget(self.pad_spin)
+        pad_btn = QPushButton("Apply pad")
+        pad_btn.setToolTip("Inset content with a transparent safe margin")
+        pad_btn.clicked.connect(self._editor_apply_padding)
+        pad_row.addWidget(pad_btn)
+        pad_row.addSpacing(12)
+        pad_row.addWidget(QLabel("Tint"))
+        self.tint_amount = QDoubleSpinBox()
+        self.tint_amount.setRange(0.05, 1.0)
+        self.tint_amount.setSingleStep(0.05)
+        self.tint_amount.setValue(0.55)
+        self.tint_amount.setDecimals(2)
+        self.tint_amount.setMaximumWidth(72)
+        self.tint_amount.setToolTip("How strongly to blend toward the current pen color")
+        pad_row.addWidget(self.tint_amount)
+        tint_btn = QPushButton("Apply tint")
+        tint_btn.setToolTip("Blend colors toward the current pen color (keeps alpha)")
+        tint_btn.clicked.connect(self._editor_apply_tint)
+        pad_row.addWidget(tint_btn)
+        pad_row.addStretch(1)
+        pl.addLayout(pad_row)
+
+        look_row = QHBoxLayout()
+        mono_gray = QPushButton("Grayscale")
+        mono_gray.setToolTip("Convert to grayscale, keep transparency")
+        mono_gray.clicked.connect(
+            lambda: self._editor_apply_op(
+                lambda im: editor_ops.monochrome(im, color=None), "Converted to grayscale"
+            )
+        )
+        mono_color = QPushButton("Mono color")
+        mono_color.setToolTip("Replace RGB with the pen color; keep alpha (symbolic-style)")
+        mono_color.clicked.connect(
+            lambda: self._editor_apply_op(
+                lambda im: editor_ops.monochrome(im, color=self.pixel_canvas.color),
+                "Applied monochrome color",
+            )
+        )
+        look_row.addWidget(mono_gray)
+        look_row.addWidget(mono_color)
+        look_row.addSpacing(8)
+        look_row.addWidget(QLabel("Outline"))
+        self.outline_spin = QSpinBox()
+        self.outline_spin.setRange(1, 12)
+        self.outline_spin.setValue(2)
+        self.outline_spin.setMaximumWidth(56)
+        self.outline_spin.setToolTip("Outline thickness in pixels")
+        look_row.addWidget(self.outline_spin)
+        outline_btn = QPushButton("Outline")
+        outline_btn.setToolTip("Draw an outline under the icon using the pen color")
+        outline_btn.clicked.connect(self._editor_apply_outline)
+        look_row.addWidget(outline_btn)
+        shadow_btn = QPushButton("Drop shadow…")
+        shadow_btn.setIcon(theme_icon("shadow", "path-effect-bspline", "draw-shadow"))
+        shadow_btn.setToolTip("Add a soft drop shadow under the icon")
+        shadow_btn.clicked.connect(self._editor_drop_shadow_dialog)
+        look_row.addWidget(shadow_btn)
+        look_row.addStretch(1)
+        pl.addLayout(look_row)
+        below.addWidget(prep, stretch=3)
+
+        prev_box = QGroupBox("Preview")
+        prev_l = QHBoxLayout(prev_box)
+        prev_l.setSpacing(10)
+        self._preview_sizes = (16, 24, 32, 48, 64)
+        self._preview_labels = {}
+        for sz in self._preview_sizes:
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            lab = QLabel()
+            lab.setFixedSize(sz + 8, sz + 8)
+            lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lab.setFrameShape(QFrame.Shape.StyledPanel)
+            lab.setToolTip(f"{sz}×{sz}")
+            col.addWidget(lab, alignment=Qt.AlignmentFlag.AlignHCenter)
+            cap = make_hint_label(str(sz))
+            cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(cap)
+            prev_l.addLayout(col)
+            self._preview_labels[sz] = lab
+        prev_l.addStretch(1)
+        below.addWidget(prev_box, stretch=2)
+        center.addLayout(below)
+
+        layout.addWidget(center_w, stretch=1)
 
         # Extra Redo for Ctrl+Y (menu already has Ctrl+Shift+Z via StandardKey.Redo)
         self._redo_sc_y = QShortcut(QKeySequence("Ctrl+Y"), self)
         self._redo_sc_y.setContext(Qt.ShortcutContext.WindowShortcut)
         self._redo_sc_y.activated.connect(self._editor_redo)
 
-        # Right: actions + library
+        # ── Right: library (unchanged role) ─────────────────────────────
         right = QGroupBox("Library")
-        right.setFixedWidth(260)
+        right.setFixedWidth(240)
         rl = QVBoxLayout(right)
+        rl.setSpacing(6)
 
         import_btn = QPushButton("Import image…")
         import_btn.setIcon(theme_icon("document-open", "document-import"))
         import_btn.clicked.connect(self._editor_import)
         rl.addWidget(import_btn)
-        rl.addWidget(make_hint_label(
-            f"PNG, JPG, WEBP, BMP, GIF — scaled to {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}"
-        ))
 
-        rl.addWidget(QLabel("Name"))
+        paste_btn = QPushButton("Paste image")
+        paste_btn.setIcon(theme_icon("edit-paste", "edit-paste"))
+        paste_btn.setToolTip("Paste an image from the clipboard (position first)")
+        paste_btn.clicked.connect(self._editor_paste_clipboard)
+        rl.addWidget(paste_btn)
+
         self.editor_name = QLineEdit()
-        self.editor_name.setPlaceholderText("e.g. My custom icon")
+        self.editor_name.setPlaceholderText("Icon name…")
         self.editor_name.setClearButtonEnabled(True)
         self.editor_name.setToolTip(
             "File name used when saving. You can also set or change this in the save dialog."
         )
         rl.addWidget(self.editor_name)
 
-        # Neither Save is setDefault — they are peer actions in a side panel.
-        # Accenting only the first made “Save and use in Map” look secondary by mistake.
         save_btn = QPushButton("Save icon")
         save_btn.setIcon(theme_icon("document-save", "document-save-as"))
         save_btn.setAutoDefault(False)
@@ -1848,7 +2233,7 @@ class CombinedWindow(QMainWindow):
 
         use_help = QToolButton()
         use_help.setText("?")
-        use_help.setToolTip("What does this do?")
+        use_help.setToolTip("Help / documentation")
         use_help.setAutoRaise(True)
         use_help.setFixedSize(28, 28)
         help_icon = theme_icon("help-about", "help-hint", "dialog-question")
@@ -1863,7 +2248,7 @@ class CombinedWindow(QMainWindow):
         self.editor_status.setWordWrap(True)
         rl.addWidget(self.editor_status)
 
-        rl.addWidget(make_hint_label(f"Stored in {LIBRARY_DIR}"))
+        rl.addWidget(make_hint_label(f"Library: {LIBRARY_DIR}"))
 
         self.library_list = QListWidget()
         self.library_list.setIconSize(QSize(32, 32))
@@ -1873,7 +2258,6 @@ class CombinedWindow(QMainWindow):
 
         lib_btn_row = QHBoxLayout()
         lib_btn_row.setSpacing(6)
-
         open_lib = QPushButton("Open in Map")
         open_lib.setIcon(theme_icon("go-jump", "go-next"))
         open_lib.setToolTip(
@@ -1881,25 +2265,27 @@ class CombinedWindow(QMainWindow):
         )
         open_lib.clicked.connect(self._editor_library_to_map)
         lib_btn_row.addWidget(open_lib, stretch=1)
-
         delete_lib = QPushButton("Delete")
         delete_lib.setIcon(theme_icon("edit-delete", "edit-clear"))
         delete_lib.setToolTip("Delete the selected custom icon permanently from your library.")
         delete_lib.clicked.connect(self._editor_library_delete)
         lib_btn_row.addWidget(delete_lib)
-
-        equalize_widths([open_lib, delete_lib])
         rl.addLayout(lib_btn_row)
 
         layout.addWidget(right)
 
         self._editor_update_color_btn()
         self._refresh_library_list()
+        self._editor_update_previews()
 
     def _editor_set_tool(self, tool):
         self.pixel_canvas.tool = tool
         for k, b in self._tool_btns.items():
             b.setChecked(k == tool)
+
+    def _editor_set_brush_size(self, value):
+        if hasattr(self, "pixel_canvas"):
+            self.pixel_canvas.set_brush_size(value)
 
     def _editor_pick_color(self):
         col = QColorDialog.getColor(
@@ -1931,12 +2317,177 @@ class CombinedWindow(QMainWindow):
         # Menu Undo is contextual (Create canvas vs Map apply stack)
         self._sync_undo_actions()
 
+    def _editor_update_previews(self):
+        """Refresh multi-size preview strip from the canvas."""
+        if not hasattr(self, "_preview_labels"):
+            return
+        img = self.pixel_canvas.image()
+        if img is None or img.isNull():
+            for lab in self._preview_labels.values():
+                lab.clear()
+            return
+        for sz, lab in self._preview_labels.items():
+            pix = QPixmap.fromImage(img).scaled(
+                sz, sz,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+                if img.width() > sz
+                else Qt.TransformationMode.FastTransformation,
+            )
+            lab.setPixmap(pix)
+
+    def _editor_apply_op(self, fn, status_msg="Applied"):
+        """Run a pure image transform as one undoable step."""
+        if not hasattr(self, "pixel_canvas"):
+            return
+        if self.pixel_canvas.is_blank():
+            self.editor_status.setText("Canvas is empty")
+            QTimer.singleShot(2000, lambda: self.editor_status.setText(""))
+            return
+        try:
+            result = fn(self.pixel_canvas.image())
+        except Exception as e:
+            QMessageBox.warning(self, "Edit failed", str(e))
+            return
+        if result is None or result.isNull():
+            return
+        self.pixel_canvas.set_image(result, record_undo=True)
+        self._editor_sync_size_combo(self.pixel_canvas.grid_size)
+        self._editor_update_previews()
+        self.editor_status.setText(status_msg)
+        QTimer.singleShot(2000, lambda: self.editor_status.setText(""))
+
+    def _editor_apply_padding(self):
+        pct = self.pad_spin.value() if hasattr(self, "pad_spin") else 12
+        self.settings.setValue("create/pad_percent", pct)
+        self._editor_apply_op(
+            lambda im: editor_ops.apply_padding(im, pct),
+            f"Padding {pct}%",
+        )
+
+    def _editor_apply_tint(self):
+        amt = self.tint_amount.value() if hasattr(self, "tint_amount") else 0.55
+        color = self.pixel_canvas.color
+        self._editor_apply_op(
+            lambda im: editor_ops.tint(im, color, amount=amt),
+            f"Tinted toward {color.name()}",
+        )
+
+    def _editor_apply_outline(self):
+        width = self.outline_spin.value() if hasattr(self, "outline_spin") else 2
+        color = self.pixel_canvas.color
+        self._editor_apply_op(
+            lambda im: editor_ops.outline(im, width=width, color=color),
+            f"Outline {width}px",
+        )
+
+    def _editor_drop_shadow_dialog(self):
+        if self.pixel_canvas.is_blank():
+            self.editor_status.setText("Canvas is empty")
+            QTimer.singleShot(2000, lambda: self.editor_status.setText(""))
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Drop shadow")
+        dlg.setMinimumWidth(320)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(make_hint_label(
+            "Soft shadow under the icon. Offset is in canvas pixels; "
+            "blur softens the edge. Opacity is the shadow strength."
+        ))
+        form = QFormLayout()
+        ox = QSpinBox()
+        ox.setRange(-64, 64)
+        ox.setValue(int(self.settings.value("create/shadow_ox", 4) or 4))
+        oy = QSpinBox()
+        oy.setRange(-64, 64)
+        oy.setValue(int(self.settings.value("create/shadow_oy", 6) or 6))
+        blur = QSpinBox()
+        blur.setRange(0, 24)
+        blur.setValue(int(self.settings.value("create/shadow_blur", 6) or 6))
+        opacity = QDoubleSpinBox()
+        opacity.setRange(0.05, 1.0)
+        opacity.setSingleStep(0.05)
+        opacity.setDecimals(2)
+        opacity.setValue(float(self.settings.value("create/shadow_opacity", 0.45) or 0.45))
+        form.addRow("Offset X:", ox)
+        form.addRow("Offset Y:", oy)
+        form.addRow("Blur:", blur)
+        form.addRow("Opacity:", opacity)
+        lay.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.settings.setValue("create/shadow_ox", ox.value())
+        self.settings.setValue("create/shadow_oy", oy.value())
+        self.settings.setValue("create/shadow_blur", blur.value())
+        self.settings.setValue("create/shadow_opacity", opacity.value())
+        self._editor_apply_op(
+            lambda im: editor_ops.drop_shadow(
+                im,
+                offset_x=ox.value(),
+                offset_y=oy.value(),
+                blur=blur.value(),
+                opacity=opacity.value(),
+            ),
+            "Drop shadow applied",
+        )
+
+    def _editor_paste_clipboard(self):
+        """Import an image from the clipboard via the same position dialog as files."""
+        clip = QApplication.clipboard()
+        if clip is None:
+            return
+        mime = clip.mimeData()
+        src = QImage()
+        if mime is not None and mime.hasImage():
+            src = QImage(clip.image())
+        if src.isNull() and mime is not None and mime.hasUrls():
+            for url in mime.urls():
+                path = url.toLocalFile()
+                if path and os.path.isfile(path):
+                    src = QImage(path)
+                    if not src.isNull():
+                        break
+        if src.isNull():
+            QMessageBox.information(
+                self,
+                "Paste",
+                "Clipboard has no image.\nCopy a PNG or screenshot first.",
+            )
+            return
+        src = src.convertToFormat(QImage.Format.Format_ARGB32)
+        dlg = ImportPositionDialog(src, canvas_size=STANDARD_ICON_SIZE, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cropped = dlg.result_image()
+        if cropped.isNull():
+            return
+        self.pixel_canvas.set_image(cropped, record_undo=True)
+        self._editor_sync_size_combo(STANDARD_ICON_SIZE)
+        self._editor_update_previews()
+        if not self.editor_name.text().strip():
+            self.editor_name.setText(f"pasted-{datetime.now().strftime('%H%M%S')}")
+        detail = ""
+        if hasattr(dlg, "import_status_suffix"):
+            detail = f" ({dlg.import_status_suffix()})"
+        self.editor_status.setText(
+            f"Pasted image → {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}{detail}"
+        )
+        hold = 5000 if editor_ops.is_modest_resolution(src) else 2500
+        QTimer.singleShot(hold, lambda: self.editor_status.setText(""))
+
     def _editor_undo(self):
         # Only act when Create tab is visible (avoid surprising Map)
         if hasattr(self, "main_tabs") and self.main_tabs.currentIndex() != 1:
             return
         if self.pixel_canvas.undo():
             self._editor_sync_size_combo(self.pixel_canvas.grid_size)
+            self._editor_update_previews()
             self.editor_status.setText("Undid last change")
             QTimer.singleShot(1500, lambda: self.editor_status.setText(""))
 
@@ -1945,6 +2496,7 @@ class CombinedWindow(QMainWindow):
             return
         if self.pixel_canvas.redo():
             self._editor_sync_size_combo(self.pixel_canvas.grid_size)
+            self._editor_update_previews()
             self.editor_status.setText("Redid change")
             QTimer.singleShot(1500, lambda: self.editor_status.setText(""))
 
@@ -1952,6 +2504,7 @@ class CombinedWindow(QMainWindow):
         size = self.size_combo.currentData()
         if size:
             self.pixel_canvas.resize_grid(size)
+            self._editor_update_previews()
 
     def _editor_toggle_grid(self, on):
         self.pixel_canvas.show_grid = on
@@ -1961,6 +2514,7 @@ class CombinedWindow(QMainWindow):
         # If picker grabbed a color, refresh swatch
         if self.pixel_canvas.tool == "picker":
             self._editor_update_color_btn()
+        self._editor_update_previews()
 
     def _editor_sync_size_combo(self, size):
         """Keep the canvas-size dropdown in sync without re-triggering resize."""
@@ -2034,13 +2588,20 @@ class CombinedWindow(QMainWindow):
             return
         self.pixel_canvas.set_image(cropped, record_undo=True)
         self._editor_sync_size_combo(STANDARD_ICON_SIZE)
+        self._editor_update_previews()
         base = os.path.splitext(os.path.basename(path))[0]
         if not self.editor_name.text().strip():
             self.editor_name.setText(base)
+        detail = ""
+        if hasattr(dlg, "import_status_suffix"):
+            detail = f" ({dlg.import_status_suffix()})"
         self.editor_status.setText(
-            f"Imported {os.path.basename(path)} → {STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE} (positioned)"
+            f"Imported {os.path.basename(path)} → "
+            f"{STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}{detail}"
         )
-        QTimer.singleShot(2500, lambda: self.editor_status.setText(""))
+        # Longer for low-res guidance
+        hold = 5000 if editor_ops.is_modest_resolution(src) else 2500
+        QTimer.singleShot(hold, lambda: self.editor_status.setText(""))
 
     def _editor_sanitize_name(self, name):
         name = (name or "").strip()
@@ -2225,12 +2786,16 @@ class CombinedWindow(QMainWindow):
             "<h3>🎨 Workflow 2: Create Custom Icons</h3>"
             "<ol>"
             "<li>Open the <b>Create</b> tab.</li>"
-            f"<li>Set a canvas size for pixel art (16×16 … 512×512), or click <i>Import image…</i> — "
-            f"imports are always fitted to <b>{STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}</b>.</li>"
-            "<li>Draw pixel art using the <b>Pen</b>, <b>Eraser</b>, <b>Fill</b>, and <b>Color Picker</b> tools.</li>"
-            "<li><b>Undo</b> / <b>Redo</b> (Ctrl+Z / Ctrl+Shift+Z) reverse mistakes without clearing the canvas.</li>"
-            f"<li>Save writes a <b>{STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}</b> PNG to your icon library "
-            "(same size for every icon).</li>"
+            f"<li><b>Import</b> a logo/screenshot or <b>Paste from clipboard</b> — "
+            f"position and crop into <b>{STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}</b>. "
+            "Small images get a quality tip: use <b>Crisp</b> scaling and <b>Integer</b> zoom "
+            "(×2 / ×4 / Max) so they stay sharp, then <b>Pad</b> on the canvas. "
+            "Or draw pixel art with Pen / Eraser / Fill / Picker (set <b>Brush</b> size).</li>"
+            "<li><b>Transform</b>: flip, rotate, center, or trim empty edges.</li>"
+            "<li><b>Prep</b>: padding (safe margin), tint, grayscale / mono color, outline, drop shadow. "
+            "Each step is one Undo. Check the multi-size previews under the canvas.</li>"
+            "<li>Rounded/circle masks stay in <b>Settings</b> and apply when you Map the icon.</li>"
+            f"<li>Save writes a <b>{STANDARD_ICON_SIZE}×{STANDARD_ICON_SIZE}</b> PNG to your icon library.</li>"
             "<li>Click <i>Save icon</i> or <i>Save and use in Map</i>.</li>"
             "</ol>"
             
@@ -2308,6 +2873,7 @@ class CombinedWindow(QMainWindow):
             # Matches disk until the user draws again
             self.pixel_canvas.mark_clean()
             self.editor_name.setText(os.path.splitext(os.path.basename(path))[0])
+            self._editor_update_previews()
 
     def _editor_library_to_map(self):
         item = self.library_list.currentItem()

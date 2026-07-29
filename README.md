@@ -70,7 +70,7 @@ Dependencies, updates, and distro packages → **[Installation wiki](https://git
 
 - **Map** from file, another app, or any installed icon theme pack
 - Stay-open **Apply**, batch multi-select, session **Undo**
-- **Create** — pixel editor, import, icon library
+- **Create** — pixel editor, import/paste, prep kit (pad, tint, mono, outline, shadow), size previews, icon library
 - **Overrides** (current vs system) and **Missing** icons
 - Optional backups, icon shapes, drag-and-drop (never auto-applies)
 - **CLI** (`kappicon-cli`) shares the same safe mutation engine
