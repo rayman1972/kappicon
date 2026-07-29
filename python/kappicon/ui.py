@@ -66,6 +66,7 @@ from kappicon.paths import (
     TARGET_DIR,
     USER_APPS_DIR,
     USER_ICONS_DIR,
+    XDG_CONFIG_HOME,
     _run_host,
 )
 
@@ -77,6 +78,28 @@ RECENT_MAX = 12
 MAP_ICON_SIZES = (32, 48, 64)
 BROWSE_FOR_ICON = "__browse_for_icon__"
 DESKTOP_LIST_RAW = [d for d in os.environ.get("DESKTOP_LIST", "").strip().split("\n") if d]
+# Fallback if VERSION files are missing (packaging should always ship one).
+_APP_VERSION_FALLBACK = "3.2.1"
+
+
+def _app_version() -> str:
+    """Best-effort version string for About / status (no network)."""
+    candidates = (
+        os.path.join(os.path.dirname(__file__), "..", "..", "VERSION"),  # repo checkout
+        os.path.join(XDG_CONFIG_HOME, "KAppIcon", "VERSION"),  # install.sh
+        "/usr/share/doc/kappicon/VERSION",
+        "/usr/share/doc/kappicon-git/VERSION",
+        os.path.join(DATA_DIR, "VERSION"),
+    )
+    for path in candidates:
+        try:
+            if os.path.isfile(path):
+                v = open(path, encoding="utf-8").read().strip()
+                if v:
+                    return v
+        except OSError:
+            continue
+    return _APP_VERSION_FALLBACK
 
 def make_rounded_pixmap(pixmap, radius=18):
     size = pixmap.size()
@@ -1520,7 +1543,7 @@ class CombinedWindow(QMainWindow):
             self,
             "About kAppIcon",
             "<h3>kAppIcon</h3>"
-            "<p>Version 3.1.1</p>"
+            f"<p>Version {_app_version()}</p>"
             "<p>A Linux utility to change application icons, reuse theme icons from other apps, "
             "and design your own custom icons. Review overrides and find apps missing icons.</p>"
             "<p>Designed for Plasma / Breeze, following freedesktop.org desktop entry specifications "

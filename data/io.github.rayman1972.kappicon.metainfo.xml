@@ -106,6 +106,17 @@
   </screenshots>
 
   <releases>
+    <release version="3.2.1" date="2026-07-29">
+      <description>
+        <p>
+          Create prep kit: brush size, transforms, pad/tint/mono/outline/shadow,
+          multi-size previews, clipboard paste, and low-resolution import help
+          (crisp scaling and integer zoom). Roomier Create layout with Draw rail
+          and Transform/Prep under the canvas.
+        </p>
+      </description>
+      <url>https://github.com/rayman1972/kappicon/releases/tag/v3.2.1</url>
+    </release>
     <release version="3.2.0" date="2026-07-21">
       <description>
         <p>
