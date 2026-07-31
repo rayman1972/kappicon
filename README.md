@@ -52,6 +52,8 @@ Dependencies, updates, and distro packages → **[Installation wiki](https://git
 
 ### Create
 
+Draw, import/paste, prep kit (pad, tint, mono, outline, shadow), transforms, and size previews.
+
 ![Create tab](screenshots/gui-create.png)
 
 ### Settings
