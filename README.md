@@ -11,7 +11,7 @@
 [![UI](https://img.shields.io/badge/UI-PyQt6-41cd52.svg)](https://github.com/rayman1972/kappicon/wiki/Requirements)
 [![Release](https://img.shields.io/github/v/release/rayman1972/kappicon?include_prereleases&label=release)](https://github.com/rayman1972/kappicon/releases)
 
-**kAppIcon** changes **Linux app launcher icons** without root. Map a custom image, another app’s icon, or a single glyph from any installed icon theme (WhiteSur, Tela, Breeze, …) to one application at a time — without switching your whole system theme.
+**kAppIcon** changes **Linux app launcher icons** without root. Map a custom image, another app’s icon, or a single glyph from any installed icon theme (WhiteSur, Tela, Breeze, …) to one application at a time — without switching your whole system theme. **Export / import an icon map** to move your overrides to another machine or restore them after a reinstall.
 
 User-level [desktop entries](https://specifications.freedesktop.org/desktop-entry-spec/) only. Built for **KDE Plasma** and other **freedesktop** desktops.
 
@@ -56,6 +56,8 @@ Dependencies, updates, and distro packages → **[Installation wiki](https://git
 
 ### Settings
 
+Includes appearance, icon shape, backups, **icon map export/import**, source folder, and maintenance.
+
 ![Settings tab](screenshots/gui-settings.png)
 
 ### Overrides
@@ -72,7 +74,7 @@ Dependencies, updates, and distro packages → **[Installation wiki](https://git
 - Stay-open **Apply**, batch multi-select, session **Undo**
 - **Create** — pixel editor, import/paste, prep kit (pad, tint, mono, outline, shadow), size previews, icon library
 - **Overrides** (current vs system) and **Missing** icons
-- **Export / import icon map** — portable zip of launcher overrides (custom icons + theme names)
+- **Export / import icon map** — portable zip of launcher overrides (custom `kappicon-*` icons + theme names) for reinstall or another PC (Settings · File · Overrides)
 - Optional backups, icon shapes, drag-and-drop (never auto-applies)
 - **CLI** (`kappicon-cli`) shares the same safe mutation engine
 - User overrides only — lock, atomic writes, content-addressed icons
