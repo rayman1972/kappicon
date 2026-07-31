@@ -72,6 +72,7 @@ Dependencies, updates, and distro packages → **[Installation wiki](https://git
 - Stay-open **Apply**, batch multi-select, session **Undo**
 - **Create** — pixel editor, import/paste, prep kit (pad, tint, mono, outline, shadow), size previews, icon library
 - **Overrides** (current vs system) and **Missing** icons
+- **Export / import icon map** — portable zip of launcher overrides (custom icons + theme names)
 - Optional backups, icon shapes, drag-and-drop (never auto-applies)
 - **CLI** (`kappicon-cli`) shares the same safe mutation engine
 - User overrides only — lock, atomic writes, content-addressed icons

@@ -79,7 +79,7 @@ MAP_ICON_SIZES = (32, 48, 64)
 BROWSE_FOR_ICON = "__browse_for_icon__"
 DESKTOP_LIST_RAW = [d for d in os.environ.get("DESKTOP_LIST", "").strip().split("\n") if d]
 # Fallback if VERSION files are missing (packaging should always ship one).
-_APP_VERSION_FALLBACK = "3.2.1"
+_APP_VERSION_FALLBACK = "3.3.0"
 
 
 def _app_version() -> str:
@@ -1319,6 +1319,20 @@ def equalize_widths(widgets):
         w.setFixedWidth(max_w)
 
 
+def style_settings_action_button(btn: QPushButton):
+    """Match Maintenance-sized action buttons (full height, not compact).
+
+    Icon map / Browse were painting shorter than Restore / Refresh; force a
+    comfortable control height. (PyQt6 has no PM_MessageBoxButtonHeight.)
+    """
+    hint = btn.sizeHint().height()
+    # Floor so short labels never produce stubby controls next to longer ones
+    min_h = max(hint, 36)
+    btn.setMinimumHeight(min_h)
+    btn.setIconSize(QSize(16, 16))
+    btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+
+
 
 # ── Main Window ──────────────────────────────────────────────────────────
 class CombinedWindow(QMainWindow):
@@ -1445,6 +1459,17 @@ class CombinedWindow(QMainWindow):
         import_action.setShortcut("Ctrl+I")
         import_action.setStatusTip("Import an image into the icon creator canvas")
         import_action.triggered.connect(self._editor_import)
+
+        file_menu.addSeparator()
+        export_map = file_menu.addAction("E&xport icon map…")
+        # Outline-style icons (match Restore/Refresh); avoid filled WhiteSur archive glyphs
+        export_map.setIcon(theme_icon("document-save", "document-export"))
+        export_map.setStatusTip("Export launcher icon overrides to a portable zip")
+        export_map.triggered.connect(self._export_icon_map)
+        import_map = file_menu.addAction("Import icon &map…")
+        import_map.setIcon(theme_icon("document-open", "document-import"))
+        import_map.setStatusTip("Import launcher icon overrides from a zip")
+        import_map.triggered.connect(self._import_icon_map)
 
         file_menu.addSeparator()
 
@@ -2829,6 +2854,9 @@ class CombinedWindow(QMainWindow):
             "<li><b>Delete custom designs</b>: In the Create tab under <i>Your Icons</i>, select any icon and click <b>Delete</b> "
             "to permanently delete the file from your local icon library.</li>"
             "<li><b>Backups</b>: In the Settings tab, you can enable auto-backups or revert overrides using the backup restorer.</li>"
+            "<li><b>Icon map</b>: Settings → Export/Import icon map (or File menu) to move launcher "
+            "overrides to another machine or restore after reinstall. Custom kAppIcon icons are "
+            "embedded; theme names need the same themes on the target system.</li>"
             "</ul>",
         )
 
@@ -3026,6 +3054,36 @@ class CombinedWindow(QMainWindow):
         ))
         layout.addWidget(backups)
 
+        # Portable transfer of launcher icon overrides (not the same as per-change backups)
+        iconmap_box = QGroupBox("Icon map (transfer)")
+        iml = QVBoxLayout(iconmap_box)
+        iml.addWidget(make_hint_label(
+            "Export your launcher icon overrides to move them to another machine "
+            "or restore after reinstall. Includes custom kAppIcon icons and theme-name "
+            "overrides from the Overrides list. Separate from per-change backups."
+        ))
+        im_row = QHBoxLayout()
+        export_map_btn = QPushButton("Export icon map…")
+        # Outline icons (same weight as Restore/Refresh), full-height controls
+        export_map_btn.setIcon(theme_icon("document-save", "document-export"))
+        export_map_btn.setToolTip("Save overrides as a portable zip")
+        export_map_btn.clicked.connect(self._export_icon_map)
+        style_settings_action_button(export_map_btn)
+        import_map_btn = QPushButton("Import icon map…")
+        import_map_btn.setIcon(theme_icon("document-open", "document-import"))
+        import_map_btn.setToolTip("Restore overrides from a zip")
+        import_map_btn.clicked.connect(self._import_icon_map)
+        style_settings_action_button(import_map_btn)
+        im_row.addWidget(export_map_btn)
+        im_row.addWidget(import_map_btn)
+        im_row.addStretch(1)
+        equalize_widths([export_map_btn, import_map_btn])
+        iml.addLayout(im_row)
+        self._iconmap_status = QLabel("")
+        self._iconmap_status.setWordWrap(True)
+        iml.addWidget(self._iconmap_status)
+        layout.addWidget(iconmap_box)
+
         source = QGroupBox("Icon files")
         sf = QVBoxLayout(source)
         default_src = DOWNLOADS_DIR_DEFAULT
@@ -3034,11 +3092,15 @@ class CombinedWindow(QMainWindow):
         self.source_input.setClearButtonEnabled(True)
         self.source_input.editingFinished.connect(self._on_source_change)
         browse = QPushButton("Browse…")
-        browse.setIcon(theme_icon("folder-open", "document-open"))
+        # Outline folder (actions), same height as Maintenance actions
+        browse.setIcon(theme_icon("document-open", "document-open-folder", "folder"))
         browse.clicked.connect(self._browse_source)
+        style_settings_action_button(browse)
         src_row = QHBoxLayout()
         src_row.addWidget(self.source_input, stretch=1)
         src_row.addWidget(browse)
+        # Line edit height tracks the taller Browse button
+        self.source_input.setMinimumHeight(browse.minimumHeight())
         sf.addLayout(src_row)
         # Full-width hint (FormLayout was wrapping this awkwardly in a narrow field column)
         sf.addWidget(make_hint_label(
@@ -3051,6 +3113,7 @@ class CombinedWindow(QMainWindow):
         restore_btn = QPushButton("Restore backup…")
         restore_btn.setIcon(theme_icon("edit-undo", "document-revert"))
         restore_btn.clicked.connect(self._restore_backup)
+        style_settings_action_button(restore_btn)
         ml.addWidget(restore_btn)
         self._restore_status = QLabel("")
         ml.addWidget(self._restore_status)
@@ -3058,10 +3121,17 @@ class CombinedWindow(QMainWindow):
         refresh_btn = QPushButton("Refresh icon cache")
         refresh_btn.setIcon(theme_icon("view-refresh", "system-reboot"))
         refresh_btn.clicked.connect(self._force_refresh)
+        style_settings_action_button(refresh_btn)
         ml.addWidget(refresh_btn)
         self._refresh_status = QLabel("")
         ml.addWidget(self._refresh_status)
         equalize_widths([restore_btn, refresh_btn])
+        # Keep Icon map / Browse the same height as Maintenance (single source of truth)
+        ref_h = max(restore_btn.minimumHeight(), refresh_btn.minimumHeight())
+        for b in (export_map_btn, import_map_btn, browse):
+            b.setMinimumHeight(ref_h)
+        if hasattr(self, "source_input"):
+            self.source_input.setMinimumHeight(ref_h)
         ml.addStretch(1)
         layout.addWidget(maint)
 
@@ -3188,6 +3258,10 @@ class CombinedWindow(QMainWindow):
         open_map.setIcon(theme_icon("preferences-desktop-icons", "go-next"))
         open_map.setToolTip("Select this app on the Map tab to change its icon")
         open_map.clicked.connect(self._overrides_open_in_map)
+        export_ov = QPushButton("Export…")
+        export_ov.setIcon(theme_icon("document-save", "document-export"))
+        export_ov.setToolTip("Export all icon overrides as a portable icon map zip")
+        export_ov.clicked.connect(self._export_icon_map)
         reset_btn = QPushButton("Reset to system icon")
         reset_btn.setIcon(theme_icon("edit-clear-all", "edit-undo", "document-revert"))
         reset_btn.setToolTip(
@@ -3195,9 +3269,10 @@ class CombinedWindow(QMainWindow):
         )
         reset_btn.clicked.connect(self._overrides_reset_selected)
         btn_row.addWidget(open_map)
+        btn_row.addWidget(export_ov)
         btn_row.addWidget(reset_btn)
         btn_row.addStretch(1)
-        equalize_widths([open_map, reset_btn])
+        equalize_widths([open_map, export_ov, reset_btn])
         layout.addLayout(btn_row)
 
         self.overrides_status = QLabel("")
@@ -4009,6 +4084,173 @@ class CombinedWindow(QMainWindow):
             self.meta_label.setText("")
         else:
             self._show_empty_icon_state()
+
+    def _iconmap_set_status(self, text, hold_ms=6000):
+        if hasattr(self, "_iconmap_status"):
+            self._iconmap_status.setText(text)
+            if hold_ms:
+                QTimer.singleShot(hold_ms, lambda: self._iconmap_status.setText(""))
+        if self.statusBar() and text:
+            self.statusBar().showMessage(text, hold_ms or 6000)
+
+    def _export_icon_map(self):
+        """Export Overrides-shaped icon map zip (kAppIcon assets + theme names)."""
+        from kappicon import iconmap
+        from datetime import date
+
+        default_name = f"kappicon-icons-{date.today().isoformat()}.zip"
+        docs = os.path.join(os.path.expanduser("~"), "Documents")
+        if not os.path.isdir(docs):
+            docs = os.path.expanduser("~")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export icon map",
+            os.path.join(docs, default_name),
+            "Icon map (*.zip);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        try:
+            summary = iconmap.export_icon_map(path)
+        except iconmap.IconMapError as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+            return
+        except Exception as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+            return
+        n = summary.get("count", 0)
+        a = summary.get("asset_count", 0)
+        t = summary.get("theme_count", 0)
+        s = summary.get("skipped_count", 0)
+        msg = f"Exported {n} ({a} custom icons, {t} theme names)"
+        if s:
+            msg += f". Skipped {s}"
+        msg += f" → {os.path.basename(path)}"
+        self._iconmap_set_status(msg, 8000)
+
+    def _import_icon_map(self):
+        """Import icon map zip: preview → confirm → apply under lock."""
+        from kappicon import iconmap
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import icon map",
+            os.path.expanduser("~"),
+            "Icon map (*.zip);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            plan = iconmap.plan_import(path)
+        except iconmap.IconMapError as e:
+            QMessageBox.warning(self, "Import failed", str(e))
+            return
+        except Exception as e:
+            QMessageBox.warning(self, "Import failed", str(e))
+            return
+
+        apply_n = plan.get("apply_count", 0)
+        theme_n = plan.get("theme_count", 0)
+        asset_n = plan.get("asset_count", 0)
+        miss_n = len(plan.get("skip_missing") or [])
+        bad_n = len(plan.get("skip_bad") or [])
+
+        if apply_n == 0:
+            QMessageBox.information(
+                self,
+                "Import icon map",
+                "Nothing to apply.\n\n"
+                f"Apps missing on this system: {miss_n}\n"
+                f"Bad entries: {bad_n}",
+            )
+            return
+
+        # Preview dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import icon map")
+        dlg.setMinimumWidth(420)
+        lay = QVBoxLayout(dlg)
+        title = QLabel("Apply this icon map?")
+        tf = title.font()
+        tf.setBold(True)
+        title.setFont(tf)
+        lay.addWidget(title)
+        lay.addWidget(make_hint_label(
+            f"Apply {apply_n} · {asset_n} custom icons · "
+            f"{theme_n} theme names (need those themes installed) · "
+            f"Skip {miss_n} (app missing)"
+            + (f" · {bad_n} bad entries" if bad_n else "")
+        ))
+        # Sample names
+        names = []
+        for item in (plan.get("apply") or [])[:15]:
+            names.append(f"• {item.get('display') or item.get('desktop_id')}")
+        extra = apply_n - len(names)
+        if extra > 0:
+            names.append(f"… and {extra} more")
+        sample = QLabel("\n".join(names) if names else "")
+        sample.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        sample.setWordWrap(True)
+        lay.addWidget(sample)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok.setText("Apply icon map")
+        ok.setIcon(theme_icon("dialog-ok-apply", "dialog-ok"))
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            self._set_apply_busy(True)
+            with apply_lock():
+                result = iconmap.apply_import_plan(
+                    plan,
+                    backup=self._backup_pref(),
+                    shape=self._shape_pref(),
+                )
+            for u in result.get("undo_entries") or []:
+                self._push_undo(
+                    u["desktop_id"],
+                    u.get("display") or u["desktop_id"],
+                    u.get("previous_bytes"),
+                )
+            # Refresh app list icons for applied ids
+            for a in result.get("applied") or []:
+                self._update_app_list_icon(a["desktop_id"], a.get("icon_value") or "")
+            schedule_icon_cache_refresh(self)
+            if hasattr(self, "_refresh_overrides_list"):
+                self._refresh_overrides_list()
+            a_n = result.get("applied_count", 0)
+            f_n = result.get("failed_count", 0)
+            msg = f"Applied {a_n} from icon map"
+            if f_n:
+                msg += f" · {f_n} failed"
+            if miss_n:
+                msg += f" · {miss_n} skipped (missing apps)"
+            self._iconmap_set_status(msg, 8000)
+            if f_n:
+                errs = result.get("failed") or []
+                detail = "\n".join(
+                    f"{e.get('display') or e.get('desktop_id')}: {e.get('error')}"
+                    for e in errs[:8]
+                )
+                QMessageBox.warning(
+                    self,
+                    "Import partial",
+                    f"Applied {a_n}, failed {f_n}.\n\n{detail}",
+                )
+        except ApplyError as e:
+            QMessageBox.warning(self, "Import failed", str(e))
+        except Exception as e:
+            QMessageBox.warning(self, "Import failed", str(e))
+        finally:
+            self._set_apply_busy(False)
 
     def _restore_backup(self):
         backup_dir = BACKUP_DIR

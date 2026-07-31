@@ -124,6 +124,66 @@ def is_kappicon_icon_name(name):
     return bool(re.match(r"^kappicon-[A-Za-z0-9._+-]+$", name.strip()))
 
 
+def locate_hicolor_icon_file(theme_name):
+    """Best file path for a freedesktop icon *name* under user hicolor, or None.
+
+    Prefers 512x512 PNG, then scalable SVG, then other common sizes.
+    """
+    if not theme_name or any(c in theme_name for c in "/\\\n\r"):
+        return None
+    name = theme_name.strip()
+    hicolor = os.path.join(USER_ICONS_DIR, "hicolor")
+    candidates = [
+        os.path.join(hicolor, "512x512", "apps", f"{name}.png"),
+        os.path.join(hicolor, "scalable", "apps", f"{name}.svg"),
+        os.path.join(hicolor, "scalable", "apps", f"{name}.svgz"),
+        os.path.join(hicolor, "256x256", "apps", f"{name}.png"),
+        os.path.join(hicolor, "128x128", "apps", f"{name}.png"),
+        os.path.join(hicolor, "64x64", "apps", f"{name}.png"),
+        os.path.join(hicolor, "48x48", "apps", f"{name}.png"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    # Fallback: walk apps/ trees for basename match
+    if not os.path.isdir(hicolor):
+        return None
+    try:
+        for root, _dirs, files in os.walk(hicolor):
+            if os.path.basename(root) != "apps":
+                continue
+            for f in files:
+                stem, ext = os.path.splitext(f)
+                if stem == name and ext.lower() in (".png", ".svg", ".svgz"):
+                    return os.path.join(root, f)
+    except OSError:
+        pass
+    return None
+
+
+def install_named_hicolor_asset(icon_path, theme_name):
+    """Install *icon_path* as user hicolor icon *theme_name* (preserve name).
+
+    Used by icon-map import so pack identity survives reinstall.
+    Returns the theme_name on success.
+    """
+    if not theme_name or any(c in theme_name for c in "/\\\n\r"):
+        raise ApplyError("Invalid icon name for pack install.")
+    path = os.path.realpath(icon_path)
+    if not os.path.isfile(path):
+        raise ApplyError(f"Icon file not found:\n{icon_path}")
+    magick = find_magick_cmd()
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    # PNG without ImageMagick: still install 512 for portability
+    if ext == "png" and not magick:
+        hicolor = os.path.join(USER_ICONS_DIR, "hicolor")
+        dest_dir = os.path.join(hicolor, "512x512", "apps")
+        dest = os.path.join(dest_dir, f"{theme_name}.png")
+        _atomic_copy_file(path, dest)
+        return theme_name
+    return _install_hicolor_icon(path, theme_name, magick)
+
+
 def _install_hicolor_icon(icon_path, theme_name, magick):
     """Install custom file into user hicolor; return freedesktop icon name."""
     if not theme_name or any(c in theme_name for c in "/\\\n\r"):
