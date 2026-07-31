@@ -22,7 +22,7 @@ provides=("${pkgname}")
 conflicts=("${pkgname}-git")
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
 # Updated after the GitHub release tarball is published (see CONTRIBUTING.md).
-sha256sums=('SKIP')
+sha256sums=('f64d8873fdb660335ec7f4c512c84fd17d7038839076d981c58eb2d1c8fdae5e')
 
 package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
