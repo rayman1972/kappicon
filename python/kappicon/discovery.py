@@ -4,7 +4,14 @@ from __future__ import annotations
 import os
 import re
 
-from .desktop import is_valid_desktop_id, path_is_under, read_desktop_icon_value
+from urllib.parse import unquote, urlparse
+
+from .desktop import (
+    is_valid_desktop_id,
+    path_is_under,
+    read_desktop_icon_value,
+    system_desktop_roots,
+)
 from .paths import (
     DATA_DIR,
     LIBRARY_DIR,
@@ -14,19 +21,115 @@ from .paths import (
 )
 
 
+def _file_uri_to_path(uri: str) -> str:
+    """Convert file: URI to a local path (best-effort)."""
+    raw = (uri or "").strip()
+    if raw.startswith("file://"):
+        parsed = urlparse(raw)
+        path = unquote(parsed.path or "")
+        # Windows-style file:///C:/... rare on Linux; keep path
+        return path
+    if raw.startswith("file:"):
+        return unquote(raw[5:])
+    return raw
+
+
+def _theme_icon_file_exists(name: str) -> bool:
+    """True if a theme icon *name* has a file under common icon roots/sizes."""
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name:
+        return False
+    sizes = (
+        "scalable",
+        "512x512",
+        "256x256",
+        "128x128",
+        "64x64",
+        "48x48",
+        "32x32",
+        "24x24",
+        "22x22",
+        "16x16",
+    )
+    exts = (".png", ".svg", ".svgz", ".xpm")
+    icon_roots = [USER_ICONS_DIR, os.path.expanduser("~/.icons")]
+    for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
+        d = d.strip()
+        if d:
+            icon_roots.append(os.path.join(d, "icons"))
+    for extra in (
+        "/usr/share/icons",
+        "/usr/local/share/icons",
+        "/run/host/usr/share/icons",
+    ):
+        icon_roots.append(extra)
+    seen = set()
+    for root in icon_roots:
+        nr = os.path.normpath(root)
+        if nr in seen or not os.path.isdir(nr):
+            continue
+        seen.add(nr)
+        # hicolor first (fast path for kappicon-* and many apps)
+        for theme in ("hicolor",):
+            tdir = os.path.join(nr, theme)
+            if not os.path.isdir(tdir):
+                continue
+            for sz in sizes:
+                for ctx in ("apps", "applications"):
+                    for ext in exts:
+                        p = os.path.join(tdir, sz, ctx, f"{name}{ext}")
+                        if os.path.isfile(p):
+                            return True
+        # One level of other themes (no deep walk)
+        try:
+            for theme in os.listdir(nr):
+                if theme == "hicolor" or theme.startswith("."):
+                    continue
+                tdir = os.path.join(nr, theme)
+                if not os.path.isdir(tdir):
+                    continue
+                for sz in ("scalable", "48x48", "32x32", "24x24", "16x16", "256x256"):
+                    for ctx in ("apps", "applications"):
+                        for ext in exts:
+                            p = os.path.join(tdir, sz, ctx, f"{name}{ext}")
+                            if os.path.isfile(p):
+                                return True
+        except OSError:
+            continue
+    return False
+
+
 def icon_resolves(icon_name):
-    """Best-effort icon resolvability without Qt (GUI may override with QIcon)."""
+    """Best-effort icon resolvability without Qt (Missing / Overrides / AppImage).
+
+    Theme names are probed on disk under common icon dirs. Remote and data URIs
+    are treated as non-resolving for hygiene lists.
+    """
     if not icon_name or not isinstance(icon_name, str):
         return False
     name = icon_name.strip()
     if not name:
         return False
-    if name.startswith(("/", "http://", "https://", "file:", "data:")):
-        return os.path.isfile(name) if name.startswith("/") else True
+    if name.startswith(("http://", "https://", "data:")):
+        return False
+    if name.startswith("file:"):
+        path = _file_uri_to_path(name)
+        try:
+            return os.path.isfile(os.path.realpath(path))
+        except OSError:
+            return False
+    if name.startswith("/"):
+        try:
+            return os.path.isfile(os.path.realpath(name))
+        except OSError:
+            return False
     if os.path.sep in name or (os.path.altsep and os.path.altsep in name):
-        return os.path.isfile(name)
-    # Theme name: cannot fully resolve without Qt; treat non-empty as potentially OK
-    return True
+        try:
+            return os.path.isfile(name)
+        except OSError:
+            return False
+    # Freedesktop theme icon name
+    return _theme_icon_file_exists(name)
 
 def collect_system_icons(app_data):
     """Unique theme icon names already used by installed apps, with sources."""
@@ -327,41 +430,7 @@ def pick_primary_provider(desktops):
 
 def _system_desktop_roots():
     """Directories that may hold system (non-user) .desktop files."""
-    roots = []
-    user_dir = os.path.normpath(USER_APPS_DIR)
-    for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
-        d = d.strip()
-        if not d:
-            continue
-        apps = os.path.join(d, "applications")
-        if os.path.isdir(apps) and os.path.normpath(apps) != user_dir:
-            roots.append(apps)
-    for apps in (
-        "/usr/share/applications",
-        "/usr/local/share/applications",
-        "/run/host/usr/share/applications",
-        "/run/host/usr/local/share/applications",
-        "/var/lib/flatpak/exports/share/applications",
-    ):
-        if os.path.isdir(apps) and os.path.normpath(apps) != user_dir:
-            roots.append(apps)
-    # DESKTOP_LIST entries: full file paths
-    for fp in os.environ.get("DESKTOP_LIST", "").split("\n"):
-        fp = fp.strip()
-        if not fp or not os.path.isfile(fp):
-            continue
-        d = os.path.dirname(fp)
-        if os.path.normpath(d) != user_dir and d not in roots:
-            roots.append(d)
-    # unique preserve order
-    seen = set()
-    out = []
-    for r in roots:
-        nr = os.path.normpath(r)
-        if nr not in seen:
-            seen.add(nr)
-            out.append(r)
-    return out
+    return system_desktop_roots()
 
 
 def _icon_looks_like_kappicon_apply(icon):
@@ -595,6 +664,216 @@ def scan_apps_missing_icons(app_data):
         })
     rows.sort(key=lambda r: (r["display"] or "").lower())
     return rows
+
+
+# ── AppImage launchers ───────────────────────────────────────────────────
+
+_APPIMAGE_EXEC_RE = re.compile(r"\.appimage\b", re.IGNORECASE)
+
+
+def extract_exec_path(exec_line: str) -> str:
+    """Best-effort first path/token from a freedesktop Exec= line."""
+    raw = (exec_line or "").strip()
+    if not raw:
+        return ""
+    # Strip common field codes at end tokens
+    # Quoted path
+    if raw.startswith('"'):
+        end = raw.find('"', 1)
+        if end > 1:
+            return raw[1:end]
+    if raw.startswith("'"):
+        end = raw.find("'", 1)
+        if end > 1:
+            return raw[1:end]
+    # First token (may include env FOO=bar before path — rare for AppImages)
+    parts = raw.split()
+    for tok in parts:
+        if "=" in tok and not tok.startswith("/") and not tok.startswith("."):
+            continue  # env assignment
+        # Drop field codes like %f %U
+        if tok.startswith("%"):
+            continue
+        return tok.strip("\"'")
+    return parts[0].strip("\"'") if parts else ""
+
+
+def exec_looks_like_appimage(exec_line: str) -> bool:
+    """True if Exec= likely runs an AppImage (path contains .AppImage)."""
+    if not exec_line:
+        return False
+    if _APPIMAGE_EXEC_RE.search(exec_line):
+        return True
+    path = extract_exec_path(exec_line)
+    return bool(path and path.lower().endswith(".appimage"))
+
+
+def _desktop_files_to_scan_for_appimages():
+    """User applications + any DESKTOP_LIST paths under the user apps dir."""
+    seen = set()
+    paths = []
+    user_dir = USER_APPS_DIR
+    if os.path.isdir(user_dir):
+        try:
+            for name in os.listdir(user_dir):
+                if not is_valid_desktop_id(name):
+                    continue
+                p = os.path.join(user_dir, name)
+                if os.path.isfile(p):
+                    paths.append(p)
+                    seen.add(os.path.normpath(p))
+        except OSError:
+            pass
+    for fp in os.environ.get("DESKTOP_LIST", "").split("\n"):
+        fp = fp.strip()
+        if not fp or not os.path.isfile(fp):
+            continue
+        np = os.path.normpath(fp)
+        if np in seen:
+            continue
+        # Prefer user-owned or any path that runs AppImage
+        paths.append(fp)
+        seen.add(np)
+    return paths
+
+
+def scan_appimage_launchers():
+    """Find launchers whose Exec runs an AppImage (user menu entries).
+
+    Returns list of dicts: desktop_id, path, display, icon, exec, appimage_path,
+    icon_ok, appimage_exists.
+    """
+    rows = []
+    for path in _desktop_files_to_scan_for_appimages():
+        desktop_id = os.path.basename(path)
+        if not is_valid_desktop_id(desktop_id):
+            continue
+        meta = parse_desktop_launcher_meta(path)
+        if (meta.get("type") or "Application") != "Application":
+            continue
+        exec_line = (meta.get("exec") or "").strip()
+        if not exec_looks_like_appimage(exec_line):
+            continue
+        # Skip hidden helpers unless they're AppImages (still show if Exec matches)
+        if meta.get("no_display") or meta.get("hidden"):
+            # Still include — AppImage helpers are rare; user may want the icon
+            pass
+        appimage_path = extract_exec_path(exec_line)
+        try:
+            if appimage_path and not os.path.isabs(appimage_path):
+                # Relative to nothing useful; keep as-is
+                pass
+            appimage_path = os.path.expanduser(appimage_path) if appimage_path else ""
+        except Exception:
+            pass
+        display, icon = parse_desktop_fields(path)
+        icon = icon or meta.get("icon") or ""
+        rows.append({
+            "desktop_id": desktop_id,
+            "path": path,
+            "display": display or meta.get("name") or desktop_id,
+            "icon": icon,
+            "exec": exec_line,
+            "appimage_path": appimage_path,
+            "icon_ok": icon_resolves(icon) if icon else False,
+            "appimage_exists": bool(appimage_path and os.path.isfile(appimage_path)),
+        })
+    rows.sort(key=lambda r: (r["display"] or "").lower())
+    return rows
+
+
+def suggest_appimage_desktop_id(appimage_path: str) -> str:
+    """Safe unique .desktop basename for an AppImage path."""
+    base = os.path.basename(appimage_path or "app")
+    stem = re.sub(r"\.appimage$", "", base, flags=re.IGNORECASE)
+    stem = re.sub(r"[^A-Za-z0-9._+-]+", "-", stem).strip(".-") or "appimage"
+    stem = stem[:48]
+    candidate = f"{stem}.desktop"
+    if not is_valid_desktop_id(candidate):
+        candidate = "appimage-app.desktop"
+    # Uniquify under user apps
+    n = 2
+    while os.path.isfile(os.path.join(USER_APPS_DIR, candidate)):
+        candidate = f"{stem}-{n}.desktop"
+        if not is_valid_desktop_id(candidate):
+            candidate = f"appimage-{n}.desktop"
+        n += 1
+        if n > 999:
+            raise ValueError("Could not allocate unique desktop id")
+    return candidate
+
+
+def create_appimage_launcher(
+    appimage_path: str,
+    *,
+    display_name: str | None = None,
+    icon: str = "",
+    desktop_id: str | None = None,
+) -> dict:
+    """Create a user .desktop for an AppImage. Returns row dict.
+
+    Caller should hold apply_lock. Does not set executable bit on the AppImage.
+    """
+    from .desktop import _atomic_write_text  # local import avoids cycles
+
+    path = os.path.realpath(os.path.expanduser(appimage_path))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"AppImage not found:\n{path}")
+    if not path.lower().endswith(".appimage"):
+        # Allow anyway if user picked a file named oddly, but prefer .AppImage
+        if ".appimage" not in path.lower():
+            raise ValueError("File does not look like an AppImage (.AppImage).")
+
+    name = (display_name or "").strip()
+    if not name:
+        name = re.sub(
+            r"\.appimage$", "", os.path.basename(path), flags=re.IGNORECASE
+        )
+        name = name.replace("-", " ").replace("_", " ").strip() or "AppImage"
+
+    did = desktop_id or suggest_appimage_desktop_id(path)
+    if not is_valid_desktop_id(did):
+        raise ValueError(f"Invalid desktop id: {did}")
+    dest = os.path.join(USER_APPS_DIR, did)
+    if os.path.isfile(dest):
+        raise FileExistsError(f"Launcher already exists:\n{dest}")
+
+    # Escape for Exec (quoted absolute path)
+    exec_path = path.replace("\\", "\\\\").replace('"', '\\"')
+    icon_line = (icon or "").strip() or "application-x-executable"
+    if "\n" in icon_line or "\r" in icon_line:
+        raise ValueError("Invalid icon value")
+    # Name must be single-line
+    name = name.replace("\n", " ").replace("\r", " ").strip()
+
+    text = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={name}\n"
+        f'Exec="{exec_path}"\n'
+        f"Icon={icon_line}\n"
+        "Terminal=false\n"
+        "Categories=Utility;\n"
+        "Comment=AppImage launcher created by kAppIcon\n"
+        "\n"
+    )
+    os.makedirs(USER_APPS_DIR, exist_ok=True)
+    _atomic_write_text(dest, text)
+    try:
+        os.chmod(dest, 0o644)
+    except OSError:
+        pass
+
+    return {
+        "desktop_id": did,
+        "path": dest,
+        "display": name,
+        "icon": icon_line,
+        "exec": f'"{path}"',
+        "appimage_path": path,
+        "icon_ok": icon_resolves(icon_line),
+        "appimage_exists": True,
+    }
 
 
 # ── Icon editor (pixel canvas + image import) ────────────────────────────

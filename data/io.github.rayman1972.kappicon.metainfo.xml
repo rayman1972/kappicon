@@ -106,6 +106,19 @@
   </screenshots>
 
   <releases>
+    <release version="3.3.1" date="2026-07-31">
+      <description>
+        <p>
+          AppImage tab: list AppImage launchers, add a menu entry for a bare
+          .AppImage, set its icon, and open in Map (with AppImage folder
+          preference). Reliability: unified system desktop roots (Flatpak/Snap),
+          stricter icon resolution, prune on failed apply, correct 512 hicolor
+          install, safer package install staging, and offscreen GUI smoke tests.
+          Icon map from 3.3.0 remains included.
+        </p>
+      </description>
+      <url>https://github.com/rayman1972/kappicon/releases/tag/v3.3.1</url>
+    </release>
     <release version="3.3.0" date="2026-07-31">
       <description>
         <p>

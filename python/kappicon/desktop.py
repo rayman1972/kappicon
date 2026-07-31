@@ -123,23 +123,55 @@ def clear_desktop_icon_py(desktop_file):
     _atomic_write_text(desktop_file, "".join(out))
 
 
-def find_system_desktop_path(desktop_id):
-    """First non-user applications path containing desktop_id."""
-    user = os.path.normpath(USER_APPS_DIR)
-    candidates = []
+def system_desktop_roots():
+    """Directories that may hold non-user .desktop files (system, Flatpak, Snap, DESKTOP_LIST).
+
+    Shared by Apply/Reset and Overrides so listed apps are always resolvable.
+    """
+    roots = []
+    user_dir = os.path.normpath(USER_APPS_DIR)
     for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
         d = d.strip()
-        if d:
-            candidates.append(os.path.join(d, "applications"))
-    for extra in (
-        "/usr/local/share/applications",
-        "/usr/share/applications",
-    ):
-        if extra not in candidates:
-            candidates.append(extra)
-    for apps in candidates:
-        if os.path.normpath(apps) == user:
+        if not d:
             continue
+        apps = os.path.join(d, "applications")
+        if os.path.isdir(apps) and os.path.normpath(apps) != user_dir:
+            roots.append(apps)
+    for apps in (
+        "/usr/share/applications",
+        "/usr/local/share/applications",
+        "/run/host/usr/share/applications",
+        "/run/host/usr/local/share/applications",
+        "/var/lib/flatpak/exports/share/applications",
+        os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+        "/var/lib/snapd/desktop/applications",
+    ):
+        if os.path.isdir(apps) and os.path.normpath(apps) != user_dir:
+            roots.append(apps)
+    # DESKTOP_LIST entries: full file paths — include parent applications dirs
+    for fp in os.environ.get("DESKTOP_LIST", "").split("\n"):
+        fp = fp.strip()
+        if not fp or not os.path.isfile(fp):
+            continue
+        d = os.path.dirname(fp)
+        if d and os.path.normpath(d) != user_dir:
+            roots.append(d)
+    # unique preserve order
+    seen = set()
+    out = []
+    for r in roots:
+        nr = os.path.normpath(r)
+        if nr not in seen and nr != user_dir:
+            seen.add(nr)
+            out.append(nr)
+    return out
+
+
+def find_system_desktop_path(desktop_id):
+    """First non-user applications path containing desktop_id."""
+    if not is_valid_desktop_id(desktop_id):
+        return None
+    for apps in system_desktop_roots():
         cand = os.path.join(apps, desktop_id)
         if os.path.isfile(cand):
             return cand
@@ -147,9 +179,20 @@ def find_system_desktop_path(desktop_id):
 
 
 def find_any_desktop_path(desktop_id):
+    """User override first, then system/export roots, then DESKTOP_LIST exact path."""
+    if not is_valid_desktop_id(desktop_id):
+        return None
     user = os.path.join(USER_APPS_DIR, desktop_id)
     if os.path.isfile(user):
         return user
+    # Exact path from DESKTOP_LIST (exotic Flatpak/Snap layouts)
+    for fp in os.environ.get("DESKTOP_LIST", "").split("\n"):
+        fp = fp.strip()
+        if not fp or not os.path.isfile(fp):
+            continue
+        if os.path.basename(fp) == desktop_id:
+            # Prefer non-user for "any" after user miss — but any match works for Apply
+            return fp
     return find_system_desktop_path(desktop_id)
 
 

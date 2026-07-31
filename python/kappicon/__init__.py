@@ -18,6 +18,7 @@ from .desktop import (
     restore_user_desktop_snapshot,
     set_desktop_icon_py,
     snapshot_user_desktop,
+    system_desktop_roots,
     user_override_only_differs_by_icon,
 )
 from .icons import (
@@ -59,6 +60,7 @@ __all__ = [
     "set_desktop_icon_py",
     "find_system_desktop_path",
     "find_any_desktop_path",
+    "system_desktop_roots",
     "_atomic_write_text",
     "_atomic_copy_file",
     "THEME_ICON_PREFIX",

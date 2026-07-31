@@ -72,19 +72,28 @@ verify_sha256sums() {
 # Install product files from a source tree root into user XDG destinations.
 install_from_tree() {
     local root="$1"
+    local stage old_pkg
     mkdir -p "$INSTALL_DIR" "$APPS_DIR" "$ICONS_DIR" "$DATA_DIR/icons" "$CONFIG_DIR"
-    install_bin "$root/gui/kappicon" "$INSTALL_DIR/kappicon"
-    install_bin "$root/cli/kappicon-cli" "$INSTALL_DIR/kappicon-cli"
-    chmod +x "$INSTALL_DIR/kappicon" "$INSTALL_DIR/kappicon-cli"
-    # Shared Python package (mutation + GUI); launcher sets PYTHONPATH to DATA_DIR/python
+    # Shared Python package first (stage + swap so interrupt is less likely to leave
+    # new binaries with a half-removed package tree).
     if [ -d "$root/python/kappicon" ]; then
         mkdir -p "$DATA_DIR/python"
-        rm -rf "$DATA_DIR/python/kappicon"
-        cp -a "$root/python/kappicon" "$DATA_DIR/python/kappicon"
+        stage="$DATA_DIR/python/kappicon.new.$$"
+        old_pkg="$DATA_DIR/python/kappicon.old.$$"
+        rm -rf "$stage" "$old_pkg"
+        cp -a "$root/python/kappicon" "$stage"
+        if [ -e "$DATA_DIR/python/kappicon" ]; then
+            mv "$DATA_DIR/python/kappicon" "$old_pkg"
+        fi
+        mv "$stage" "$DATA_DIR/python/kappicon"
+        rm -rf "$old_pkg"
     else
         echo "❌ Missing python/kappicon package in source tree." >&2
         return 1
     fi
+    install_bin "$root/gui/kappicon" "$INSTALL_DIR/kappicon"
+    install_bin "$root/cli/kappicon-cli" "$INSTALL_DIR/kappicon-cli"
+    chmod +x "$INSTALL_DIR/kappicon" "$INSTALL_DIR/kappicon-cli"
     rm -f "$INSTALL_DIR/kappicon-gui" \
         "$INSTALL_DIR/apply-mac-icon" "$INSTALL_DIR/apply-mac-icon-gui" \
         "$ICONS_DIR/macosicons.png" "$ICONS_DIR/macosicons-gui.png" \

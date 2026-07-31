@@ -16,9 +16,22 @@ from .desktop import (
     snapshot_user_desktop,
     user_override_only_differs_by_icon,
 )
-from .icons import is_kappicon_icon_name, prepare_icon_value
+from .icons import (
+    is_kappicon_icon_name,
+    prepare_icon_value,
+    prune_unreferenced_kappicon_assets,
+)
 from .lock import ApplyError
 from .paths import USER_APPS_DIR
+
+
+def _prune_quiet():
+    """Drop unreferenced kappicon-* assets after a failed or partial mutation."""
+    try:
+        prune_unreferenced_kappicon_assets()
+    except Exception:
+        pass
+
 
 def apply_icon_to_desktop(desktop_id, selected_icon, *, shape="as-is", backup=False):
     """
@@ -30,6 +43,17 @@ def apply_icon_to_desktop(desktop_id, selected_icon, *, shape="as-is", backup=Fa
     if isinstance(selected_icon, str) and ("\n" in selected_icon or "\r" in selected_icon):
         raise ApplyError("Invalid icon selection (control characters).")
 
+    try:
+        return _apply_icon_to_desktop_impl(
+            desktop_id, selected_icon, shape=shape, backup=backup
+        )
+    except Exception:
+        # Hicolor may have been installed before Icon= write failed
+        _prune_quiet()
+        raise
+
+
+def _apply_icon_to_desktop_impl(desktop_id, selected_icon, *, shape="as-is", backup=False):
     previous_bytes = snapshot_user_desktop(desktop_id)
     user_path = os.path.join(USER_APPS_DIR, desktop_id)
     app_path = find_any_desktop_path(desktop_id)

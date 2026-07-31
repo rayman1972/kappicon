@@ -92,6 +92,16 @@ class TestIconProcessing(unittest.TestCase):
                 / f"{name}.png"
             )
             self.assertTrue(dest.is_file(), f"missing {dest}")
+            # Smaller source still lands real files under size dirs (resized)
+            for sz in ("256x256", "48x48"):
+                p = (
+                    Path(eng.USER_ICONS_DIR)
+                    / "hicolor"
+                    / sz
+                    / "apps"
+                    / f"{name}.png"
+                )
+                self.assertTrue(p.is_file(), f"missing {p}")
 
     @unittest.skipUnless(
         shutil.which("magick") or shutil.which("convert"),

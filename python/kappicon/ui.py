@@ -45,6 +45,7 @@ from kappicon.desktop import (
 )
 from kappicon.discovery import (
     collect_system_icons,
+    create_appimage_launcher,
     discover_icon_themes,
     friendly_desktop_label,
     is_visible_user_launcher,
@@ -52,6 +53,7 @@ from kappicon.discovery import (
     parse_desktop_launcher_meta,
     parse_icon_name,
     pick_primary_provider,
+    scan_appimage_launchers,
     scan_apps_missing_icons,
     scan_theme_icons,
     scan_user_launcher_overrides,
@@ -79,7 +81,7 @@ MAP_ICON_SIZES = (32, 48, 64)
 BROWSE_FOR_ICON = "__browse_for_icon__"
 DESKTOP_LIST_RAW = [d for d in os.environ.get("DESKTOP_LIST", "").strip().split("\n") if d]
 # Fallback if VERSION files are missing (packaging should always ship one).
-_APP_VERSION_FALLBACK = "3.3.0"
+_APP_VERSION_FALLBACK = "3.3.1"
 
 
 def _app_version() -> str:
@@ -94,7 +96,8 @@ def _app_version() -> str:
     for path in candidates:
         try:
             if os.path.isfile(path):
-                v = open(path, encoding="utf-8").read().strip()
+                with open(path, encoding="utf-8") as fh:
+                    v = fh.read().strip()
                 if v:
                     return v
         except OSError:
@@ -1432,6 +1435,14 @@ class CombinedWindow(QMainWindow):
             "Missing",
         )
 
+        appimage_w = QWidget()
+        self._build_appimage_tab(appimage_w)
+        tabs.addTab(
+            appimage_w,
+            theme_icon("application-x-executable", "package-x-generic", "application-default-icon"),
+            "AppImage",
+        )
+
         root.addWidget(tabs)
 
         sb = QStatusBar()
@@ -1555,11 +1566,13 @@ class CombinedWindow(QMainWindow):
         """Refresh management tabs when shown; clear stale status tips."""
         if self.statusBar():
             self.statusBar().clearMessage()
-        # Tab order: 0 Map, 1 Create, 2 Settings, 3 Overrides, 4 Missing
+        # Tab order: 0 Map, 1 Create, 2 Settings, 3 Overrides, 4 Missing, 5 AppImage
         if index == 3 and hasattr(self, "_refresh_overrides_list"):
             self._refresh_overrides_list()
         elif index == 4 and hasattr(self, "_refresh_missing_list"):
             self._refresh_missing_list()
+        elif index == 5 and hasattr(self, "_refresh_appimage_list"):
+            self._refresh_appimage_list()
         self._sync_undo_actions()
 
     def _show_about_dialog(self):
@@ -1570,7 +1583,7 @@ class CombinedWindow(QMainWindow):
             "<h3>kAppIcon</h3>"
             f"<p>Version {_app_version()}</p>"
             "<p>A Linux utility to change application icons, reuse theme icons from other apps, "
-            "and design your own custom icons. Review overrides and find apps missing icons.</p>"
+            "design custom icons, manage AppImage launcher icons, and transfer icon maps.</p>"
             "<p>Designed for Plasma / Breeze, following freedesktop.org desktop entry specifications "
             "and KDE Human Interface Guidelines for clear primary actions and safe bulk changes.</p>"
             "<p>License: MIT</p>"
@@ -2857,6 +2870,8 @@ class CombinedWindow(QMainWindow):
             "<li><b>Icon map</b>: Settings → Export/Import icon map (or File menu) to move launcher "
             "overrides to another machine or restore after reinstall. Custom kAppIcon icons are "
             "embedded; theme names need the same themes on the target system.</li>"
+            "<li><b>AppImage</b>: list AppImage menu launchers, <i>Add AppImage…</i> to create a "
+            "user .desktop for a bare .AppImage file, set its icon, or Open in Map.</li>"
             "</ul>",
         )
 
@@ -2974,18 +2989,19 @@ class CombinedWindow(QMainWindow):
                 except Exception as e:
                     QMessageBox.warning(self, "Error", f"Could not delete file:\n{e}")
 
-    # ── Settings tab (KDE form / group box layout) ───────────────────────
+    # ── Settings tab (full width like other tabs; fewer groups, shorter copy) ─
     def _build_settings_tab(self, parent):
         layout = QVBoxLayout(parent)
         layout.setContentsMargins(0, layout_spacing(), 0, 0)
         layout.setSpacing(layout_spacing())
 
-        look = QGroupBox("Appearance")
+        # ── Appearance + shape (one card) ──────────────────────────────
+        look = QGroupBox("Appearance & apply")
         look_l = QVBoxLayout(look)
-        look_l.addWidget(make_hint_label(
-            "Widget style stays Breeze. Colors can follow the system or be forced light/dark."
-        ))
+        look_l.setSpacing(8)
+
         theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("Colors"))
         self.theme_group = QButtonGroup(self)
         self.theme_system = QRadioButton("System")
         self.theme_light = QRadioButton("Light")
@@ -3003,23 +3019,18 @@ class CombinedWindow(QMainWindow):
         theme_row.addWidget(self.theme_dark)
         theme_row.addStretch(1)
         look_l.addLayout(theme_row)
-        layout.addWidget(look)
 
-        shape_box = QGroupBox("Applied icon shape")
-        shape_l = QVBoxLayout(shape_box)
-        shape_l.addWidget(make_hint_label(
-            "How icons are shaped when you Apply them. "
-            "No guessing — pick the look you want."
-        ))
+        shape_row = QHBoxLayout()
+        shape_row.addWidget(QLabel("Shape"))
         self.shape_group = QButtonGroup(self)
         self.shape_as_is = QRadioButton("As designed")
         self.shape_square = QRadioButton("Square")
-        self.shape_rounded = QRadioButton("Rounded corners")
+        self.shape_rounded = QRadioButton("Rounded")
         self.shape_circle = QRadioButton("Circle")
-        self.shape_group.addButton(self.shape_as_is)
-        self.shape_group.addButton(self.shape_square)
-        self.shape_group.addButton(self.shape_rounded)
-        self.shape_group.addButton(self.shape_circle)
+        for b in (
+            self.shape_as_is, self.shape_square, self.shape_rounded, self.shape_circle
+        ):
+            self.shape_group.addButton(b)
         cur_shape = self.settings.value("icons/shape", "as-is", type=str)
         {
             "square": self.shape_square,
@@ -3030,84 +3041,94 @@ class CombinedWindow(QMainWindow):
         self.shape_square.toggled.connect(lambda on: on and self._on_icon_shape("square"))
         self.shape_rounded.toggled.connect(lambda on: on and self._on_icon_shape("rounded"))
         self.shape_circle.toggled.connect(lambda on: on and self._on_icon_shape("circle"))
-        shape_row = QHBoxLayout()
+        self.shape_as_is.setToolTip("Keep the file’s own shape (best for themed SVGs)")
+        self.shape_square.setToolTip("Mask to a square PNG on Apply")
+        self.shape_rounded.setToolTip("Mask to rounded corners on Apply")
+        self.shape_circle.setToolTip("Mask to a circle on Apply")
         shape_row.addWidget(self.shape_as_is)
         shape_row.addWidget(self.shape_square)
         shape_row.addWidget(self.shape_rounded)
         shape_row.addWidget(self.shape_circle)
         shape_row.addStretch(1)
-        shape_l.addLayout(shape_row)
-        shape_l.addWidget(make_hint_label(
-            "As designed: keep the file’s own shape (best for themed SVGs). "
-            "Square / Rounded / Circle: re-export a PNG with that mask."
-        ))
-        layout.addWidget(shape_box)
+        look_l.addLayout(shape_row)
+        layout.addWidget(look)
 
-        backups = QGroupBox("Backups")
-        bl = QVBoxLayout(backups)
-        self.backup_check = QCheckBox("Create a backup of .desktop files before changing them")
-        self.backup_check.setChecked(self.settings.value("backups/enabled", False, type=bool))
-        self.backup_check.toggled.connect(lambda v: self.settings.setValue("backups/enabled", v))
-        bl.addWidget(self.backup_check)
-        bl.addWidget(make_hint_label(
-            f"Backups are stored in {BACKUP_DIR}/"
-        ))
-        layout.addWidget(backups)
+        # ── Folders (Map icons + AppImage browse start) ─────────────────
+        folders = QGroupBox("Folders")
+        fl = QVBoxLayout(folders)
+        fl.setSpacing(8)
 
-        # Portable transfer of launcher icon overrides (not the same as per-change backups)
-        iconmap_box = QGroupBox("Icon map (transfer)")
-        iml = QVBoxLayout(iconmap_box)
-        iml.addWidget(make_hint_label(
-            "Export your launcher icon overrides to move them to another machine "
-            "or restore after reinstall. Includes custom kAppIcon icons and theme-name "
-            "overrides from the Overrides list. Separate from per-change backups."
-        ))
-        im_row = QHBoxLayout()
-        export_map_btn = QPushButton("Export icon map…")
-        # Outline icons (same weight as Restore/Refresh), full-height controls
-        export_map_btn.setIcon(theme_icon("document-save", "document-export"))
-        export_map_btn.setToolTip("Save overrides as a portable zip")
-        export_map_btn.clicked.connect(self._export_icon_map)
-        style_settings_action_button(export_map_btn)
-        import_map_btn = QPushButton("Import icon map…")
-        import_map_btn.setIcon(theme_icon("document-open", "document-import"))
-        import_map_btn.setToolTip("Restore overrides from a zip")
-        import_map_btn.clicked.connect(self._import_icon_map)
-        style_settings_action_button(import_map_btn)
-        im_row.addWidget(export_map_btn)
-        im_row.addWidget(import_map_btn)
-        im_row.addStretch(1)
-        equalize_widths([export_map_btn, import_map_btn])
-        iml.addLayout(im_row)
-        self._iconmap_status = QLabel("")
-        self._iconmap_status.setWordWrap(True)
-        iml.addWidget(self._iconmap_status)
-        layout.addWidget(iconmap_box)
-
-        source = QGroupBox("Icon files")
-        sf = QVBoxLayout(source)
         default_src = DOWNLOADS_DIR_DEFAULT
-        sf.addWidget(QLabel("Source folder"))
+        fl.addWidget(QLabel("Map icons (Map → From file)"))
         self.source_input = QLineEdit(self.settings.value("source/folder", default_src, type=str))
         self.source_input.setClearButtonEnabled(True)
+        self.source_input.setToolTip("Folder of image files for Map → From file")
         self.source_input.editingFinished.connect(self._on_source_change)
         browse = QPushButton("Browse…")
-        # Outline folder (actions), same height as Maintenance actions
         browse.setIcon(theme_icon("document-open", "document-open-folder", "folder"))
         browse.clicked.connect(self._browse_source)
         style_settings_action_button(browse)
         src_row = QHBoxLayout()
         src_row.addWidget(self.source_input, stretch=1)
         src_row.addWidget(browse)
-        # Line edit height tracks the taller Browse button
         self.source_input.setMinimumHeight(browse.minimumHeight())
-        sf.addLayout(src_row)
-        # Full-width hint (FormLayout was wrapping this awkwardly in a narrow field column)
-        sf.addWidget(make_hint_label(
-            "Used by Map → From file. Icons you create are kept in the library automatically."
-        ))
-        layout.addWidget(source)
+        fl.addLayout(src_row)
 
+        default_ai = self._default_appimage_folder()
+        fl.addWidget(QLabel("AppImage folder (Add AppImage… start directory)"))
+        self.appimage_folder_input = QLineEdit(
+            self.settings.value("appimage/folder", default_ai, type=str) or default_ai
+        )
+        self.appimage_folder_input.setClearButtonEnabled(True)
+        self.appimage_folder_input.setToolTip(
+            "Starting folder for AppImage → Add AppImage… (not scanned)"
+        )
+        self.appimage_folder_input.editingFinished.connect(self._on_appimage_folder_change)
+        ai_browse = QPushButton("Browse…")
+        ai_browse.setIcon(theme_icon("document-open", "document-open-folder", "folder"))
+        ai_browse.clicked.connect(self._browse_appimage_folder)
+        style_settings_action_button(ai_browse)
+        ai_row = QHBoxLayout()
+        ai_row.addWidget(self.appimage_folder_input, stretch=1)
+        ai_row.addWidget(ai_browse)
+        self.appimage_folder_input.setMinimumHeight(ai_browse.minimumHeight())
+        fl.addLayout(ai_row)
+        layout.addWidget(folders)
+
+        # ── Safety & transfer ───────────────────────────────────────────
+        safety = QGroupBox("Safety & transfer")
+        sl = QVBoxLayout(safety)
+        sl.setSpacing(8)
+        self.backup_check = QCheckBox("Back up .desktop files before changes")
+        self.backup_check.setChecked(self.settings.value("backups/enabled", False, type=bool))
+        self.backup_check.setToolTip(f"Stored in {BACKUP_DIR}/")
+        self.backup_check.toggled.connect(lambda v: self.settings.setValue("backups/enabled", v))
+        sl.addWidget(self.backup_check)
+
+        im_row = QHBoxLayout()
+        export_map_btn = QPushButton("Export icon map…")
+        export_map_btn.setIcon(theme_icon("document-save", "document-export"))
+        export_map_btn.setToolTip(
+            "Portable zip of launcher overrides (custom icons + theme names)"
+        )
+        export_map_btn.clicked.connect(self._export_icon_map)
+        style_settings_action_button(export_map_btn)
+        import_map_btn = QPushButton("Import icon map…")
+        import_map_btn.setIcon(theme_icon("document-open", "document-import"))
+        import_map_btn.setToolTip("Restore overrides from a zip (preview, then Apply)")
+        import_map_btn.clicked.connect(self._import_icon_map)
+        style_settings_action_button(import_map_btn)
+        im_row.addWidget(export_map_btn)
+        im_row.addWidget(import_map_btn)
+        im_row.addStretch(1)
+        equalize_widths([export_map_btn, import_map_btn])
+        sl.addLayout(im_row)
+        self._iconmap_status = QLabel("")
+        self._iconmap_status.setWordWrap(True)
+        sl.addWidget(self._iconmap_status)
+        layout.addWidget(safety)
+
+        # ── Maintenance ─────────────────────────────────────────────────
         maint = QGroupBox("Maintenance")
         ml = QHBoxLayout(maint)
         restore_btn = QPushButton("Restore backup…")
@@ -3126,23 +3147,18 @@ class CombinedWindow(QMainWindow):
         self._refresh_status = QLabel("")
         ml.addWidget(self._refresh_status)
         equalize_widths([restore_btn, refresh_btn])
-        # Keep Icon map / Browse the same height as Maintenance (single source of truth)
         ref_h = max(restore_btn.minimumHeight(), refresh_btn.minimumHeight())
-        for b in (export_map_btn, import_map_btn, browse):
+        for b in (export_map_btn, import_map_btn, browse, ai_browse):
             b.setMinimumHeight(ref_h)
-        if hasattr(self, "source_input"):
-            self.source_input.setMinimumHeight(ref_h)
+        self.source_input.setMinimumHeight(ref_h)
+        self.appimage_folder_input.setMinimumHeight(ref_h)
         ml.addStretch(1)
         layout.addWidget(maint)
 
-        about = QGroupBox("About")
-        al = QVBoxLayout(about)
-        al.addWidget(QLabel("kAppIcon — change, create, and map application icons."))
-        al.addWidget(make_hint_label(
-            "Designed for Plasma / Breeze. Icons follow the freedesktop.org desktop entry standard."
-        ))
+        about = make_hint_label(
+            f"kAppIcon {_app_version()} · Plasma / Breeze · freedesktop launchers"
+        )
         layout.addWidget(about)
-
         layout.addStretch(1)
 
     # ── Overrides tab (user launcher overrides) ──────────────────────────
@@ -3606,6 +3622,388 @@ class CombinedWindow(QMainWindow):
         row = item.data(Qt.ItemDataRole.UserRole) or {}
         self._jump_to_map_app(row.get("desktop_id"))
 
+    # ── AppImage tab ─────────────────────────────────────────────────────
+    def _build_appimage_tab(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(0, layout_spacing(), 0, 0)
+        layout.setSpacing(layout_spacing())
+
+        layout.addWidget(make_hint_label(
+            "AppImage launchers (user .desktop files whose Exec runs a .AppImage). "
+            "Add a launcher for a bare AppImage file, set its icon, or open it on Map. "
+            "Does not manage AppImage updates or folders — only menu icons and launchers."
+        ))
+
+        filt_row = QHBoxLayout()
+        self.appimage_search = QLineEdit()
+        self.appimage_search.setClearButtonEnabled(True)
+        self.appimage_search.setPlaceholderText("Filter AppImages…")
+        self.appimage_search.textChanged.connect(self._filter_appimage_list)
+        filt_row.addWidget(self.appimage_search, stretch=1)
+        refresh = QPushButton("Refresh")
+        refresh.setIcon(theme_icon("view-refresh", "system-reboot"))
+        refresh.clicked.connect(self._refresh_appimage_list)
+        style_settings_action_button(refresh)
+        filt_row.addWidget(refresh)
+        layout.addLayout(filt_row)
+
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.setChildrenCollapsible(False)
+
+        self.appimage_list = QListWidget()
+        self.appimage_list.setIconSize(QSize(32, 32))
+        self.appimage_list.setAlternatingRowColors(True)
+        self.appimage_list.itemDoubleClicked.connect(
+            lambda _i: self._appimage_open_in_map()
+        )
+        body.addWidget(self.appimage_list)
+
+        right = QWidget()
+        right.setMinimumWidth(240)
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        self.appimage_title = QLabel("Select an AppImage launcher")
+        tf = self.appimage_title.font()
+        tf.setBold(True)
+        self.appimage_title.setFont(tf)
+        self.appimage_title.setWordWrap(True)
+        rl.addWidget(self.appimage_title)
+
+        self.appimage_preview = QLabel("—")
+        self.appimage_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.appimage_preview.setMinimumSize(96, 96)
+        self.appimage_preview.setFrameShape(QFrame.Shape.StyledPanel)
+        self.appimage_preview.setFrameShadow(QFrame.Shadow.Sunken)
+        rl.addWidget(self.appimage_preview, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        self.appimage_detail = QLabel("")
+        self.appimage_detail.setWordWrap(True)
+        self.appimage_detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        rl.addWidget(self.appimage_detail)
+        rl.addStretch(1)
+        body.addWidget(right)
+        body.setStretchFactor(0, 3)
+        body.setStretchFactor(1, 2)
+        layout.addWidget(body, stretch=1)
+
+        self.appimage_list.currentItemChanged.connect(
+            lambda cur, _prev: self._appimage_show_detail(cur)
+        )
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add AppImage…")
+        add_btn.setIcon(theme_icon("list-add", "document-new"))
+        add_btn.setToolTip("Create a user menu launcher for an AppImage file")
+        add_btn.clicked.connect(self._appimage_add_launcher)
+        style_settings_action_button(add_btn)
+        set_icon = QPushButton("Set icon from file…")
+        set_icon.setIcon(theme_icon("document-open", "image-x-generic"))
+        set_icon.setToolTip("Apply a custom image to the selected AppImage launcher")
+        set_icon.clicked.connect(self._appimage_set_icon_file)
+        style_settings_action_button(set_icon)
+        open_map = QPushButton("Open in Map")
+        open_map.setIcon(theme_icon("preferences-desktop-icons", "go-next"))
+        open_map.setToolTip("Select this launcher on Map to use any icon source")
+        open_map.clicked.connect(self._appimage_open_in_map)
+        style_settings_action_button(open_map)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(set_icon)
+        btn_row.addWidget(open_map)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        self.appimage_status = QLabel("")
+        layout.addWidget(self.appimage_status)
+        self._refresh_appimage_list()
+
+    def _refresh_appimage_list(self):
+        if not hasattr(self, "appimage_list"):
+            return
+        self.appimage_list.clear()
+        try:
+            rows = scan_appimage_launchers()
+        except Exception as e:
+            self.appimage_status.setText(f"Could not scan AppImages: {e}")
+            return
+        warn = theme_icon("image-missing", "dialog-warning")
+        for row in rows:
+            item = QListWidgetItem(row["display"])
+            item.setData(Qt.ItemDataRole.UserRole, row)
+            tip = (
+                f"{row['desktop_id']}\n"
+                f"AppImage: {row.get('appimage_path') or '(unknown)'}\n"
+                f"Icon={row.get('icon') or '(empty)'}\n"
+                f"{row.get('path', '')}"
+            )
+            item.setToolTip(tip)
+            pix = resolve_icon(row["icon"], size=32) if row.get("icon") else None
+            if pix:
+                item.setIcon(QIcon(pix))
+            elif not row.get("icon_ok"):
+                # Prefer app branding over a harsh warning glyph
+                kic = self._kappicon_icon()
+                item.setIcon(kic if not kic.isNull() else warn)
+            self.appimage_list.addItem(item)
+        n = self.appimage_list.count()
+        self.appimage_status.setText(
+            f"{n} AppImage launcher(s)"
+            if n
+            else "No AppImage launchers yet — use Add AppImage… (starts in your AppImage folder)"
+        )
+        self._filter_appimage_list(
+            self.appimage_search.text() if hasattr(self, "appimage_search") else ""
+        )
+        # Empty list or no selection → kAppIcon placeholder in the detail pane
+        cur = self.appimage_list.currentItem()
+        if n == 0 or cur is None:
+            self._appimage_show_empty_placeholder(n == 0)
+        else:
+            self._appimage_show_detail(cur)
+
+    def _filter_appimage_list(self, text=""):
+        if not hasattr(self, "appimage_list"):
+            return
+        q = (text or "").lower().strip()
+        for i in range(self.appimage_list.count()):
+            item = self.appimage_list.item(i)
+            row = item.data(Qt.ItemDataRole.UserRole) or {}
+            hay = " ".join([
+                row.get("display", ""),
+                row.get("desktop_id", ""),
+                row.get("appimage_path", ""),
+                row.get("icon", ""),
+                row.get("path", ""),
+            ]).lower()
+            item.setHidden(bool(q) and q not in hay)
+
+    def _appimage_show_empty_placeholder(self, none_found=True):
+        """kAppIcon icon when nothing is selected / list is empty."""
+        if not hasattr(self, "appimage_preview"):
+            return
+        if none_found:
+            self.appimage_title.setText("No AppImage launchers yet")
+            self.appimage_detail.setText(
+                "Use <b>Add AppImage…</b> to create a menu launcher for a "
+                f".AppImage file.<br/>Browse starts in: "
+                f"<code>{self._appimage_start_dir()}</code>"
+            )
+        else:
+            self.appimage_title.setText("Select an AppImage launcher")
+            self.appimage_detail.setText("")
+        pix = self._kappicon_pixmap(96)
+        if pix and not pix.isNull():
+            self.appimage_preview.setPixmap(pix)
+            self.appimage_preview.setText("")
+        else:
+            self.appimage_preview.clear()
+            self.appimage_preview.setText("kAppIcon")
+
+    def _appimage_show_detail(self, item):
+        if not hasattr(self, "appimage_detail"):
+            return
+        if not item or not item.data(Qt.ItemDataRole.UserRole):
+            none = (
+                hasattr(self, "appimage_list") and self.appimage_list.count() == 0
+            )
+            self._appimage_show_empty_placeholder(none_found=none)
+            return
+        row = item.data(Qt.ItemDataRole.UserRole) or {}
+        self.appimage_title.setText(row.get("display") or row.get("desktop_id") or "")
+        icon = row.get("icon") or ""
+        pix = resolve_icon(icon, size=96) if icon else None
+        if pix and not pix.isNull():
+            self.appimage_preview.setPixmap(pix)
+            self.appimage_preview.setText("")
+        else:
+            # Unresolved icon → kAppIcon placeholder instead of "?"
+            kpix = self._kappicon_pixmap(96)
+            if kpix and not kpix.isNull():
+                self.appimage_preview.setPixmap(kpix)
+                self.appimage_preview.setText("")
+            else:
+                self.appimage_preview.clear()
+                self.appimage_preview.setText("?")
+        exists = row.get("appimage_exists")
+        exist_s = "file found" if exists else "file missing"
+        lines = [
+            f"<code>{row.get('desktop_id', '')}</code>",
+            f"AppImage: <code>{row.get('appimage_path') or '(unknown)'}</code> ({exist_s})",
+            f"Icon=: <code>{icon or '(empty)'}</code>"
+            + ("" if row.get("icon_ok") else " · unresolved"),
+            f"Desktop: <code>{row.get('path', '')}</code>",
+        ]
+        self.appimage_detail.setText("<br/>".join(lines))
+
+    def _appimage_selected_row(self):
+        item = self.appimage_list.currentItem() if hasattr(self, "appimage_list") else None
+        if not item or item.isHidden():
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _appimage_open_in_map(self):
+        row = self._appimage_selected_row()
+        if not row:
+            QMessageBox.information(self, "AppImage", "Select a launcher first.")
+            return
+        self._register_app_in_map(
+            row["desktop_id"],
+            row.get("icon") or "",
+            row.get("display") or row["desktop_id"],
+            row.get("path") or "",
+        )
+        self._jump_to_map_app(row["desktop_id"])
+
+    def _register_app_in_map(self, desktop_id, icon_name, display_name, desktop_path):
+        """Ensure Map's app list / app_data know about this launcher."""
+        if not desktop_id or not hasattr(self, "app_list"):
+            return
+        # app_data
+        found = False
+        for idx, row in enumerate(self.app_data):
+            if row[0] == desktop_id:
+                self.app_data[idx] = (
+                    desktop_id, icon_name or "", display_name, desktop_path
+                )
+                found = True
+                break
+        if not found:
+            self.app_data.append(
+                (desktop_id, icon_name or "", display_name, desktop_path)
+            )
+            self.app_data.sort(key=lambda t: (t[2] or t[0]).lower())
+        self.desktop_paths[desktop_id] = desktop_path
+        self.desktop_labels[desktop_id] = display_name
+        # list widget
+        for i in range(self.app_list.count()):
+            if self.app_list.item(i).data(Qt.ItemDataRole.UserRole) == desktop_id:
+                item = self.app_list.item(i)
+                item.setText(display_name)
+                item.setData(Qt.ItemDataRole.UserRole + 1, display_name)
+                item.setData(Qt.ItemDataRole.UserRole + 2, icon_name)
+                pix = resolve_icon(icon_name, size=self._map_icon_size) if icon_name else None
+                if pix:
+                    item.setIcon(QIcon(pix))
+                return
+        item = QListWidgetItem(display_name)
+        item.setData(Qt.ItemDataRole.UserRole, desktop_id)
+        item.setData(Qt.ItemDataRole.UserRole + 1, display_name)
+        item.setData(Qt.ItemDataRole.UserRole + 2, icon_name)
+        item.setToolTip(f"Will modify: {display_name}\nDesktop file: {desktop_id}")
+        pix = resolve_icon(icon_name, size=self._map_icon_size) if icon_name else None
+        if pix:
+            item.setIcon(QIcon(pix))
+        self.app_list.addItem(item)
+
+    def _appimage_add_launcher(self):
+        """Pick an AppImage file and create a user .desktop launcher."""
+        start = self._appimage_start_dir()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select AppImage",
+            start,
+            "AppImage (*.AppImage *.appimage);;All files (*)",
+        )
+        if not path:
+            return
+        base = os.path.splitext(os.path.basename(path))[0]
+        # Drop .AppImage from basename for default name
+        if base.lower().endswith(".appimage"):
+            base = base[:-9]
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self,
+            "AppImage name",
+            "Name shown in the application menu:",
+            text=base.replace("-", " ").replace("_", " ").strip() or "AppImage",
+        )
+        if not ok:
+            return
+        name = (name or "").strip() or base or "AppImage"
+        try:
+            self._set_apply_busy(True)
+            with apply_lock():
+                row = create_appimage_launcher(path, display_name=name)
+        except Exception as e:
+            QMessageBox.warning(self, "Add AppImage failed", str(e))
+            return
+        finally:
+            self._set_apply_busy(False)
+
+        self._register_app_in_map(
+            row["desktop_id"],
+            row.get("icon") or "",
+            row.get("display") or row["desktop_id"],
+            row.get("path") or "",
+        )
+        self._refresh_appimage_list()
+        # Select the new row
+        for i in range(self.appimage_list.count()):
+            item = self.appimage_list.item(i)
+            r = item.data(Qt.ItemDataRole.UserRole) or {}
+            if r.get("desktop_id") == row["desktop_id"]:
+                self.appimage_list.setCurrentItem(item)
+                break
+        schedule_icon_cache_refresh(self)
+        if self.statusBar():
+            self.statusBar().showMessage(
+                f"Created launcher {row['desktop_id']} — set an icon or Open in Map",
+                8000,
+            )
+        # Offer icon immediately
+        ask = QMessageBox.question(
+            self,
+            "Set icon?",
+            f"Launcher “{row['display']}” created.\n\nSet a custom icon now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if ask == QMessageBox.StandardButton.Yes:
+            self._appimage_set_icon_file()
+
+    def _appimage_set_icon_file(self):
+        row = self._appimage_selected_row()
+        if not row:
+            QMessageBox.information(self, "AppImage", "Select a launcher first.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Icon image for AppImage",
+            DOWNLOADS_DIR_DEFAULT,
+            "Images (*.png *.svg *.svgz *.jpg *.jpeg *.webp *.bmp *.gif "
+            "*.PNG *.SVG *.JPG *.JPEG *.WEBP);;All files (*)",
+        )
+        if not path:
+            return
+        desktop_id = row["desktop_id"]
+        display = row.get("display") or desktop_id
+        try:
+            self._set_apply_busy(True)
+            with apply_lock():
+                result = apply_icon_to_desktop(
+                    desktop_id,
+                    path,
+                    shape=self._shape_pref(),
+                    backup=self._backup_pref(),
+                )
+            self._push_undo(desktop_id, display, result.get("previous_bytes"))
+            icon_value = result.get("icon_value") or ""
+            self._update_app_list_icon(desktop_id, icon_value)
+            self._register_app_in_map(
+                desktop_id, icon_value, display, row.get("path") or ""
+            )
+            schedule_icon_cache_refresh(self)
+            self._refresh_appimage_list()
+            if self.statusBar():
+                self.statusBar().showMessage(f"Icon set for {display}", 6000)
+        except ApplyError as e:
+            QMessageBox.warning(self, "Set icon failed", str(e))
+        except Exception as e:
+            QMessageBox.warning(self, "Set icon failed", str(e))
+        finally:
+            self._set_apply_busy(False)
+
     def _jump_to_map_app(self, desktop_id):
         """Switch to Map and select the given application in step 2.
 
@@ -3709,6 +4107,61 @@ class CombinedWindow(QMainWindow):
         path = self.source_input.text()
         self.settings.setValue("source/folder", path)
         self._rescan_source()
+
+    def _default_appimage_folder(self):
+        """~/Applications if present, else Downloads (browse start only)."""
+        apps = os.path.expanduser("~/Applications")
+        if os.path.isdir(apps):
+            return apps
+        return DOWNLOADS_DIR_DEFAULT
+
+    def _appimage_start_dir(self):
+        """Directory for Add AppImage… file dialog."""
+        if hasattr(self, "appimage_folder_input"):
+            folder = self.appimage_folder_input.text().strip()
+            if folder and os.path.isdir(folder):
+                return folder
+        folder = self.settings.value(
+            "appimage/folder",
+            self._default_appimage_folder(),
+            type=str,
+        )
+        if folder and os.path.isdir(folder):
+            return folder
+        return self._default_appimage_folder()
+
+    def _browse_appimage_folder(self):
+        start = self.appimage_folder_input.text().strip() or self._default_appimage_folder()
+        d = QFileDialog.getExistingDirectory(self, "Select AppImage folder", start)
+        if d:
+            self.appimage_folder_input.setText(d)
+            self.settings.setValue("appimage/folder", d)
+
+    def _on_appimage_folder_change(self):
+        path = self.appimage_folder_input.text().strip()
+        self.settings.setValue("appimage/folder", path)
+
+    def _kappicon_icon(self):
+        """App icon for window / empty-state placeholders."""
+        wicon = theme_icon("preferences-desktop-icons", "applications-graphics", "kappicon")
+        for path in (
+            os.path.join(USER_ICONS_DIR, "kappicon.png"),
+            os.path.join(USER_ICONS_DIR, "hicolor", "256x256", "apps", "kappicon.png"),
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "assets",
+                "kappicon.png",
+            ),
+        ):
+            if os.path.isfile(path):
+                return QIcon(path)
+        return wicon
+
+    def _kappicon_pixmap(self, size=96):
+        ic = self._kappicon_icon()
+        if ic.isNull():
+            return QPixmap()
+        return ic.pixmap(QSize(size, size))
 
     def _icon_start_dir(self):
         if hasattr(self, "source_input"):

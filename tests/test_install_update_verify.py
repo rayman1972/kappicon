@@ -37,6 +37,10 @@ class TestInstallUpdateVerify(unittest.TestCase):
             or "cannot safely update" in text.lower(),
             "install.sh should mention fail-closed missing SUMS",
         )
+        # Package install stages then swaps (safer than live rm + cp)
+        self.assertIn("kappicon.new.", text)
+        self.assertIn("kappicon.old.", text)
+        self.assertIn('mv "$stage"', text)
 
     def test_sha256sum_happy_path(self) -> None:
         self.assertTrue(shutil.which("sha256sum"), "sha256sum required on test host")

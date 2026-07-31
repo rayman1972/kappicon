@@ -30,6 +30,7 @@ from .icons import (
     is_kappicon_icon_name,
     locate_hicolor_icon_file,
     prepare_icon_value,
+    prune_unreferenced_kappicon_assets,
 )
 from .lock import ApplyError
 from .mutation import apply_icon_to_desktop
@@ -526,6 +527,11 @@ def apply_import_plan(
                         "display": display,
                         "error": str(e),
                     })
+        # Drop assets left by partial/failed entries (successes keep refs via Icon=)
+        try:
+            prune_unreferenced_kappicon_assets()
+        except Exception:
+            pass
     finally:
         # Best-effort cleanup of staging
         try:

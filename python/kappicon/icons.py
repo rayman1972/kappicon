@@ -197,33 +197,36 @@ def _install_hicolor_icon(icon_path, theme_name, magick):
         return theme_name
     if not magick:
         raise ApplyError("ImageMagick is not installed (need magick or convert).")
+    # Resize *all* sizes including 512 so non-512 sources are not mislabeled
     for sz in (512, 256, 128, 64, 48):
         dest_dir = os.path.join(hicolor, f"{sz}x{sz}", "apps")
         dest = os.path.join(dest_dir, f"{theme_name}.png")
-        if sz == 512:
-            _atomic_copy_file(icon_path, dest)
-        else:
-            os.makedirs(dest_dir, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".png", dir=dest_dir)
-            os.close(fd)
-            try:
-                r = subprocess.run(
-                    [magick, icon_path, "-background", "none", "-resize", f"{sz}x{sz}", tmp],
-                    capture_output=True,
-                )
-                if r.returncode != 0 or not os.path.isfile(tmp):
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
-                    continue
-                os.chmod(tmp, 0o644)
-                os.replace(tmp, dest)
-            except Exception:
+        os.makedirs(dest_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".kappicon-", suffix=".png", dir=dest_dir)
+        os.close(fd)
+        try:
+            r = subprocess.run(
+                [
+                    magick, icon_path,
+                    "-background", "none",
+                    "-resize", f"{sz}x{sz}",
+                    tmp,
+                ],
+                capture_output=True,
+            )
+            if r.returncode != 0 or not os.path.isfile(tmp):
                 try:
                     os.unlink(tmp)
                 except OSError:
                     pass
+                continue
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, dest)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     if not os.path.isfile(os.path.join(hicolor, "512x512", "apps", f"{theme_name}.png")):
         raise ApplyError("Failed to install icon into the hicolor theme.")
     return theme_name

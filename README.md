@@ -58,7 +58,7 @@ Draw, import/paste, prep kit (pad, tint, mono, outline, shadow), transforms, and
 
 ### Settings
 
-Includes appearance, icon shape, backups, **icon map export/import**, source folder, and maintenance.
+Includes appearance, icon shape, backups, **icon map export/import**, Map/AppImage folders, and maintenance.
 
 ![Settings tab](screenshots/gui-settings.png)
 
@@ -77,6 +77,7 @@ Includes appearance, icon shape, backups, **icon map export/import**, source fol
 - **Create** — pixel editor, import/paste, prep kit (pad, tint, mono, outline, shadow), size previews, icon library
 - **Overrides** (current vs system) and **Missing** icons
 - **Export / import icon map** — portable zip of launcher overrides (custom `kappicon-*` icons + theme names) for reinstall or another PC (Settings · File · Overrides)
+- **AppImage** — list AppImage launchers, add a menu entry for a `.AppImage`, set its icon
 - Optional backups, icon shapes, drag-and-drop (never auto-applies)
 - **CLI** (`kappicon-cli`) shares the same safe mutation engine
 - User overrides only — lock, atomic writes, content-addressed icons
@@ -86,7 +87,7 @@ Full list → **[Features wiki](https://github.com/rayman1972/kappicon/wiki/Feat
 ## Usage
 
 ```bash
-kappicon          # GUI (Map · Create · Settings · Overrides · Missing)
+kappicon          # GUI (Map · Create · Settings · Overrides · Missing · AppImage)
 kappicon-cli      # interactive CLI (fzf)
 ```
 
