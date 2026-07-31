@@ -103,6 +103,10 @@
       <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-missing.png</image>
       <caption>Missing — apps with empty or unresolved icons</caption>
     </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rayman1972/kappicon/main/screenshots/gui-appimage.png</image>
+      <caption>AppImage — list launchers, add a .AppImage, set its icon</caption>
+    </screenshot>
   </screenshots>
 
   <releases>

@@ -11,7 +11,7 @@
 [![UI](https://img.shields.io/badge/UI-PyQt6-41cd52.svg)](https://github.com/rayman1972/kappicon/wiki/Requirements)
 [![Release](https://img.shields.io/github/v/release/rayman1972/kappicon?include_prereleases&label=release)](https://github.com/rayman1972/kappicon/releases)
 
-**kAppIcon** changes **Linux app launcher icons** without root. Map a custom image, another app’s icon, or a single glyph from any installed icon theme (WhiteSur, Tela, Breeze, …) to one application at a time — without switching your whole system theme. **Export / import an icon map** to move your overrides to another machine or restore them after a reinstall.
+**kAppIcon** changes **Linux app launcher icons** without root. Map a custom image, another app’s icon, or a single glyph from any installed icon theme (WhiteSur, Tela, Breeze, …) to one application at a time — without switching your whole system theme. Give **AppImages** a menu entry and a proper icon. **Export / import an icon map** to move your overrides to another machine or restore them after a reinstall.
 
 User-level [desktop entries](https://specifications.freedesktop.org/desktop-entry-spec/) only. Built for **KDE Plasma** and other **freedesktop** desktops.
 
@@ -70,19 +70,27 @@ Includes appearance, icon shape, backups, **icon map export/import**, Map/AppIma
 
 ![Missing tab](screenshots/gui-missing.png)
 
+### AppImage
+
+List AppImage menu launchers, **Add AppImage…** for a bare `.AppImage`, set its icon, or open it on Map.
+
+![AppImage tab](screenshots/gui-appimage.png)
+
+→ **[AppImage wiki](https://github.com/rayman1972/kappicon/wiki/AppImage)** (what it does, what it doesn’t, Settings folder)
+
 ## Features
 
 - **Map** from file, another app, or any installed icon theme pack
 - Stay-open **Apply**, batch multi-select, session **Undo**
 - **Create** — pixel editor, import/paste, prep kit (pad, tint, mono, outline, shadow), size previews, icon library
 - **Overrides** (current vs system) and **Missing** icons
+- **AppImage** — menu launchers for `.AppImage` files: list, add, set icon, open in Map
 - **Export / import icon map** — portable zip of launcher overrides (custom `kappicon-*` icons + theme names) for reinstall or another PC (Settings · File · Overrides)
-- **AppImage** — list AppImage launchers, add a menu entry for a `.AppImage`, set its icon
 - Optional backups, icon shapes, drag-and-drop (never auto-applies)
 - **CLI** (`kappicon-cli`) shares the same safe mutation engine
 - User overrides only — lock, atomic writes, content-addressed icons
 
-Full list → **[Features wiki](https://github.com/rayman1972/kappicon/wiki/Features)**
+Full list → **[Features wiki](https://github.com/rayman1972/kappicon/wiki/Features)** · **[AppImage](https://github.com/rayman1972/kappicon/wiki/AppImage)**
 
 ## Usage
 
@@ -101,6 +109,7 @@ Tab walkthrough and CLI flags → **[Usage wiki](https://github.com/rayman1972/k
 | [Installation](https://github.com/rayman1972/kappicon/wiki/Installation) | Install, update, deps |
 | [Requirements](https://github.com/rayman1972/kappicon/wiki/Requirements) | Python, PyQt6, tools |
 | [Usage](https://github.com/rayman1972/kappicon/wiki/Usage) | GUI + CLI |
+| [AppImage](https://github.com/rayman1972/kappicon/wiki/AppImage) | AppImage launchers & icons |
 | [FAQ](https://github.com/rayman1972/kappicon/wiki/FAQ) | Common questions |
 | [Paths](https://github.com/rayman1972/kappicon/wiki/Paths) | XDG locations |
 | [How it works](https://github.com/rayman1972/kappicon/wiki/How-it-works) | Overrides, icons, safety |
