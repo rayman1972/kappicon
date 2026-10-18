@@ -1,13 +1,12 @@
 name: Publish GitHub release
 
-# Branch pushes publish the tag named in VERSION (needed for v3.3.2, which
-# was pushed before this workflow existed). Later v* tags publish themselves.
+# A push that changes this file publishes the tag named in VERSION.
+# v3.3.2 was created before any workflow existed, so a tag trigger would
+# not see this file. Later releases: push a v* tag (release-tag.yml).
 on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
     paths:
       - .github/workflows/release.yml
   workflow_dispatch:
