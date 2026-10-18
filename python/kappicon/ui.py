@@ -226,6 +226,11 @@ def icon_resolves(icon_name):
     return resolve_icon(icon_name) is not None
 
 
+# `global` inside schedule_icon_cache_refresh binds in this module. The name
+# must exist before the first read; a missing binding raises NameError on
+# Apply and aborts the GUI (the timer does not live in mutation.py).
+_cache_refresh_timer = None
+
 
 def schedule_icon_cache_refresh(parent_widget=None):
     """Debounce expensive cache tools; always runs after lock is released."""

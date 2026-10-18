@@ -1,7 +1,8 @@
-"""Offscreen GUI smoke: build CombinedWindow, visit all tabs, check Apply states.
+"""Offscreen GUI smoke: build CombinedWindow, visit tabs, check Apply.
 
 Requires PyQt6 + QT_QPA_PLATFORM=offscreen. Skips cleanly if PyQt6 is absent.
-Does not click Apply/Reset (no host mutation).
+Theme Apply runs inside the XDG sandbox and disarms the icon-cache timer so
+host cache tools are not executed.
 """
 from __future__ import annotations
 
@@ -28,6 +29,18 @@ except ImportError:  # pragma: no cover
 
 from tests.support.load_engine import clear_engine_cache, load_engine
 from tests.support.xdg_sandbox import temp_xdg
+
+
+def _disarm_icon_cache_refresh() -> None:
+    """Stop the debounced cache timer so tests never run kbuildsycoca."""
+    try:
+        from kappicon import ui as ui_mod
+    except ImportError:
+        return
+    timer = getattr(ui_mod, "_cache_refresh_timer", None)
+    if timer is not None:
+        timer.stop()
+        ui_mod._cache_refresh_timer = None
 
 EXPECTED_TABS = ("Map", "Create", "Settings", "Overrides", "Missing", "AppImage")
 
@@ -203,6 +216,72 @@ class TestGuiSmoke(unittest.TestCase):
                 )
                 self.assertEqual(win.select_btn.text(), "Apply")
             finally:
+                self._close_window(win)
+
+    def test_cache_refresh_timer_is_defined_while_qt_is_alive(self) -> None:
+        """Apply schedules a refresh only when this module global exists."""
+        with temp_xdg():
+            load_engine(force_reload=True)
+            from kappicon import ui as ui_mod
+
+            ui_mod._cache_refresh_timer = None
+            try:
+                ui_mod.schedule_icon_cache_refresh()
+                timer = ui_mod._cache_refresh_timer
+                self.assertIsNotNone(timer)
+                self.assertTrue(timer.isSingleShot())
+                self.assertTrue(timer.isActive())
+                # A second Apply in the same session reuses the timer.
+                ui_mod.schedule_icon_cache_refresh()
+                self.assertIs(ui_mod._cache_refresh_timer, timer)
+                self.assertTrue(timer.isActive())
+            finally:
+                _disarm_icon_cache_refresh()
+
+    def test_theme_apply_keeps_window_open(self) -> None:
+        """Stay-open Apply: theme icon is written and the window survives."""
+        with temp_xdg() as sandbox:
+            win, _png = self._build_window(sandbox)
+            try:
+                from PyQt6.QtWidgets import QListWidgetItem
+
+                from kappicon.paths import THEME_ICON_PREFIX
+
+                win.show()
+                self.app.processEvents()
+
+                theme_item = QListWidgetItem("Terminal")
+                theme_item.setData(
+                    Qt.ItemDataRole.UserRole, THEME_ICON_PREFIX + "utilities-terminal"
+                )
+                theme_item.setData(Qt.ItemDataRole.UserRole + 1, "Breeze")
+                win.file_list.addItem(theme_item)
+                win.file_list.setCurrentItem(theme_item)
+
+                app_item = win.app_list.item(0)
+                win.app_list.setCurrentItem(app_item)
+                app_item.setSelected(True)
+                win._update_mapping_summary()
+                self.app.processEvents()
+                self.assertTrue(win.select_btn.isEnabled())
+
+                win.select_btn.click()
+                self.app.processEvents()
+
+                self.assertTrue(win.isVisible())
+                user_desktop = sandbox.user_apps / "demo.desktop"
+                self.assertTrue(user_desktop.is_file(), "user override was not written")
+                self.assertIn("Icon=utilities-terminal", user_desktop.read_text(encoding="utf-8"))
+                message = win.statusBar().currentMessage()
+                self.assertIn("stays open", message)
+
+                # Second Apply in the same session must not raise.
+                win.select_btn.click()
+                self.app.processEvents()
+                self.assertTrue(win.isVisible())
+                self.assertFalse(win._apply_busy)
+            finally:
+                _disarm_icon_cache_refresh()
                 self._close_window(win)
 
 

@@ -156,7 +156,3 @@ def undo_keep_icon_names(undo_stack):
     return keep
 
 
-_cache_refresh_timer = None
-
-
-
