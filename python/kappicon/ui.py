@@ -81,7 +81,7 @@ MAP_ICON_SIZES = (32, 48, 64)
 BROWSE_FOR_ICON = "__browse_for_icon__"
 DESKTOP_LIST_RAW = [d for d in os.environ.get("DESKTOP_LIST", "").strip().split("\n") if d]
 # Fallback if VERSION files are missing (packaging should always ship one).
-_APP_VERSION_FALLBACK = "3.3.1"
+_APP_VERSION_FALLBACK = "3.3.2"
 
 
 def _app_version() -> str:

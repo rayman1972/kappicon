@@ -110,6 +110,17 @@
   </screenshots>
 
   <releases>
+    <release version="3.3.2" date="2026-10-19">
+      <description>
+        <p>
+          Stay-open Apply no longer crashes. Accepting an icon saved the
+          change, then aborted because the icon-cache refresh timer was
+          missing in the UI module. AppImage support from 3.3.1 remains
+          included.
+        </p>
+      </description>
+      <url>https://github.com/rayman1972/kappicon/releases/tag/v3.3.2</url>
+    </release>
     <release version="3.3.1" date="2026-07-31">
       <description>
         <p>
