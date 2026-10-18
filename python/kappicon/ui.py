@@ -2835,6 +2835,7 @@ class CombinedWindow(QMainWindow):
             self,
             "kAppIcon Help & Workflow",
             "<h2>kAppIcon Documentation</h2>"
+            f"<p>Version {_app_version()}</p>"
             "<p>kAppIcon is a Linux utility to customize launcher icons for your installed applications "
             "following the freedesktop.org desktop entry specifications.</p>"
             
@@ -2846,7 +2847,8 @@ class CombinedWindow(QMainWindow):
             "<i>From icon theme</i> (browse an installed pack such as Tela or WhiteSur). "
             "Select the icon in the list.</li>"
             "<li><b>Select Target Application</b> (Step 2): Select the application whose launcher you want to customize.</li>"
-            "<li><b>Apply</b>: Click <i>Apply icon</i> to copy the launcher into your local user directory and change the Icon field.</li>"
+            "<li><b>Apply</b>: Click <i>Apply</i> to copy the launcher into your local user directory and change the Icon field. "
+            "The window stays open so you can change more icons in the same session, and the app-list icon updates immediately.</li>"
             "</ol>"
             
             "<h3>🎨 Workflow 2: Create Custom Icons</h3>"
