@@ -1,0 +1,65 @@
+name: Publish GitHub release
+
+# Branch pushes publish the tag named in VERSION (needed for v3.3.2, which
+# was pushed before this workflow existed). Later v* tags publish themselves.
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release metadata
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checksum the GitHub tag archive and publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+            ver="${tag#v}"
+          else
+            ver="$(tr -d '[:space:]' < VERSION)"
+            tag="v${ver}"
+          fi
+          archive="kappicon-${ver}.tar.gz"
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
+          ok=0
+          for _ in 1 2 3 4 5 6 7 8; do
+            if curl -fsSL -o "$archive" "$url"; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          test "$ok" = 1
+          test -s "$archive"
+          sha256sum "$archive" > SHA256SUMS
+          cat SHA256SUMS
+          git fetch origin "refs/tags/${tag}:refs/tags/${tag}"
+          notes="$(git tag -l --format='%(contents)' "$tag")"
+          if [ -z "$notes" ]; then
+            notes="kAppIcon ${ver}"
+          fi
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$tag" SHA256SUMS --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "$tag" SHA256SUMS \
+              --repo "${{ github.repository }}" \
+              --title "kAppIcon ${ver}" \
+              --notes "$notes"
+          fi
